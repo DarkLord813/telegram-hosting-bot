@@ -77,15 +77,15 @@ def get_uptime():
 
 def get_app_url():
     """Automatically detect the app URL"""
-    # Try to get from environment first
+    # Try to get from Render's environment variables first
+    render_external_url = os.getenv('RENDER_EXTERNAL_URL')
+    if render_external_url:
+        return render_external_url
+    
+    # Fallback to RENDER_APP_URL
     render_app_url = os.getenv('RENDER_APP_URL')
     if render_app_url:
         return render_app_url
-    
-    # Try to get from Render's environment variables
-    render_service_url = os.getenv('RENDER_SERVICE_URL')
-    if render_service_url:
-        return render_service_url
     
     # Try to get from request context (when running)
     try:
