@@ -14,6 +14,7 @@ import secrets
 import string
 import re
 import signal
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ========== CONFIGURATION ==========
 # Get configuration from environment variables (SECURE)
@@ -36,7 +37,6 @@ CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/gamerdroidbot2")
 # Platform detection
 IS_RENDER = os.environ.get("RENDER") == "true"
 IS_HEROKU = os.environ.get("HEROKU") == "true"
-IS_CHOREO = os.environ.get("CHOREO") == "true"
 IS_ANDROID = 'pydroid' in sys.executable.lower() or 'termux' in sys.executable.lower()
 
 # Set base directory based on platform
@@ -44,8 +44,6 @@ if IS_RENDER:
     BASE_DIR = Path("/opt/render/project/src/bot_hosting_data")
 elif IS_HEROKU:
     BASE_DIR = Path("/app/bot_hosting_data")
-elif IS_CHOREO:
-    BASE_DIR = Path("/choreo/app/bot_hosting_data")
 elif IS_ANDROID:
     BASE_DIR = Path("/storage/emulated/0/bot_hosting_data")
 else:
@@ -54,17 +52,16 @@ else:
 DEPLOYMENTS_DIR = BASE_DIR / "deployments"
 DATABASE_FILE = BASE_DIR / "bot_database.db"
 USER_FILES_DIR = BASE_DIR / "user_files"
-LOGS_DIR = BASE_DIR / "logs"
 
 # Create directories
-for dir_path in [BASE_DIR, DEPLOYMENTS_DIR, USER_FILES_DIR, LOGS_DIR]:
+for dir_path in [BASE_DIR, DEPLOYMENTS_DIR, USER_FILES_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 # File size limit (10MB)
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 10))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-# Premium Subscription Pricing (configurable via env)
+# Premium Subscription Pricing
 PRICE_MONTHLY_STARS = int(os.environ.get("PRICE_MONTHLY_STARS", 50))
 PRICE_YEARLY_STARS = int(os.environ.get("PRICE_YEARLY_STARS", 500))
 PRICE_MONTHLY_COINS = PRICE_MONTHLY_STARS * 10
@@ -85,19 +82,49 @@ server_running = True
 active_deployments = {}
 deployment_lock = threading.Lock()
 
-# Webhook server (for cloud platforms)
-WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
-
 print("=" * 60)
 print("🤖 BOT HOSTING PLATFORM")
 print("=" * 60)
-print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Choreo' if IS_CHOREO else 'Android' if IS_ANDROID else 'Local'}")
+print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Android' if IS_ANDROID else 'Local'}")
 print(f"📁 Data Directory: {BASE_DIR}")
 print(f"💰 Monthly Price: {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
 print(f"💰 Yearly Price: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
 print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} deployments x {FREE_DEPLOYMENT_DURATION_HOURS}h")
 print("=" * 60)
+
+# ========== HEALTH CHECK SERVER ==========
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"healthy","message":"Bot is running","timestamp":"' + 
+                           datetime.now().isoformat().encode() + b'"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress health check logs
+        if '/health' not in str(args):
+            print(f"[HTTP] {format % args}")
+
+def start_health_server():
+    """Start a simple HTTP server for health checks"""
+    port = int(os.environ.get("PORT", 8080))
+    
+    for attempt in range(3):
+        try:
+            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+            print(f"✅ Health check server running on port {port}")
+            server.serve_forever()
+            break
+        except OSError as e:
+            print(f"⚠️ Port {port} busy, trying {port + attempt + 1}...")
+            port = port + attempt + 1
+    else:
+        print(f"❌ Failed to start health server after 3 attempts")
 
 # ========== DATABASE SETUP ==========
 def init_db():
@@ -910,24 +937,6 @@ def save_user_file(user_id, temp_file_path, original_filename):
     shutil.copy2(temp_file_path, latest_path)
     
     return saved_path, saved_filename
-
-def get_user_files(user_id):
-    user_dir = USER_FILES_DIR / str(user_id)
-    if not user_dir.exists():
-        return []
-    
-    files = []
-    for file_path in user_dir.glob("*.py"):
-        stat = file_path.stat()
-        files.append({
-            'filename': file_path.name,
-            'size': stat.st_size,
-            'modified': datetime.fromtimestamp(stat.st_mtime),
-            'path': str(file_path)
-        })
-    
-    files.sort(key=lambda x: x['modified'], reverse=True)
-    return files
 
 # ==================== ENHANCED DEPLOYMENT FUNCTIONS ====================
 def install_dependencies(reqs_file, update_logs):
@@ -3152,7 +3161,7 @@ def main():
     print("=" * 60)
     print("🤖 BOT HOSTING PLATFORM")
     print("=" * 60)
-    print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Choreo' if IS_CHOREO else 'Android' if IS_ANDROID else 'Local'}")
+    print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Android' if IS_ANDROID else 'Local'}")
     print(f"📁 Data Directory: {BASE_DIR}")
     print(f"💰 Monthly Price: {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
     print(f"💰 Yearly Price: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
@@ -3172,15 +3181,18 @@ def main():
         print(f"❌ Error: {e}")
         return
     
+    # Start health check server (for Render)
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    print("✅ Health check server started on port 8080")
+    
     print("=" * 60)
-    print("✅ Bot running! Press Ctrl+C to stop")
+    print("✅ Bot is running!")
+    print("📡 Using long polling for updates")
+    print("💚 Health check available at /health or :8080")
     print("=" * 60)
     
-    # Use webhook on cloud platforms, polling on local/Android
-    if IS_RENDER or IS_HEROKU or IS_CHOREO:
-        print("📡 Running in cloud mode - using polling (webhook alternative)")
-        # For simplicity, use polling even on cloud (works fine)
-    
+    # Main bot loop
     while True:
         try:
             params = {"offset": LAST_UPDATE_ID + 1, "timeout": 30}
