@@ -14,7 +14,12 @@ import secrets
 import string
 import re
 import signal
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import platform
+import traceback
+import hashlib
+import base64
+import tempfile
+import random
 
 # ========== CONFIGURATION ==========
 # Get configuration from environment variables (SECURE)
@@ -26,8 +31,6 @@ if not BOT_TOKEN:
 
 # Get admin IDs from environment (comma-separated)
 admin_ids_str = os.environ.get("ADMIN_IDS", "")
-if not admin_ids_str:
-    print("⚠️ WARNING: ADMIN_IDS not set! No admin commands will work.")
 ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 
 # Channel verification settings (configure via env)
@@ -37,6 +40,7 @@ CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/gamerdroidbot2")
 # Platform detection
 IS_RENDER = os.environ.get("RENDER") == "true"
 IS_HEROKU = os.environ.get("HEROKU") == "true"
+IS_CHOREO = os.environ.get("CHOREO") == "true"
 IS_ANDROID = 'pydroid' in sys.executable.lower() or 'termux' in sys.executable.lower()
 
 # Set base directory based on platform
@@ -44,6 +48,8 @@ if IS_RENDER:
     BASE_DIR = Path("/opt/render/project/src/bot_hosting_data")
 elif IS_HEROKU:
     BASE_DIR = Path("/app/bot_hosting_data")
+elif IS_CHOREO:
+    BASE_DIR = Path("/choreo/app/bot_hosting_data")
 elif IS_ANDROID:
     BASE_DIR = Path("/storage/emulated/0/bot_hosting_data")
 else:
@@ -52,13 +58,15 @@ else:
 DEPLOYMENTS_DIR = BASE_DIR / "deployments"
 DATABASE_FILE = BASE_DIR / "bot_database.db"
 USER_FILES_DIR = BASE_DIR / "user_files"
+LOGS_DIR = BASE_DIR / "logs"
+PIP_CACHE_DIR = BASE_DIR / "pip_cache"
 
 # Create directories
-for dir_path in [BASE_DIR, DEPLOYMENTS_DIR, USER_FILES_DIR]:
+for dir_path in [BASE_DIR, DEPLOYMENTS_DIR, USER_FILES_DIR, LOGS_DIR, PIP_CACHE_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
-# File size limit (10MB)
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 10))
+# File size limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 50))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Premium Subscription Pricing
@@ -68,11 +76,14 @@ PRICE_MONTHLY_COINS = PRICE_MONTHLY_STARS * 10
 PRICE_YEARLY_COINS = PRICE_YEARLY_STARS * 10
 
 # Free tier settings
-FREE_USER_MAX_DEPLOYMENTS = int(os.environ.get("FREE_USER_MAX_DEPLOYMENTS", 2))
+FREE_USER_MAX_DEPLOYMENTS = int(os.environ.get("FREE_USER_MAX_DEPLOYMENTS", 3))
 FREE_DEPLOYMENT_DURATION_HOURS = int(os.environ.get("FREE_DEPLOYMENT_DURATION_HOURS", 24))
 
 # Exchange rate
 STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
+
+# Timeout settings
+PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LAST_UPDATE_ID = 0
@@ -82,49 +93,33 @@ server_running = True
 active_deployments = {}
 deployment_lock = threading.Lock()
 
-print("=" * 60)
-print("🤖 BOT HOSTING PLATFORM")
-print("=" * 60)
-print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Android' if IS_ANDROID else 'Local'}")
+# Webhook server
+WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
+
+print("=" * 70)
+print("╔═════════════════════════════════════════════════════════════════════╗")
+print("║         UNIVERSAL BOT HOSTING PLATFORM - ENTERPRISE EDITION         ║")
+print("╚═════════════════════════════════════════════════════════════════════╝")
+print("=" * 70)
+print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Choreo' if IS_CHOREO else 'Android' if IS_ANDROID else 'Local'}")
 print(f"📁 Data Directory: {BASE_DIR}")
-print(f"💰 Monthly Price: {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
-print(f"💰 Yearly Price: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
-print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} deployments x {FREE_DEPLOYMENT_DURATION_HOURS}h")
-print("=" * 60)
-
-# ========== HEALTH CHECK SERVER ==========
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status":"healthy","message":"Bot is running","timestamp":"' + 
-                           datetime.now().isoformat().encode() + b'"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress health check logs
-        if '/health' not in str(args):
-            print(f"[HTTP] {format % args}")
-
-def start_health_server():
-    """Start a simple HTTP server for health checks"""
-    port = int(os.environ.get("PORT", 8080))
-    
-    for attempt in range(3):
-        try:
-            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-            print(f"✅ Health check server running on port {port}")
-            server.serve_forever()
-            break
-        except OSError as e:
-            print(f"⚠️ Port {port} busy, trying {port + attempt + 1}...")
-            port = port + attempt + 1
-    else:
-        print(f"❌ Failed to start health server after 3 attempts")
+print(f"💰 Monthly: {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
+print(f"💰 Yearly: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
+print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
+print(f"📦 Max File Size: {MAX_FILE_SIZE_MB}MB")
+print(f"🐍 Python Version: {platform.python_version()}")
+print("=" * 70)
+print("✨ ENHANCED FEATURES:")
+print("   ✓ Supports ANY Python bot (Telegram, Discord, Flask, FastAPI, etc.)")
+print("   ✓ ALL dependency types (PyPI, Git, Mercurial, Subversion, wheel, egg)")
+print("   ✓ Auto-dependency detection from imports")
+print("   ✓ Progress bars for installations")
+print("   ✓ Environment variable injection with .env support")
+print("   ✓ Premium/Free tier with Stars/Coins")
+print("   ✓ Persistent storage with user file management")
+print("   ✓ Framework detection and optimized launcher")
+print("=" * 70)
 
 # ========== DATABASE SETUP ==========
 def init_db():
@@ -203,7 +198,10 @@ def init_db():
         error_log TEXT,
         is_free INTEGER DEFAULT 0,
         is_paused INTEGER DEFAULT 0,
-        last_expiry_notification TEXT
+        last_expiry_notification TEXT,
+        bot_type TEXT DEFAULT 'python_app',
+        framework TEXT DEFAULT 'unknown',
+        dependencies_installed TEXT
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS coin_transactions (
@@ -303,9 +301,16 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print("✅ Database initialized")
+    print("✅ Database initialized with enhanced schema")
 
-# ==================== HELPER FUNCTIONS ====================
+# ========== PROGRESS BAR FUNCTION ==========
+def create_progress_bar(percentage: float, width: int = 30, filled_char: str = "█", empty_char: str = "░") -> str:
+    filled = int(width * percentage / 100)
+    empty = width - filled
+    bar = filled_char * filled + empty_char * empty
+    return f"[{bar}] {percentage:.1f}%"
+
+# ========== HELPER FUNCTIONS ==========
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
@@ -654,7 +659,7 @@ def format_uptime(seconds):
     else:
         return f"{secs}s"
 
-# ==================== CHANNEL VERIFICATION ====================
+# ========== CHANNEL VERIFICATION ==========
 def check_channel_membership(user_id):
     try:
         url = f"{TELEGRAM_API}/getChatMember"
@@ -709,7 +714,7 @@ def send_verification_required(chat_id, user_id, first_name, message_id=None):
     else:
         send_message(chat_id, text, keyboard)
 
-# ==================== REDEEM CODES ====================
+# ========== REDEEM CODES ==========
 def generate_redeem_code(length=12):
     alphabet = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
@@ -781,7 +786,7 @@ def redeem_code(user_id, code):
     update_system_stats()
     return True, f"✅ Redeemed: {', '.join(reward_msg)}!"
 
-# ==================== PREMIUM SUBSCRIPTION ====================
+# ========== PREMIUM SUBSCRIPTION ==========
 def create_premium_invoice(chat_id, user_id, plan, duration_days, cost_stars):
     try:
         payload = f"premium_{plan}_{user_id}_{int(datetime.now().timestamp())}"
@@ -922,7 +927,7 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
             {"inline_keyboard": [[{"text": "⭐ Pay with Stars", "callback_data": f"premium_{plan}_stars"},
                                   {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
 
-# ==================== PERMANENT USER FILE STORAGE ====================
+# ========== PERMANENT USER FILE STORAGE ==========
 def save_user_file(user_id, temp_file_path, original_filename):
     user_dir = USER_FILES_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -938,11 +943,203 @@ def save_user_file(user_id, temp_file_path, original_filename):
     
     return saved_path, saved_filename
 
-# ==================== ENHANCED DEPLOYMENT FUNCTIONS ====================
-def install_dependencies(reqs_file, update_logs):
+def get_user_files(user_id):
+    user_dir = USER_FILES_DIR / str(user_id)
+    if not user_dir.exists():
+        return []
+    
+    files = []
+    for file_path in user_dir.glob("*.py"):
+        stat = file_path.stat()
+        files.append({
+            'filename': file_path.name,
+            'size': stat.st_size,
+            'modified': datetime.fromtimestamp(stat.st_mtime),
+            'path': str(file_path)
+        })
+    
+    files.sort(key=lambda x: x['modified'], reverse=True)
+    return files
+
+def delete_user_file(user_id, filename):
+    user_dir = USER_FILES_DIR / str(user_id)
+    file_path = user_dir / filename
+    if file_path.exists():
+        file_path.unlink()
+        return True
+    return False
+
+# ========== UNIVERSAL DEPENDENCY INSTALLER ==========
+class UniversalDependencyInstaller:
+    """Supports ALL Python dependency types: PyPI, Git, Mercurial, Subversion, local, wheel, egg, etc."""
+    
+    DEPENDENCY_PATTERNS = {
+        r'^([a-zA-Z0-9_\-\.]+)$': 'pypi',
+        r'^([a-zA-Z0-9_\-\.]+)[=<>~!]+': 'pypi',
+        r'^git\+https?://': 'git',
+        r'^git\+ssh://': 'git',
+        r'^git@': 'git',
+        r'\.git(@|#|$|/| )': 'git',
+        r'^hg\+https?://': 'mercurial',
+        r'^hg\+ssh://': 'mercurial',
+        r'^svn\+https?://': 'subversion',
+        r'^svn\+ssh://': 'subversion',
+        r'^\./': 'local',
+        r'^\.\./': 'local',
+        r'^/': 'local',
+        r'^[A-Za-z]:\\': 'local',
+        r'\.whl$': 'wheel',
+        r'\.egg$': 'egg',
+        r'\.(tar\.gz|tgz|tar\.bz2|zip)$': 'archive',
+    }
+    
+    @classmethod
+    def detect_dependency_type(cls, dependency: str) -> str:
+        for pattern, dep_type in cls.DEPENDENCY_PATTERNS.items():
+            if re.search(pattern, dependency, re.IGNORECASE):
+                return dep_type
+        return 'pypi'
+    
+    @classmethod
+    def install_dependency(cls, dependency: str, update_logs: callable, retries: int = 3) -> tuple:
+        dep_type = cls.detect_dependency_type(dependency)
+        update_logs(f"   📦 Type: {dep_type.upper()} - {dependency[:60]}...")
+        
+        for attempt in range(retries):
+            try:
+                if dep_type == 'git':
+                    return cls._install_git_dependency(dependency, update_logs)
+                elif dep_type in ['mercurial', 'subversion']:
+                    return cls._install_vcs_dependency(dependency, update_logs)
+                elif dep_type in ['wheel', 'egg', 'archive', 'local']:
+                    return cls._install_file_dependency(dependency, update_logs)
+                else:
+                    return cls._install_pypi_dependency(dependency, update_logs, attempt)
+            except subprocess.TimeoutExpired:
+                update_logs(f"   ⏰ Attempt {attempt + 1} timeout, retrying...")
+                sleep(5)
+            except Exception as e:
+                update_logs(f"   ⚠️ Attempt {attempt + 1} failed: {str(e)[:80]}")
+                if attempt < retries - 1:
+                    sleep(3)
+                else:
+                    return False, str(e)
+        return False, "Max retries exceeded"
+    
+    @classmethod
+    def _install_pypi_dependency(cls, dependency: str, update_logs: callable, attempt: int) -> tuple:
+        match = re.match(r'^([a-zA-Z0-9_\-\.]+)([=<>~!].*)?$', dependency)
+        if match:
+            package = match.group(1)
+            version_spec = match.group(2) or ""
+            full_package = package + version_spec
+        else:
+            full_package = dependency
+        
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--cache-dir", str(PIP_CACHE_DIR), 
+               "--timeout", str(PIP_INSTALL_TIMEOUT), full_package]
+        
+        if any(x in dependency.lower() for x in ['a', 'b', 'rc', 'dev', 'pre']):
+            cmd.insert(4, "--pre")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
+        
+        if result.returncode == 0:
+            version_match = re.search(r'Successfully installed .*? ([\d\.]+)', result.stdout)
+            version = version_match.group(1) if version_match else "unknown"
+            return True, version
+        else:
+            error = result.stderr[:200] if result.stderr else "Unknown error"
+            return False, error
+    
+    @classmethod
+    def _install_git_dependency(cls, dependency: str, update_logs: callable) -> tuple:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", dependency]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
+        return result.returncode == 0, result.stderr[:200] if result.stderr else ""
+    
+    @classmethod
+    def _install_vcs_dependency(cls, dependency: str, update_logs: callable) -> tuple:
+        cmd = [sys.executable, "-m", "pip", "install", dependency]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
+        return result.returncode == 0, result.stderr[:200] if result.stderr else ""
+    
+    @classmethod
+    def _install_file_dependency(cls, dependency: str, update_logs: callable) -> tuple:
+        cmd = [sys.executable, "-m", "pip", "install", dependency]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
+        return result.returncode == 0, result.stderr[:200] if result.stderr else ""
+
+# ========== AUTO-DEPENDENCY DETECTION ==========
+class AutoDependencyDetector:
+    """Automatically detect required dependencies by scanning code"""
+    
+    IMPORT_MAPPING = {
+        'flask': 'flask', 'django': 'django', 'fastapi': 'fastapi',
+        'aiohttp': 'aiohttp', 'tornado': 'tornado', 'sanic': 'sanic',
+        'telegram': 'python-telegram-bot', 'aiogram': 'aiogram',
+        'pyrogram': 'pyrogram', 'telethon': 'telethon',
+        'discord': 'discord.py', 'nextcord': 'nextcord',
+        'sqlalchemy': 'sqlalchemy', 'psycopg2': 'psycopg2-binary',
+        'pymysql': 'pymysql', 'pymongo': 'pymongo', 'redis': 'redis',
+        'requests': 'requests', 'httpx': 'httpx',
+        'numpy': 'numpy', 'pandas': 'pandas', 'scipy': 'scipy',
+        'PIL': 'Pillow', 'cv2': 'opencv-python',
+        'bs4': 'beautifulsoup4', 'selenium': 'selenium',
+        'dotenv': 'python-dotenv', 'click': 'click',
+        'cryptography': 'cryptography', 'jwt': 'pyjwt',
+        'yaml': 'pyyaml', 'toml': 'toml',
+        'boto3': 'boto3', 'psutil': 'psutil', 'loguru': 'loguru',
+        'rich': 'rich', 'tqdm': 'tqdm', 'uvicorn': 'uvicorn',
+        'gunicorn': 'gunicorn', 'celery': 'celery',
+    }
+    
+    @classmethod
+    def scan_imports(cls, code_content: str, update_logs: callable) -> list:
+        detected = set()
+        lines = code_content.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            match = re.match(r'^(?:from|import)\s+([a-zA-Z0-9_\.]+)', line)
+            if match:
+                module = match.group(1).split('.')[0]
+                if module in cls.IMPORT_MAPPING:
+                    package = cls.IMPORT_MAPPING[module]
+                    if package and package not in detected:
+                        detected.add(package)
+                        update_logs(f"   🔍 Detected: {module} → {package}")
+                elif module not in ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 
+                                     'string', 'collections', 'itertools', 'functools', 'typing', 'pathlib',
+                                     'tempfile', 'subprocess', 'threading', 'multiprocessing', 'socket',
+                                     'ssl', 'hashlib', 'base64', 'zipfile', 'tarfile', 'shutil', 'glob']:
+                    guessed = module.replace('_', '-')
+                    if module == 'bs4':
+                        guessed = 'beautifulsoup4'
+                    elif module == 'cv2':
+                        guessed = 'opencv-python'
+                    detected.add(guessed)
+                    update_logs(f"   🔍 Detected: {module} → {guessed}")
+        
+        return list(detected)
+    
+    @classmethod
+    def scan_requirements_file(cls, content: str, update_logs: callable) -> list:
+        requirements = []
+        for line in content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('-r'):
+                if ';' in line:
+                    line = line.split(';')[0].strip()
+                requirements.append(line)
+                update_logs(f"   📄 From requirements: {line[:60]}")
+        return requirements
+
+# ========== ENHANCED DEPENDENCY INSTALLATION ==========
+def install_dependencies_enhanced(reqs_file, update_logs):
     if not reqs_file.exists():
         update_logs("✅ No requirements file found")
-        return True
+        return True, []
     
     try:
         with open(reqs_file, 'r') as f:
@@ -950,86 +1147,80 @@ def install_dependencies(reqs_file, update_logs):
         
         if not requirements:
             update_logs("⚠️ requirements.txt is empty")
-            return True
+            return True, []
         
         packages = [p.strip() for p in requirements.split('\n') if p.strip() and not p.startswith('#')]
         update_logs(f"📦 Found {len(packages)} package(s) to install")
         
+        # Upgrade pip with progress
         update_logs("🔄 Upgrading pip...")
+        update_logs(create_progress_bar(0, 25))
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], 
                       capture_output=True, timeout=60)
+        update_logs(create_progress_bar(100, 25))
+        update_logs("✅ Pip upgraded")
         
-        update_logs("📦 Installing all packages...")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install"] + packages,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            if result.returncode == 0:
-                update_logs(f"✅ Successfully installed {len(packages)} package(s)")
-                return True
+        # Install packages with progress tracking
+        success_count = 0
+        failed_packages = []
+        
+        for i, package in enumerate(packages):
+            progress = (i / len(packages)) * 100
+            update_logs(create_progress_bar(progress, 25))
+            update_logs(f"   Installing: {package[:50]}...")
+            
+            success, message = UniversalDependencyInstaller.install_dependency(package, update_logs)
+            
+            if success:
+                success_count += 1
+                update_logs(f"   ✅ {package[:50]} installed")
             else:
-                update_logs("⚠️ Batch install had issues, trying individually...")
-                success_count = 0
-                for i, package in enumerate(packages, 1):
-                    update_logs(f"   [{i}/{len(packages)}] Installing: {package[:50]}...")
-                    try:
-                        single_result = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", package],
-                            capture_output=True,
-                            text=True,
-                            timeout=120
-                        )
-                        if single_result.returncode == 0:
-                            success_count += 1
-                            update_logs(f"   ✅ {package[:50]} installed")
-                        else:
-                            error_short = single_result.stderr[:100] if single_result.stderr else "Unknown"
-                            update_logs(f"   ⚠️ {package[:50]} failed: {error_short}")
-                    except subprocess.TimeoutExpired:
-                        update_logs(f"   ⏰ {package[:50]} timeout - continuing")
-                    except Exception as e:
-                        update_logs(f"   ❌ {package[:50]} error: {str(e)[:50]}")
-                
-                success_rate = success_count / len(packages) if packages else 1.0
-                if success_rate >= 0.8:
-                    update_logs(f"✅ Installed {success_count}/{len(packages)} packages (≥80%)")
-                    return True
-                else:
-                    update_logs(f"❌ Only {success_count}/{len(packages)} packages installed (<80%)")
-                    return False
-        except subprocess.TimeoutExpired:
-            update_logs("❌ Package installation timed out")
-            return False
+                failed_packages.append(package)
+                update_logs(f"   ❌ {package[:50]} failed: {message[:80]}")
+        
+        update_logs(create_progress_bar(100, 25))
+        
+        if failed_packages:
+            update_logs(f"⚠️ Failed: {len(failed_packages)} package(s)")
+            for pkg in failed_packages[:5]:
+                update_logs(f"   • {pkg[:50]}")
+        
+        update_logs(f"✅ Installed {success_count}/{len(packages)} packages")
+        
+        success_rate = success_count / len(packages) if packages else 1.0
+        return success_rate >= 0.8, failed_packages
+        
     except Exception as e:
         update_logs(f"❌ Installation error: {str(e)}")
-        return False
+        return False, []
 
-def validate_bot_code(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        warnings = []
-        hardcoded_patterns = [
-            (r'BOT_TOKEN\s*=\s*["\'][^"\']+["\']', '⚠️ BOT_TOKEN appears hardcoded. Use os.environ.get("BOT_TOKEN") instead'),
-            (r'TOKEN\s*=\s*["\'][^"\']+["\']', '⚠️ TOKEN appears hardcoded. Use os.environ.get("TOKEN") instead'),
-        ]
-        
-        for pattern, warning in hardcoded_patterns:
-            if re.search(pattern, content):
-                warnings.append(warning)
-        
-        compile(content, str(file_path), 'exec')
-        return True, warnings
-    except SyntaxError as e:
-        return False, [f"❌ Syntax Error at line {e.lineno}: {e.msg}"]
-    except Exception as e:
-        return False, [f"❌ Validation error: {str(e)}"]
+# ========== FRAMEWORK DETECTION ==========
+def detect_bot_framework(code_content: str) -> list:
+    frameworks = []
+    
+    if 'telegram' in code_content.lower() or 'telegram.ext' in code_content:
+        frameworks.append('telegram')
+    if 'discord' in code_content.lower():
+        frameworks.append('discord')
+    if 'flask' in code_content.lower():
+        frameworks.append('flask')
+    if 'fastapi' in code_content.lower():
+        frameworks.append('fastapi')
+    if 'django' in code_content.lower():
+        frameworks.append('django')
+    if 'aiohttp' in code_content.lower():
+        frameworks.append('aiohttp')
+    if 'aiogram' in code_content.lower():
+        frameworks.append('aiogram')
+    
+    return frameworks if frameworks else ['generic']
 
-def create_launcher_script(deploy_folder, dest_script, env_vars_dict):
+# ========== ENHANCED LAUNCHER SCRIPT ==========
+def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs):
+    frameworks = detect_bot_framework(code_content)
+    framework_str = ', '.join(frameworks)
+    update_logs(f"🔧 Framework detection: {framework_str}")
+    
     launcher_script = deploy_folder / "run.py"
     
     env_set_code = []
@@ -1041,18 +1232,31 @@ def create_launcher_script(deploy_folder, dest_script, env_vars_dict):
     
     with open(launcher_script, 'w', encoding='utf-8') as f:
         f.write(f'''#!/usr/bin/env python3
+"""
+UNIVERSAL BOT LAUNCHER - Auto-generated by Hosting Platform
+Detected frameworks: {framework_str}
+"""
+
 import os
 import sys
 import time
+import json
+import signal
+import threading
+import traceback
+from pathlib import Path
 
+# Change to deployment directory
 os.chdir(r"{deploy_folder}")
 
+# ========== SET ENVIRONMENT VARIABLES ==========
 {env_set_str}
 
+# Try to load .env file
 try:
     from dotenv import load_dotenv
-    env_file = r"{deploy_folder}/.env"
-    if os.path.exists(env_file):
+    env_file = Path(r"{deploy_folder}") / ".env"
+    if env_file.exists():
         load_dotenv(env_file)
         print("✅ Loaded .env file")
 except ImportError:
@@ -1060,60 +1264,115 @@ except ImportError:
 except Exception as e:
     print(f"⚠️ Could not load .env: {{e}}")
 
-print("🔧 ENVIRONMENT VARIABLES STATUS:")
-print("=" * 50)
+# ========== HEARTBEAT THREAD ==========
+heartbeat_running = True
 
-critical_vars_found = []
-custom_vars = []
+def heartbeat():
+    heartbeat_file = Path(r"{deploy_folder}") / ".heartbeat"
+    while heartbeat_running:
+        try:
+            with open(heartbeat_file, 'w') as f:
+                f.write(str(time.time()))
+            time.sleep(30)
+        except:
+            pass
+
+heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+heartbeat_thread.start()
+
+# ========== VERIFY ENVIRONMENT ==========
+print("=" * 50)
+print("🔧 ENVIRONMENT VERIFICATION")
+print("=" * 50)
+print(f"Python: {{sys.version}}")
+print(f"Working directory: {{os.getcwd()}}")
+
+print("\\n📊 Environment Variables:")
+env_count = 0
 for key, value in os.environ.items():
-    if key not in ['PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'PWD', 'OLDPWD', 'SHLVL', '_', 'HOSTNAME']:
-        if any(s in key.upper() for s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'HASH']):
-            display_value = value[:10] + "..." if len(value) > 15 else value
+    if key not in ['PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'LC_ALL']:
+        if any(s in key.upper() for s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD']):
+            print(f"  ✅ {{key}} = {{value[:10]}}...")
         else:
-            display_value = value[:30] + "..." if len(value) > 35 else value
-        custom_vars.append(f"  ✅ {{key}} = {{display_value}}")
-        if key.upper() in ['BOT_TOKEN', 'TOKEN', 'API_TOKEN']:
-            critical_vars_found.append(key)
+            print(f"  ✅ {{key}} = {{value[:40]}}...")
+        env_count += 1
+print(f"\\n📊 Total custom env vars: {{env_count}}")
 
-print(f"📊 Loaded {{len(custom_vars)}} environment variable(s):")
-for var in custom_vars[:15]:
-    print(var)
-
-if critical_vars_found:
-    print(f"✅ Critical vars found: {{', '.join(critical_vars_found)}}")
-else:
-    print("⚠️ WARNING: No BOT_TOKEN/TOKEN found!")
+# Check for common bot tokens
+for token_name in ['BOT_TOKEN', 'TOKEN', 'API_TOKEN', 'DISCORD_TOKEN']:
+    if os.environ.get(token_name):
+        print(f"✅ {{token_name}} found!")
+        break
 
 print("=" * 50)
-print("🚀 Starting bot...\\n")
+print("🚀 STARTING BOT")
+print("=" * 50)
 
+# ========== METHOD 1: Import and run ==========
 try:
+    print("📌 Method 1: Importing as module...")
+    sys.path.insert(0, r"{deploy_folder}")
+    
     import importlib.util
-    spec = importlib.util.spec_from_file_location("bot", r"{dest_script}")
+    spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
+    if spec is None:
+        raise ImportError(f"Cannot load module")
+    
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     
-    if hasattr(module, 'main'):
-        print("📌 Calling main() function...")
-        module.main()
-    elif hasattr(module, 'run'):
-        print("📌 Calling run() function...")
-        module.run()
-    else:
-        print("📌 Running script directly...")
-        exec(open(r"{dest_script}").read())
+    # Try different entry points
+    entry_points = ['main', 'run', 'start', 'setup', 'app', 'application', 'bot', 'client']
+    
+    for entry in entry_points:
+        if hasattr(module, entry):
+            attr = getattr(module, entry)
+            if callable(attr):
+                print(f"✅ Found {{entry}}(), calling...")
+                try:
+                    result = attr()
+                    if result and hasattr(result, 'run_polling'):
+                        result.run_polling()
+                    elif result and hasattr(result, 'run'):
+                        result.run()
+                    elif result and hasattr(result, 'start'):
+                        result.start()
+                    elif result and hasattr(result, 'run_forever'):
+                        result.run_forever()
+                    elif result and hasattr(result, 'serve_forever'):
+                        result.serve_forever()
+                except KeyboardInterrupt:
+                    print("\\n🛑 Bot stopped by user")
+                except Exception as e:
+                    print(f"❌ Error in {{entry}}: {{e}}")
+                heartbeat_running = False
+                sys.exit(0)
+    
+    print("⚠️ No entry point found, trying direct execution...")
+    
+except Exception as e:
+    print(f"⚠️ Import method failed: {{e}}")
+
+# ========== METHOD 2: Subprocess execution ==========
+print("📌 Method 2: Running as subprocess...")
+import subprocess
+
+try:
+    result = subprocess.run([sys.executable, r"{dest_script}"], env=os.environ.copy())
+    sys.exit(result.returncode)
 except KeyboardInterrupt:
-    print("\\n🛑 Bot stopped")
+    print("\\n🛑 Stopped by user")
     sys.exit(0)
 except Exception as e:
-    print(f"❌ Error: {{e}}")
-    import traceback
-    traceback.print_exc()
+    print(f"❌ Subprocess failed: {{e}}")
+    sys.exit(1)
 ''')
     
-    return launcher_script
+    launcher_script.chmod(0o755)
+    return launcher_script, frameworks
 
-def deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars, 
+# ========== ENHANCED DEPLOYMENT FUNCTION ==========
+def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars, 
                      plan, duration, cost_coins, cost_stars, payment_method, is_free=False):
     status_msg = send_message(chat_id, "```\n🚀 STARTING DEPLOYMENT\n```", None)
     if not status_msg:
@@ -1121,16 +1380,15 @@ def deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
     status_message_id = status_msg.get('result', {}).get('message_id')
     
     logs = []
-    error_logs = []
     
     def update_logs(new_log):
         logs.append(new_log)
-        display_logs = logs[-30:]
+        display_logs = logs[-25:]
         log_text = "\n".join(display_logs)
         if status_message_id:
             try:
                 edit_message(chat_id, status_message_id, 
-                            f"```\n🚀 DEPLOYMENT IN PROGRESS\n\n{log_text[-2500:]}\n```", None)
+                            f"```\n🚀 DEPLOYMENT IN PROGRESS\n\n{log_text[-3000:]}\n```", None)
             except:
                 pass
     
@@ -1146,8 +1404,9 @@ def deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
         
         dest_script = deploy_folder / saved_filename
         shutil.copy2(saved_path, dest_script)
-        update_logs(f"📄 File saved permanently: {saved_filename} ({format_file_size(file_size)})")
+        update_logs(f"📄 File saved: {saved_filename} ({format_file_size(file_size)})")
         
+        # Parse environment variables
         env_vars_dict = {}
         if env_vars:
             if isinstance(env_vars, dict):
@@ -1162,42 +1421,45 @@ def deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
                         if key:
                             env_vars_dict[key] = value
         
-        update_logs("🔍 Validating bot code...")
-        valid, validation_warnings = validate_bot_code(dest_script)
-        for warning in validation_warnings:
-            update_logs(warning)
+        # Read code content for analysis
+        with open(dest_script, 'r', encoding='utf-8') as f:
+            code_content = f.read()
         
-        deps_success = True
+        # Detect dependencies
+        update_logs("🔍 Scanning for dependencies...")
+        requirements_list = []
+        
         if requirements_text and requirements_text.strip():
+            requirements_list = AutoDependencyDetector.scan_requirements_file(requirements_text, update_logs)
+        else:
+            auto_detected = AutoDependencyDetector.scan_imports(code_content, update_logs)
+            if auto_detected:
+                requirements_list.extend(auto_detected)
+                update_logs(f"📦 Auto-detected {len(auto_detected)} package(s)")
+        
+        # Install dependencies
+        deps_success, failed = True, []
+        if requirements_list:
             reqs_file = deploy_folder / "requirements.txt"
             with open(reqs_file, 'w') as f:
-                f.write(requirements_text)
-            update_logs("📦 Installing dependencies...")
-            deps_success = install_dependencies(reqs_file, update_logs)
+                f.write('\n'.join(requirements_list))
+            deps_success, failed = install_dependencies_enhanced(reqs_file, update_logs)
         
-        if not deps_success and requirements_text:
-            update_logs("❌ Critical dependency installation failed!")
-            edit_message(chat_id, status_message_id, 
-                        f"❌ **DEPLOYMENT FAILED - Dependency Error**\n\nCould not install required packages.")
-            Path(temp_file).unlink(missing_ok=True)
-            return False
+        if not deps_success and requirements_list:
+            update_logs("⚠️ Some dependencies failed to install - continuing anyway")
         
-        update_logs(f"🔧 Setting {len(env_vars_dict)} environment variable(s):")
-        for k, v in list(env_vars_dict.items())[:10]:
-            if any(s in k.upper() for s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'HASH']):
-                display_v = v[:5] + "..." if len(v) > 10 else v
-            else:
-                display_v = v[:30] + "..." if len(v) > 35 else v
-            update_logs(f"   • {k} = {display_v}")
-        
+        # Create .env file
         env_file = deploy_folder / ".env"
         with open(env_file, 'w') as f:
             for k, v in env_vars_dict.items():
                 f.write(f"{k}={v}\n")
+        update_logs(f"📝 Created .env with {len(env_vars_dict)} variables")
         
-        update_logs("🚀 Creating launcher script...")
-        launcher_script = create_launcher_script(deploy_folder, dest_script, env_vars_dict)
+        # Create enhanced launcher
+        update_logs("🚀 Creating enhanced launcher...")
+        launcher_script, frameworks = create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs)
         
+        # Create start script
         start_script = deploy_folder / "start.sh"
         with open(start_script, 'w') as f:
             f.write(f"""#!/bin/bash
@@ -1208,11 +1470,13 @@ echo $! > pid.txt
 """)
         start_script.chmod(0o755)
         
+        # Start the bot
         update_logs("🚀 Starting bot process...")
-        result = subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True, text=True)
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True, text=True)
         
         sleep(5)
         
+        # Check if running
         pid_file = deploy_folder / "pid.txt"
         proc_pid = None
         if pid_file.exists():
@@ -1220,7 +1484,7 @@ echo $! > pid.txt
                 try:
                     proc_pid = int(f.read().strip())
                 except:
-                    proc_pid = None
+                    pass
         
         is_running = False
         if proc_pid:
@@ -1228,36 +1492,20 @@ echo $! > pid.txt
                 os.kill(proc_pid, 0)
                 is_running = True
             except:
-                is_running = False
+                pass
         
+        # Check output
         log_file = deploy_folder / "output.log"
-        output_preview = ""
-        bot_actually_started = False
-        
         if log_file.exists() and log_file.stat().st_size > 0:
             with open(log_file, 'r') as f:
                 output = f.read()
-                output_preview = output[:2000]
-                
-                started_indicators = [
-                    "Bot started", "Application started", "Polling",
-                    "Running", "started", "✅", "BOT_TOKEN found"
-                ]
-                
-                for indicator in started_indicators:
-                    if indicator.lower() in output.lower():
-                        bot_actually_started = True
-                        break
-                
                 if output:
-                    update_logs("📋 Bot output preview:")
+                    update_logs("📋 Output preview:")
                     for line in output.split('\n')[:15]:
                         if line.strip():
-                            update_logs(f"   {line[:150]}")
+                            update_logs(f"   {line[:120]}")
         
-        deployment_successful = (is_running or bot_actually_started) and log_file.exists()
-        
-        if deployment_successful:
+        if is_running:
             start_time = datetime.now()
             expire_time = start_time + timedelta(days=duration) if not is_free else start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
             
@@ -1265,12 +1513,13 @@ echo $! > pid.txt
             c = conn.cursor()
             c.execute('''INSERT INTO deployments 
                 (user_id, file_name, file_size, requirements, env_vars, plan, payment_method, cost_coins, cost_stars, 
-                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused, framework, dependencies_installed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
-                 "\n".join(logs[-50:]), "Bot running", 1 if is_free else 0, 0))
+                 "\n".join(logs[-100:]), "Bot running", 1 if is_free else 0, 0,
+                 ', '.join(frameworks), json.dumps(requirements_list)))
             deployment_db_id = c.lastrowid
             conn.commit()
             conn.close()
@@ -1292,12 +1541,17 @@ echo $! > pid.txt
             success_text = (
                 f"**🎉 DEPLOYMENT SUCCESSFUL!** 🎉\n\n"
                 f"📁 **File:** `{dest_script.name}`\n"
+                f"🔧 **Framework:** {', '.join(frameworks)}\n"
                 f"📋 **Plan:** {plan.upper()}\n"
                 f"⏱️ **Duration:** {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}\n"
                 f"📅 **Expires:** {expire_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🔧 **Env Vars Set:** {len(env_vars_dict)}\n"
+                f"📦 **Dependencies:** {len(requirements_list)} package(s)\n"
+                f"🔧 **Env Vars:** {len(env_vars_dict)}\n"
                 f"🆔 **ID:** `{deployment_db_id}`"
             )
+            
+            if failed:
+                success_text += f"\n\n⚠️ **Partial Success:** {len(failed)} package(s) failed to install"
             
             edit_message(chat_id, status_message_id, success_text, success_keyboard)
             
@@ -1328,12 +1582,13 @@ echo $! > pid.txt
             c = conn.cursor()
             c.execute('''INSERT INTO deployments 
                 (user_id, file_name, file_size, requirements, env_vars, plan, payment_method, cost_coins, cost_stars, 
-                 start_time, expire_time, status, install_log, deploy_log, error_log, is_free)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 start_time, expire_time, status, install_log, deploy_log, error_log, is_free, framework)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  datetime.now().isoformat(), datetime.now().isoformat(), "failed",
-                 "\n".join(logs[-50:]), "Bot failed to start", error_msg[:2000], 1 if is_free else 0))
+                 "\n".join(logs[-50:]), "Bot failed to start", error_msg[:2000], 1 if is_free else 0,
+                 ', '.join(frameworks)))
             conn.commit()
             conn.close()
             
@@ -1341,11 +1596,12 @@ echo $! > pid.txt
             return False
             
     except Exception as e:
-        error_msg = f"❌ **DEPLOYMENT FAILED**\n\nException: {str(e)}"
+        error_msg = f"❌ **DEPLOYMENT FAILED**\n\nException: {str(e)}\n{traceback.format_exc()}"
         edit_message(chat_id, status_message_id, error_msg[:4000])
         Path(temp_file).unlink(missing_ok=True)
         return False
 
+# ========== WRAPPER FUNCTIONS ==========
 def deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars):
     if not is_user_verified(user_id):
         send_verification_required(chat_id, user_id, "User", None)
@@ -1357,7 +1613,7 @@ def deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements_text, en
                     {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
         return False
     
-    return deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
+    return deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars,
                            "free", FREE_DEPLOYMENT_DURATION_HOURS, 0, 0, "none", is_free=True)
 
 def deploy_paid_bot(chat_id, user_id, temp_file, requirements_text, env_vars, plan, duration, cost_coins, cost_stars, payment_method):
@@ -1371,10 +1627,10 @@ def deploy_paid_bot(chat_id, user_id, temp_file, requirements_text, env_vars, pl
             f"As a premium user, your {plan.upper()} deployment is **FREE**!\n\n"
             f"Proceeding with deployment...")
         
-        return deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
+        return deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars,
                                plan, duration, 0, 0, "premium_free", is_free=False)
     else:
-        return deploy_with_logs(chat_id, user_id, temp_file, requirements_text, env_vars,
+        return deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars,
                                plan, duration, cost_coins, cost_stars, payment_method, is_free=False)
 
 def get_payment_keyboard(plan, cost_stars, cost_coins):
@@ -1386,7 +1642,7 @@ def get_payment_keyboard(plan, cost_stars, cost_coins):
         ]
     }
 
-# ==================== DEPLOYMENT MANAGEMENT ====================
+# ========== DEPLOYMENT MANAGEMENT ==========
 def delete_deployment(deployment_id, user_id, chat_id):
     try:
         conn = sqlite3.connect(DATABASE_FILE)
@@ -1483,7 +1739,11 @@ def restart_deployment(deployment_id, user_id, chat_id):
         
         env_vars = json.loads(env_vars_json) if env_vars_json else {}
         
-        launcher_script = create_launcher_script(deploy_folder, dest_script, env_vars)
+        # Read code content for launcher
+        with open(dest_script, 'r', encoding='utf-8') as f:
+            code_content = f.read()
+        
+        launcher_script, _ = create_enhanced_launcher_script(deploy_folder, dest_script, env_vars, code_content, lambda x: None)
         
         env_file = deploy_folder / ".env"
         with open(env_file, 'w') as f:
@@ -1572,7 +1832,7 @@ def stop_deployment(deployment_id):
     
     update_system_stats()
 
-# ==================== LOG VIEWING FUNCTIONS ====================
+# ========== LOG VIEWING FUNCTIONS ==========
 def view_install_logs(chat_id, message_id, user_id, dep_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -1655,7 +1915,7 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
 def view_deployment(chat_id, message_id, user_id, dep_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("SELECT file_name, file_size, plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, is_free, requirements, env_vars, error_log, is_paused FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
+    c.execute("SELECT file_name, file_size, plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, is_free, requirements, env_vars, error_log, is_paused, framework FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
     row = c.fetchone()
     conn.close()
     
@@ -1663,7 +1923,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         edit_message(chat_id, message_id, "❌ Not found", {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
         return
     
-    fname, fsize, plan, payment, cost_coins, cost_stars, start_str, expire_str, status, is_free, requirements, env_vars_json, error_log, is_paused = row
+    fname, fsize, plan, payment, cost_coins, cost_stars, start_str, expire_str, status, is_free, requirements, env_vars_json, error_log, is_paused, framework = row
     start_time = datetime.fromisoformat(start_str)
     expire_time = datetime.fromisoformat(expire_str)
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
@@ -1730,6 +1990,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     text = (
         f"**📄 DEPLOYMENT #{dep_id}**\n\n"
         f"📁 File: `{fname}` ({size_str})\n"
+        f"🔧 Framework: `{framework}`\n"
         f"📋 Plan: `{plan.upper()}`\n"
         f"💰 Cost: {cost_text}\n"
         f"📅 Started: `{start_time.strftime('%Y-%m-%d %H:%M')}`\n"
@@ -1741,7 +2002,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     )
     edit_message(chat_id, message_id, text, keyboard)
 
-# ==================== HANDLERS ====================
+# ========== HANDLERS ==========
 def handle_start(chat_id, user_id, username, first_name):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -1944,7 +2205,7 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
     
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, payment_method, is_paused FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
+    c.execute("SELECT deployment_id, file_name, file_size, plan, expire_time, status, is_free, payment_method, is_paused, framework FROM deployments WHERE user_id = ? ORDER BY deployment_id DESC", (user_id,))
     rows = c.fetchall()
     conn.close()
     
@@ -1964,7 +2225,7 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
         header = "📦 **Your Deployments**\n\n"
     
     keyboard = {"inline_keyboard": []}
-    for dep_id, fname, fsize, plan, exp_str, status, is_free, payment, is_paused in rows:
+    for dep_id, fname, fsize, plan, exp_str, status, is_free, payment, is_paused, framework in rows:
         exp_time = datetime.fromisoformat(exp_str)
         if is_free:
             remaining = (exp_time - datetime.now()).total_seconds() / 3600
@@ -1990,8 +2251,18 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
         if is_paused:
             icon = "⏸️"
         
+        # Framework icon
+        if 'telegram' in framework:
+            fw_icon = "🤖"
+        elif 'discord' in framework:
+            fw_icon = "🎮"
+        elif 'flask' in framework or 'fastapi' in framework:
+            fw_icon = "🌐"
+        else:
+            fw_icon = "🐍"
+        
         size_str = format_file_size(fsize) if fsize else "Unknown"
-        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon} ID:{dep_id} - {fname[:20]} ({size_str}) [{remaining_text}]", 
+        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon}{fw_icon} ID:{dep_id} - {fname[:20]} ({size_str}) [{remaining_text}]", 
                          "callback_data": f"view_deploy_{dep_id}"}])
     
     keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
@@ -2054,7 +2325,7 @@ def get_reqs_keyboard():
     return {
         "inline_keyboard": [
             [{"text": "📦 Send requirements.txt", "callback_data": "reqs_yes"}],
-            [{"text": "⏭️ Skip - No requirements", "callback_data": "reqs_no"}],
+            [{"text": "⚡ Auto-detect & Skip", "callback_data": "reqs_no"}],
             [{"text": "❌ Cancel Deployment", "callback_data": "cancel_deploy"}]
         ]
     }
@@ -2664,8 +2935,8 @@ def handle_callback(callback):
             f"Please send your `requirements.txt` file now.\n\n"
             f"Example content:\n"
             f"```\npython-telegram-bot==20.7\nrequests==2.31.0\n```\n\n"
-            f"Or click Skip:",
-            {"inline_keyboard": [[{"text": "⏭️ Skip", "callback_data": "reqs_no"}],
+            f"Or click Auto-detect:",
+            {"inline_keyboard": [[{"text": "⚡ Auto-detect & Skip", "callback_data": "reqs_no"}],
                                   [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]]})
         return
     
@@ -3076,7 +3347,7 @@ def handle_message(message):
                             f"📦 File size: {format_file_size(file_size)}\n"
                             f"💰 Cost: {user_step.get('cost_stars')}⭐ or {user_step.get('cost_coins')}🪙\n\n"
                             f"**📦 Requirements?**\n"
-                            f"Send requirements.txt or click No:",
+                            f"Send requirements.txt or click Auto-detect:",
                             get_reqs_keyboard())
                     except Exception as e:
                         send_message(chat_id, f"❌ Error downloading: {str(e)}")
@@ -3132,7 +3403,7 @@ def handle_successful_payment(message):
             update_user_stars(user_id, total_amount, "deployment", "telegram_stars", invoice_payload)
             conn.commit()
             
-            deploy_with_logs(chat_id, user_id, temp_file, requirements, env_vars, 
+            deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements, env_vars, 
                             plan, duration, cost_coins, cost_stars, payment_method)
             
             c.execute('UPDATE pending_deployments SET status = "completed" WHERE payload = ?', (invoice_payload,))
@@ -3154,21 +3425,57 @@ def handle_pre_checkout_query(pre_checkout_query):
         print(f"❌ Pre-checkout error: {e}")
         return False
 
+# ==================== HEALTH CHECK SERVER ====================
+def start_health_server():
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status":"healthy","version":"2.0","timestamp":"' + datetime.now().isoformat().encode() + b'"}')
+            def log_message(self, format, *args):
+                pass
+        port = int(os.environ.get("PORT", 8080))
+        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"✅ Health check server on port {port}")
+    except Exception as e:
+        print(f"⚠️ Health server: {e}")
+
 # ==================== MAIN ====================
 def main():
     global LAST_UPDATE_ID
     
-    print("=" * 60)
-    print("🤖 BOT HOSTING PLATFORM")
-    print("=" * 60)
-    print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Android' if IS_ANDROID else 'Local'}")
+    print("=" * 70)
+    print("╔═════════════════════════════════════════════════════════════════════╗")
+    print("║         UNIVERSAL BOT HOSTING PLATFORM - ENTERPRISE EDITION         ║")
+    print("╚═════════════════════════════════════════════════════════════════════╝")
+    print("=" * 70)
+    print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Choreo' if IS_CHOREO else 'Android' if IS_ANDROID else 'Local'}")
     print(f"📁 Data Directory: {BASE_DIR}")
-    print(f"💰 Monthly Price: {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
-    print(f"💰 Yearly Price: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
-    print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} deployments x {FREE_DEPLOYMENT_DURATION_HOURS}h")
-    print("=" * 60)
+    print(f"💰 Monthly: {PRICE_MONTHLY_STARS}⭐ | Yearly: {PRICE_YEARLY_STARS}⭐")
+    print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
+    print(f"📦 Max File Size: {MAX_FILE_SIZE_MB}MB")
+    print(f"🐍 Python Version: {platform.python_version()}")
+    print("=" * 70)
+    print("✨ ENHANCED FEATURES:")
+    print("   ✓ Supports ANY Python bot (Telegram, Discord, Flask, FastAPI, etc.)")
+    print("   ✓ ALL dependency types (PyPI, Git, Mercurial, Subversion, wheel, egg)")
+    print("   ✓ Auto-dependency detection from imports")
+    print("   ✓ Progress bars for installations")
+    print("   ✓ Environment variable injection with .env support")
+    print("   ✓ Premium/Free tier with Stars/Coins")
+    print("   ✓ Persistent storage with user file management")
+    print("   ✓ Framework detection and optimized launcher")
+    print("=" * 70)
     
     init_db()
+    
+    # Start health check server for cloud platforms
+    if IS_RENDER or IS_HEROKU or IS_CHOREO:
+        start_health_server()
     
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
@@ -3181,18 +3488,10 @@ def main():
         print(f"❌ Error: {e}")
         return
     
-    # Start health check server (for Render)
-    health_thread = threading.Thread(target=start_health_server, daemon=True)
-    health_thread.start()
-    print("✅ Health check server started on port 8080")
+    print("=" * 70)
+    print("✅ Bot running! Press Ctrl+C to stop")
+    print("=" * 70)
     
-    print("=" * 60)
-    print("✅ Bot is running!")
-    print("📡 Using long polling for updates")
-    print("💚 Health check available at /health or :8080")
-    print("=" * 60)
-    
-    # Main bot loop
     while True:
         try:
             params = {"offset": LAST_UPDATE_ID + 1, "timeout": 30}
@@ -3215,6 +3514,7 @@ def main():
             break
         except Exception as e:
             print(f"⚠️ Error: {e}")
+            traceback.print_exc()
             sleep(5)
 
 if __name__ == "__main__":
