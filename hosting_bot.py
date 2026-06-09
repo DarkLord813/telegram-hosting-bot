@@ -1319,44 +1319,81 @@ heartbeat_thread.start()
 
 # ========== VERIFY ENVIRONMENT ==========
 print("=" * 50)
-print("🔧 ENVIRONMENT VERIFICATION")
+print("🔧 LAUNCHER READY")
 print("=" * 50)
-print(f"Python: {{sys.version}}")
-print(f"Working directory: {{os.getcwd()}}")
+print(f"Python: {{sys.version.split()[0]}}")
+print(f"Dir: {{os.getcwd()}}")
+sys.stdout.flush()
 
-print("\\n📊 Environment Variables:")
-env_count = 0
-for key, value in os.environ.items():
-    if key not in ['PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'LC_ALL']:
-        if any(s in key.upper() for s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD']):
-            print(f"  ✅ {{key}} = {{value[:10]}}...")
-        else:
-            print(f"  ✅ {{key}} = {{value[:40]}}...")
-        env_count += 1
-print(f"\\n📊 Total custom env vars: {{env_count}}")
+# Skip noisy cloud/system env vars — only show what the user actually set
+_SKIP_PREFIXES = ('KUBERNETES_', 'RENDER_', 'UV_', 'PIPENV_', 'NPM_', 'NODE_',
+                   'BUN_', 'GUNICORN_', 'YARN_', 'DEFAULT_', 'PYTHON_')
+_SKIP_EXACT = frozenset([
+    'PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM',
+    'LANG', 'LC_ALL', 'PWD', 'HOSTNAME', 'RENDER', 'PORT',
+    'IS_PULL_REQUEST', 'RENDER_ROOT', 'RENDER_ENV_IS_DOCKER',
+    'RENDER_SERVICE_ID', 'RENDER_SERVICE_NS', 'RENDER_SERVICE_CONTEXT_ROOT',
+    'RENDER_EXTERNAL_HOSTNAME', 'RENDER_GIT_REPO_SLUG',
+    'RENDER_NODE_VERSION_DETECTED', 'RENDER_NODE_INSTALLED',
+    'RENDER_PRE_RUN_COMMAND', 'RENDER_CPU_COUNT', 'USER_RUN_COMMAND',
+    'BLACK', 'BLUE', 'CYAN', 'YELLOW', 'RESET', 'ENTER_STANDOUT',
+    'PYTHONUNBUFFERED', 'UV_COMPILE_BYTECODE', 'ENTER_BOLD',
+])
 
-# Check for common bot tokens
-for token_name in ['BOT_TOKEN', 'TOKEN', 'API_TOKEN', 'DISCORD_TOKEN']:
-    if os.environ.get(token_name):
-        print(f"✅ {{token_name}} found!")
+_shown_keys = []
+for _k, _v in os.environ.items():
+    if _k in _SKIP_EXACT:
+        continue
+    _skip = False
+    for _pfx in _SKIP_PREFIXES:
+        if _k.startswith(_pfx):
+            _skip = True
+            break
+    if _skip:
+        continue
+    _shown_keys.append(_k)
+    if any(_s in _k.upper() for _s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'HASH']):
+        _disp = (_v[:8] + '...') if len(_v) > 8 else '***'
+    else:
+        _disp = (_v[:60] + '...') if len(_v) > 60 else _v
+    print(f"  ✅ {{_k}} = {{_disp}}")
+
+if not _shown_keys:
+    print("  ℹ️  No custom env vars (set KEY=VALUE when deploying)")
+
+# Token check
+_token_found = False
+for _tname in ['BOT_TOKEN', 'TOKEN', 'API_TOKEN', 'DISCORD_TOKEN', 'TELEGRAM_TOKEN']:
+    if os.environ.get(_tname):
+        print(f"✅ {{_tname}} is set")
+        _token_found = True
         break
+if not _token_found:
+    print("⚠️  WARNING: No bot token detected in env vars!")
+    print("   Set BOT_TOKEN (or TOKEN) via env vars when deploying.")
 
+sys.stdout.flush()
 print("=" * 50)
 print("🚀 STARTING BOT")
 print("=" * 50)
+sys.stdout.flush()
 
 # ========== METHOD 1: Import and run ==========
 try:
     print("📌 Method 1: Importing as module...")
+    sys.stdout.flush()
     sys.path.insert(0, r"{deploy_folder}")
     
     import importlib.util
     spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
     if spec is None:
-        raise ImportError(f"Cannot load module")
+        raise ImportError(f"Cannot load module from {dest_script}")
     
     module = importlib.util.module_from_spec(spec)
+    sys.modules["user_bot"] = module
     spec.loader.exec_module(module)
+    print("✅ Module loaded successfully")
+    sys.stdout.flush()
     
     # Try different entry points
     entry_points = ['main', 'run', 'start', 'setup', 'app', 'application', 'bot', 'client']
@@ -1388,10 +1425,13 @@ try:
     print("⚠️ No entry point found, trying direct execution...")
     
 except Exception as e:
-    print(f"⚠️ Import method failed: {{e}}")
+    print(f"⚠️ Import method failed: {{type(e).__name__}}: {{e}}")
+    traceback.print_exc()
+    sys.stdout.flush()
 
 # ========== METHOD 2: Subprocess execution ==========
 print("📌 Method 2: Running as subprocess...")
+sys.stdout.flush()
 import subprocess
 
 try:
@@ -1511,7 +1551,9 @@ echo $! > pid.txt
         update_logs("🚀 Starting bot process...")
         subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True, text=True)
         
-        sleep(5)
+        # Give the process time to start (or fail fast on syntax errors)
+        update_logs("⏳ Waiting for bot to initialize (10s)...")
+        sleep(10)
         
         # Check if running
         pid_file = deploy_folder / "pid.txt"
@@ -1531,16 +1573,17 @@ echo $! > pid.txt
             except:
                 pass
         
-        # Check output
+        # Show the TAIL of the log so the actual error/startup line is visible
         log_file = deploy_folder / "output.log"
         if log_file.exists() and log_file.stat().st_size > 0:
-            with open(log_file, 'r') as f:
-                output = f.read()
-                if output:
-                    update_logs("📋 Output preview:")
-                    for line in output.split('\n')[:15]:
-                        if line.strip():
-                            update_logs(f"   {line[:120]}")
+            with open(log_file, 'r', errors='replace') as f:
+                raw = f.read()
+            all_lines = [l for l in raw.split('\n') if l.strip()]
+            # Show last 20 meaningful lines — these contain the actual error/success
+            tail_lines = all_lines[-20:]
+            update_logs("📋 Bot output (last lines):")
+            for line in tail_lines:
+                update_logs(f"   {line[:120]}")
         
         if is_running:
             start_time = datetime.now()
@@ -1598,20 +1641,47 @@ echo $! > pid.txt
             
             return True
         else:
-            error_output = ""
+            # Read the TAIL of the log — that's where the error actually is
+            error_tail = ""
             if log_file.exists() and log_file.stat().st_size > 0:
-                with open(log_file, 'r') as f:
-                    error_output = f.read()[:2000]
+                with open(log_file, 'r', errors='replace') as f:
+                    raw = f.read()
+                # Last 3000 chars contains the crash traceback
+                error_tail = raw[-3000:].strip()
+            
+            # Try to detect common failure causes from the log
+            diagnosis = ""
+            if error_tail:
+                low = error_tail.lower()
+                if 'no bot token' in low or 'bot_token' in low and 'not' in low:
+                    diagnosis = "\n\n💡 **Tip:** Your bot needs `BOT_TOKEN` — set it in env vars when deploying."
+                elif 'modulenotfounderror' in low or 'importerror' in low:
+                    import re as _re
+                    m = _re.search(r"No module named '([^']+)'", error_tail)
+                    pkg = m.group(1) if m else "unknown"
+                    diagnosis = f"\n\n💡 **Tip:** Missing package `{pkg}` — add it to `requirements.txt` and redeploy."
+                elif 'syntaxerror' in low:
+                    diagnosis = "\n\n💡 **Tip:** Your bot has a Python syntax error — test it locally first."
+                elif 'telegramapiexception' in low or 'unauthorized' in low:
+                    diagnosis = "\n\n💡 **Tip:** Invalid bot token — check your `BOT_TOKEN` env var."
+                elif 'address already in use' in low or 'port' in low and 'bind' in low:
+                    diagnosis = "\n\n💡 **Tip:** Port conflict — another process is using the same port."
+                elif 'permissionerror' in low:
+                    diagnosis = "\n\n💡 **Tip:** File permission error — contact support."
+                else:
+                    diagnosis = "\n\n💡 **Tip:** Check the error above. Common fixes:\n• Add `BOT_TOKEN` env var\n• Add a `requirements.txt`\n• Make sure your bot has no syntax errors"
             
             error_msg = f"❌ **DEPLOYMENT FAILED**\n\n"
-            if error_output:
-                error_msg += f"**Output:**\n```\n{error_output}\n```"
+            if error_tail:
+                error_msg += f"**Last output (tail):**\n```\n{error_tail}\n```{diagnosis}"
             else:
-                error_msg += "No output captured. Common issues:\n"
-                error_msg += "• Missing required imports\n"
-                error_msg += "• Syntax error in your code\n"
-                error_msg += "• BOT_TOKEN not properly configured\n\n"
-                error_msg += "**Tip:** Use `os.environ.get('BOT_TOKEN')` in your code"
+                error_msg += (
+                    "No output captured. Common issues:\n"
+                    "• Missing required env vars (e.g. `BOT_TOKEN`)\n"
+                    "• Syntax error in your code\n"
+                    "• Missing packages not in requirements.txt\n\n"
+                    "**Tip:** Test your bot locally before deploying."
+                )
             
             edit_message(chat_id, status_message_id, error_msg[:4000])
             
