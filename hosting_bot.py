@@ -201,7 +201,8 @@ def init_db():
         last_expiry_notification TEXT,
         bot_type TEXT DEFAULT 'python_app',
         framework TEXT DEFAULT 'unknown',
-        dependencies_installed TEXT
+        dependencies_installed TEXT,
+        folder_name TEXT
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS coin_transactions (
@@ -299,9 +300,32 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_expire ON subscriptions(end_date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_redeem_codes_code ON redeem_codes(code)')
     
+    # Migration: add folder_name column if missing (existing databases)
+    try:
+        c.execute("ALTER TABLE deployments ADD COLUMN folder_name TEXT")
+    except Exception:
+        pass  # Column already exists
+    
     conn.commit()
     conn.close()
     print("✅ Database initialized with enhanced schema")
+
+# ========== DEPLOY FOLDER HELPER ==========
+def get_deploy_folder(user_id, deployment_id):
+    """Return the correct deploy folder path using folder_name from DB (fixes timestamp vs DB-id mismatch)."""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT folder_name, user_id FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            owner_id = row[1] if row[1] else user_id
+            return DEPLOYMENTS_DIR / str(owner_id) / str(row[0])
+    except Exception:
+        pass
+    # Fallback: old behaviour (folder named by DB id) for records without folder_name
+    return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
 
 # ========== PROGRESS BAR FUNCTION ==========
 def create_progress_bar(percentage: float, width: int = 30, filled_char: str = "█", empty_char: str = "░") -> str:
@@ -395,54 +419,46 @@ def get_user_balances(user_id):
 def update_user_coins(user_id, delta, transaction_type="balance_update", source="system"):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    c.execute("UPDATE users SET coins_balance = coins_balance + ? WHERE user_id = ?", (delta, user_id))
-    if delta > 0:
-        c.execute("UPDATE users SET total_coins_earned = total_coins_earned + ? WHERE user_id = ?", (delta, user_id))
-    else:
-        c.execute("UPDATE users SET total_coins_spent = total_coins_spent + ? WHERE user_id = ?", (abs(delta), user_id))
-    conn.commit()
-    conn.close()
-    
     try:
-        conn2 = sqlite3.connect(DATABASE_FILE)
-        c2 = conn2.cursor()
-        c2.execute('''INSERT INTO coin_transactions 
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        c.execute("UPDATE users SET coins_balance = coins_balance + ? WHERE user_id = ?", (delta, user_id))
+        if delta > 0:
+            c.execute("UPDATE users SET total_coins_earned = total_coins_earned + ? WHERE user_id = ?", (delta, user_id))
+        else:
+            c.execute("UPDATE users SET total_coins_spent = total_coins_spent + ? WHERE user_id = ?", (abs(delta), user_id))
+        c.execute('''INSERT INTO coin_transactions 
             (user_id, amount, transaction_type, source, reference_id, timestamp, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)''',
             (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed'))
-        conn2.commit()
-        conn2.close()
+        conn.commit()
     except Exception as e:
-        print(f"❌ Record coin transaction error: {e}")
-    
+        print(f"❌ update_user_coins error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
     update_system_stats()
     return True
 
 def update_user_stars(user_id, delta, transaction_type="balance_update", source="system", payload=None):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    c.execute("UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?", (delta, user_id))
-    if delta > 0:
-        c.execute("UPDATE users SET total_stars_earned = total_stars_earned + ? WHERE user_id = ?", (delta, user_id))
-    else:
-        c.execute("UPDATE users SET total_stars_spent = total_stars_spent + ? WHERE user_id = ?", (abs(delta), user_id))
-    conn.commit()
-    conn.close()
-    
     try:
-        conn2 = sqlite3.connect(DATABASE_FILE)
-        c2 = conn2.cursor()
-        c2.execute('''INSERT INTO star_transactions 
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        c.execute("UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?", (delta, user_id))
+        if delta > 0:
+            c.execute("UPDATE users SET total_stars_earned = total_stars_earned + ? WHERE user_id = ?", (delta, user_id))
+        else:
+            c.execute("UPDATE users SET total_stars_spent = total_stars_spent + ? WHERE user_id = ?", (abs(delta), user_id))
+        c.execute('''INSERT INTO star_transactions 
             (user_id, amount, transaction_type, source, reference_id, timestamp, status, payload)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
             (user_id, delta, transaction_type, source, None, datetime.now().isoformat(), 'completed', payload))
-        conn2.commit()
-        conn2.close()
+        conn.commit()
     except Exception as e:
-        print(f"❌ Record star transaction error: {e}")
-    
+        print(f"❌ update_user_stars error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
     update_system_stats()
     return True
 
@@ -522,13 +538,17 @@ def resume_paused_deployments(user_id):
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
         
-        c.execute('''SELECT deployment_id, file_name, env_vars
+        c.execute('''SELECT deployment_id, file_name, env_vars, folder_name
                      FROM deployments WHERE user_id = ? AND status = 'paused' AND is_paused = 1''', (user_id,))
         paused = c.fetchall()
         
         resumed_count = 0
-        for dep_id, file_name, env_vars_json in paused:
-            deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(dep_id)
+        for dep_id, file_name, env_vars_json, folder_name_val in paused:
+            # Resolve correct folder using stored folder_name
+            if folder_name_val:
+                deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(folder_name_val)
+            else:
+                deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(dep_id)
             dest_script = deploy_folder / file_name
             
             if dest_script.exists():
@@ -538,31 +558,31 @@ def resume_paused_deployments(user_id):
                     env[k] = v
                 
                 launcher_script = deploy_folder / "run.py"
-                if launcher_script.exists():
-                    with open(deploy_folder / "output.log", "a") as log_file:
+                log_file_path = deploy_folder / "output.log"
+                with open(log_file_path, "a") as log_f:
+                    if launcher_script.exists():
                         proc = subprocess.Popen(
                             [sys.executable, str(launcher_script)],
                             cwd=str(deploy_folder),
                             env=env,
-                            stdout=log_file,
+                            stdout=log_f,
                             stderr=subprocess.STDOUT
                         )
-                else:
-                    with open(deploy_folder / "output.log", "a") as log_file:
+                    else:
                         proc = subprocess.Popen(
                             [sys.executable, str(dest_script)],
                             cwd=str(deploy_folder),
                             env=env,
-                            stdout=log_file,
+                            stdout=log_f,
                             stderr=subprocess.STDOUT
                         )
                 
                 c.execute('''UPDATE deployments SET status = 'active', is_paused = 0, proc_pid = ? 
-                             WHERE deployment_id = ?''', (proc.pid, dep_id))
+                             WHERE deployment_id = ?''', (proc.pid, dep_id))  # FIX: store proc.pid not proc
                 resumed_count += 1
                 
                 with deployment_lock:
-                    active_deployments[dep_id] = proc
+                    active_deployments[dep_id] = proc.pid  # FIX: store PID integer
         
         conn.commit()
         conn.close()
@@ -1039,7 +1059,8 @@ class UniversalDependencyInstaller:
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--cache-dir", str(PIP_CACHE_DIR), 
                "--timeout", str(PIP_INSTALL_TIMEOUT), full_package]
         
-        if any(x in dependency.lower() for x in ['a', 'b', 'rc', 'dev', 'pre']):
+        # Only add --pre when the version spec explicitly requests a pre-release (e.g. ==1.0a1, ==2.0b3, ==1.0rc1)
+        if re.search(r'[=<>!]=?\s*\d[\d.]*\s*(a\d|b\d|rc\d|\.dev|\.post)', dependency.lower()):
             cmd.insert(4, "--pre")
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
@@ -1112,14 +1133,30 @@ class AutoDependencyDetector:
                 elif module not in ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 
                                      'string', 'collections', 'itertools', 'functools', 'typing', 'pathlib',
                                      'tempfile', 'subprocess', 'threading', 'multiprocessing', 'socket',
-                                     'ssl', 'hashlib', 'base64', 'zipfile', 'tarfile', 'shutil', 'glob']:
-                    guessed = module.replace('_', '-')
-                    if module == 'bs4':
-                        guessed = 'beautifulsoup4'
-                    elif module == 'cv2':
-                        guessed = 'opencv-python'
-                    detected.add(guessed)
-                    update_logs(f"   🔍 Detected: {module} → {guessed}")
+                                     'ssl', 'hashlib', 'base64', 'zipfile', 'tarfile', 'shutil', 'glob',
+                                     'io', 'abc', 'copy', 'enum', 'struct', 'queue', 'weakref',
+                                     'contextlib', 'dataclasses', 'inspect', 'logging', 'warnings',
+                                     'argparse', 'configparser', 'csv', 'html', 'http', 'urllib',
+                                     'uuid', 'decimal', 'fractions', 'statistics', 'operator',
+                                     'concurrent', 'asyncio', 'signal', 'platform', 'traceback',
+                                     'pprint', 'textwrap', 'binascii', 'hmac', 'secrets']:
+                    # Only add if it looks like a real installable package (not a relative import or internal module)
+                    if module and not module.startswith('_') and len(module) > 1:
+                        guessed = module.replace('_', '-')
+                        if module == 'bs4':
+                            guessed = 'beautifulsoup4'
+                        elif module == 'cv2':
+                            guessed = 'opencv-python'
+                        elif module == 'PIL':
+                            guessed = 'Pillow'
+                        elif module == 'sklearn':
+                            guessed = 'scikit-learn'
+                        elif module == 'wx':
+                            guessed = 'wxPython'
+                        # Only guess if it's plausibly a PyPI package name
+                        if guessed and re.match(r'^[a-zA-Z][a-zA-Z0-9\-\.]+$', guessed):
+                            detected.add(guessed)
+                            update_logs(f"   🔍 Guessed: {module} → {guessed}")
         
         return list(detected)
     
@@ -1513,13 +1550,13 @@ echo $! > pid.txt
             c = conn.cursor()
             c.execute('''INSERT INTO deployments 
                 (user_id, file_name, file_size, requirements, env_vars, plan, payment_method, cost_coins, cost_stars, 
-                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused, framework, dependencies_installed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused, framework, dependencies_installed, folder_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
                  "\n".join(logs[-100:]), "Bot running", 1 if is_free else 0, 0,
-                 ', '.join(frameworks), json.dumps(requirements_list)))
+                 ', '.join(frameworks), json.dumps(requirements_list), str(deploy_id)))
             deployment_db_id = c.lastrowid
             conn.commit()
             conn.close()
@@ -1582,13 +1619,13 @@ echo $! > pid.txt
             c = conn.cursor()
             c.execute('''INSERT INTO deployments 
                 (user_id, file_name, file_size, requirements, env_vars, plan, payment_method, cost_coins, cost_stars, 
-                 start_time, expire_time, status, install_log, deploy_log, error_log, is_free, framework)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 start_time, expire_time, status, install_log, deploy_log, error_log, is_free, framework, folder_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  datetime.now().isoformat(), datetime.now().isoformat(), "failed",
                  "\n".join(logs[-50:]), "Bot failed to start", error_msg[:2000], 1 if is_free else 0,
-                 ', '.join(frameworks)))
+                 ', '.join(frameworks), str(deploy_id)))
             conn.commit()
             conn.close()
             
@@ -1668,7 +1705,7 @@ def delete_deployment(deployment_id, user_id, chat_id):
             except:
                 pass
         
-        deploy_folder = DEPLOYMENTS_DIR / str(owner_id) / str(deployment_id)
+        deploy_folder = get_deploy_folder(owner_id, deployment_id)
         if deploy_folder.exists():
             shutil.rmtree(deploy_folder)
         
@@ -1719,7 +1756,7 @@ def restart_deployment(deployment_id, user_id, chat_id):
             send_message(chat_id, "❌ This deployment is paused. Renew premium to resume.")
             return False
         
-        deploy_folder = DEPLOYMENTS_DIR / str(owner_id) / str(deployment_id)
+        deploy_folder = get_deploy_folder(owner_id, deployment_id)
         dest_script = deploy_folder / file_name
         
         if not deploy_folder.exists():
@@ -1876,7 +1913,7 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
         return
     
     deploy_log, file_name, status, error_log, is_paused = row
-    log_file = DEPLOYMENTS_DIR / str(user_id) / str(dep_id) / "output.log"
+    log_file = get_deploy_folder(user_id, dep_id) / "output.log"
     
     log_text = deploy_log if deploy_log else ""
     
@@ -2467,8 +2504,8 @@ def process_create_code(admin_id, amount, chat_id, message_id):
                               {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
 
 # ==================== ADMIN ADD COINS ====================
-def admin_add_coins_start(chat_id, message_id):
-    set_user_step(chat_id, 'awaiting_coins_target')
+def admin_add_coins_start(admin_id, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_coins_target')
     
     keyboard = {
         "inline_keyboard": [
@@ -2612,7 +2649,7 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
         f"Target user: `{target_user_id}` ({first_name})\n"
         f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
         f"Enter the amount of coins to add using the number pad below:\n\n"
-        f"**Amount: `{new_amount} 🪙**",
+        f"**Amount: `{new_amount}` 🪙**",
         keyboard)
 
 def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
@@ -2652,7 +2689,7 @@ def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
         f"**🪙 ADD COINS**\n\n"
         f"Target user: `{target_user_id}` ({first_name})\n"
         f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
-        f"Amount preset: `{preset_amount} 🪙**\n\n"
+        f"Amount preset: `{preset_amount}` 🪙\n\n"
         f"Click ✅ to confirm or continue entering digits:",
         keyboard)
 
@@ -2746,7 +2783,7 @@ def handle_callback(callback):
     # ========== ADMIN ADD COINS ==========
     if data == "admin_add_coins":
         if is_admin(user_id):
-            admin_add_coins_start(chat_id, message_id)
+            admin_add_coins_start(user_id, chat_id, message_id)
         return
     
     if data.startswith("target_digit_"):
@@ -3074,8 +3111,6 @@ def handle_callback(callback):
     if data.startswith("stop_deploy_"):
         dep_id = int(data.split("_")[2])
         stop_deployment(dep_id)
-        send_message(chat_id, f"✅ Bot `{dep_id}` stopped",
-                    {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
         view_deployment(chat_id, message_id, user_id, dep_id)
         return
     
@@ -3400,8 +3435,19 @@ def handle_successful_payment(message):
             temp_file, requirements, env_vars_json, plan, duration, cost_coins, cost_stars, payment_method = pending
             env_vars = json.loads(env_vars_json) if env_vars_json else {}
             
-            update_user_stars(user_id, total_amount, "deployment", "telegram_stars", invoice_payload)
-            conn.commit()
+            # Record outgoing star transaction (user spent real Stars — do NOT credit their internal balance)
+            try:
+                conn2 = sqlite3.connect(DATABASE_FILE)
+                c2 = conn2.cursor()
+                c2.execute('''INSERT INTO star_transactions 
+                    (user_id, amount, transaction_type, source, reference_id, timestamp, status, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (user_id, -total_amount, "deployment_payment", "telegram_stars",
+                     None, datetime.now().isoformat(), 'completed', invoice_payload))
+                conn2.commit()
+                conn2.close()
+            except Exception as tx_e:
+                print(f"⚠️ Star transaction record error: {tx_e}")
             
             deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements, env_vars, 
                             plan, duration, cost_coins, cost_stars, payment_method)
@@ -3424,6 +3470,110 @@ def handle_pre_checkout_query(pre_checkout_query):
     except Exception as e:
         print(f"❌ Pre-checkout error: {e}")
         return False
+
+# ==================== BACKGROUND MONITORS ====================
+
+def deployment_expiry_monitor():
+    """
+    Runs every 60 s. Stops bots whose expire_time has passed and updates their
+    status. Free-tier bots are simply stopped; paid bots with an expired premium
+    owner are paused (so they can be resumed on renewal).
+    """
+    print("✅ Deployment expiry monitor started")
+    while True:
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            now_iso = datetime.now().isoformat()
+
+            # Find all active/paused deployments that have expired
+            c.execute("""SELECT deployment_id, user_id, proc_pid, is_free, plan, folder_name
+                         FROM deployments
+                         WHERE status IN ('active', 'paused') AND expire_time <= ?""",
+                      (now_iso,))
+            expired = c.fetchall()
+
+            for dep_id, uid, proc_pid, is_free, plan, folder_name_val in expired:
+                # Kill the process if it's still running
+                if proc_pid:
+                    try:
+                        os.kill(proc_pid, signal.SIGTERM)
+                    except Exception:
+                        pass
+
+                c.execute("""UPDATE deployments
+                             SET status = 'stopped', proc_pid = NULL, is_paused = 0
+                             WHERE deployment_id = ?""", (dep_id,))
+
+                with deployment_lock:
+                    active_deployments.pop(dep_id, None)
+
+                print(f"⏰ Expired deployment {dep_id} (user {uid}) stopped")
+
+                # Notify user
+                try:
+                    plan_label = "Free" if is_free else plan.capitalize()
+                    send_message(uid,
+                        f"⏰ **Deployment #{dep_id} Expired**\n\n"
+                        f"Plan: `{plan_label}`\n"
+                        f"Your bot has been stopped automatically.\n\n"
+                        f"Deploy a new bot or renew your subscription!",
+                        {"inline_keyboard": [
+                            [{"text": "🚀 Deploy New Bot", "callback_data": "deploy_new"}],
+                            [{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]
+                        ]})
+                except Exception:
+                    pass
+
+            conn.commit()
+            conn.close()
+
+            update_system_stats()
+        except Exception as e:
+            print(f"❌ Expiry monitor error: {e}")
+
+        sleep(60)
+
+
+def process_health_monitor():
+    """
+    Runs every 120 s. Checks whether PIDs recorded as 'active' are still alive.
+    If a process has died, the deployment is marked 'stopped' so the user sees
+    the correct status and the slot is freed.
+    """
+    print("✅ Process health monitor started")
+    while True:
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute("SELECT deployment_id, user_id, proc_pid FROM deployments WHERE status = 'active' AND proc_pid IS NOT NULL")
+            active = c.fetchall()
+
+            for dep_id, uid, proc_pid in active:
+                alive = False
+                try:
+                    os.kill(proc_pid, 0)   # signal 0 — just checks existence
+                    alive = True
+                except (ProcessLookupError, PermissionError):
+                    alive = False
+                except Exception:
+                    alive = True  # unknown error → assume alive
+
+                if not alive:
+                    c.execute("""UPDATE deployments
+                                 SET status = 'stopped', proc_pid = NULL
+                                 WHERE deployment_id = ?""", (dep_id,))
+                    with deployment_lock:
+                        active_deployments.pop(dep_id, None)
+                    print(f"💀 Dead process detected for deployment {dep_id} (user {uid}) — marked stopped")
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"❌ Health monitor error: {e}")
+
+        sleep(120)
+
 
 # ==================== HEALTH CHECK SERVER ====================
 def start_health_server():
@@ -3448,34 +3598,15 @@ def start_health_server():
 def main():
     global LAST_UPDATE_ID
     
-    print("=" * 70)
-    print("╔═════════════════════════════════════════════════════════════════════╗")
-    print("║         UNIVERSAL BOT HOSTING PLATFORM - ENTERPRISE EDITION         ║")
-    print("╚═════════════════════════════════════════════════════════════════════╝")
-    print("=" * 70)
-    print(f"📍 Platform: {'Render' if IS_RENDER else 'Heroku' if IS_HEROKU else 'Choreo' if IS_CHOREO else 'Android' if IS_ANDROID else 'Local'}")
-    print(f"📁 Data Directory: {BASE_DIR}")
-    print(f"💰 Monthly: {PRICE_MONTHLY_STARS}⭐ | Yearly: {PRICE_YEARLY_STARS}⭐")
-    print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
-    print(f"📦 Max File Size: {MAX_FILE_SIZE_MB}MB")
-    print(f"🐍 Python Version: {platform.python_version()}")
-    print("=" * 70)
-    print("✨ ENHANCED FEATURES:")
-    print("   ✓ Supports ANY Python bot (Telegram, Discord, Flask, FastAPI, etc.)")
-    print("   ✓ ALL dependency types (PyPI, Git, Mercurial, Subversion, wheel, egg)")
-    print("   ✓ Auto-dependency detection from imports")
-    print("   ✓ Progress bars for installations")
-    print("   ✓ Environment variable injection with .env support")
-    print("   ✓ Premium/Free tier with Stars/Coins")
-    print("   ✓ Persistent storage with user file management")
-    print("   ✓ Framework detection and optimized launcher")
-    print("=" * 70)
-    
     init_db()
     
     # Start health check server for cloud platforms
     if IS_RENDER or IS_HEROKU or IS_CHOREO:
         start_health_server()
+    
+    # Start background monitors
+    threading.Thread(target=deployment_expiry_monitor, daemon=True, name="ExpiryMonitor").start()
+    threading.Thread(target=process_health_monitor, daemon=True, name="HealthMonitor").start()
     
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
@@ -3502,12 +3633,14 @@ def main():
                     LAST_UPDATE_ID = update['update_id']
                     if 'callback_query' in update:
                         handle_callback(update['callback_query'])
-                    elif 'message' in update:
-                        handle_message(update['message'])
                     elif 'pre_checkout_query' in update:
                         handle_pre_checkout_query(update['pre_checkout_query'])
-                    elif 'successful_payment' in update:
-                        handle_successful_payment(update)
+                    elif 'message' in update:
+                        msg = update['message']
+                        if 'successful_payment' in msg:
+                            handle_successful_payment(msg)
+                        else:
+                            handle_message(msg)
             sleep(0.5)
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped")
