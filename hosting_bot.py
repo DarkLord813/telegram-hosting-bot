@@ -1385,6 +1385,7 @@ try:
     sys.path.insert(0, r"{deploy_folder}")
     
     import importlib.util
+    import inspect as _inspect
     spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
     if spec is None:
         raise ImportError(f"Cannot load module from {dest_script}")
@@ -1395,34 +1396,136 @@ try:
     print("✅ Module loaded successfully")
     sys.stdout.flush()
     
-    # Try different entry points
-    entry_points = ['main', 'run', 'start', 'setup', 'app', 'application', 'bot', 'client']
+    # ------------------------------------------------------------------
+    # _make_runner: detect what kind of object an entry point is and
+    # return a zero-argument callable that starts it properly.
+    # This stops us calling Flask/FastAPI WSGI apps as plain functions
+    # (which blows up with "missing environ and start_response").
+    # ------------------------------------------------------------------
+    def _make_runner(name, obj):
+        _cls     = type(obj).__name__.lower()
+        _cls_mod = getattr(type(obj), '__module__', '') or ''
+
+        # Flask / Quart ------------------------------------------------
+        if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
+            _port = int(os.environ.get('PORT', 5000))
+            print(f"  🌐 {{name}} → Flask/Quart app (.run port={{_port}})")
+            return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
+
+        # FastAPI / Starlette ------------------------------------------
+        if _cls in ('fastapi', 'starlette') or 'fastapi' in _cls_mod or 'starlette' in _cls_mod:
+            _port = int(os.environ.get('PORT', 8000))
+            print(f"  🌐 {{name}} → FastAPI/Starlette app (uvicorn port={{_port}})")
+            def _run_asgi():
+                try:
+                    import uvicorn
+                    uvicorn.run(obj, host='0.0.0.0', port=_port, log_level='info')
+                except ImportError:
+                    try:
+                        import asyncio, hypercorn.asyncio as _ha, hypercorn.config as _hc
+                        _cfg = _hc.Config(); _cfg.bind = [f'0.0.0.0:{{_port}}']
+                        asyncio.run(_ha.serve(obj, _cfg))
+                    except ImportError:
+                        print("❌ uvicorn/hypercorn not found — add uvicorn to requirements.txt")
+                        sys.exit(1)
+            return _run_asgi
+
+        # aiogram Application -----------------------------------------
+        if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
+            print(f"  🤖 {{name}} → aiogram Application (run_polling)")
+            return lambda: obj.run_polling()
+
+        # python-telegram-bot Application -----------------------------
+        if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
+            print(f"  🤖 {{name}} → PTB Application (run_polling)")
+            return lambda: obj.run_polling()
+
+        # Any object with run_polling ----------------------------------
+        if callable(getattr(obj, 'run_polling', None)):
+            print(f"  🤖 {{name}} → has run_polling()")
+            return lambda: obj.run_polling()
+
+        # discord.py / nextcord Client --------------------------------
+        if _cls in ('client', 'bot', 'autoclient') and hasattr(obj, 'run'):
+            _tok = (os.environ.get('DISCORD_TOKEN')
+                    or os.environ.get('TOKEN')
+                    or os.environ.get('BOT_TOKEN', ''))
+            if _tok:
+                print(f"  🎮 {{name}} → Discord client (.run token)")
+                return lambda: obj.run(_tok)
+            print(f"  ⚠️ {{name}} looks like Discord client — set DISCORD_TOKEN env var")
+
+        # Async coroutine function ------------------------------------
+        if _inspect.iscoroutinefunction(obj):
+            import asyncio as _aio
+            print(f"  ⚡ {{name}} → async function (asyncio.run)")
+            return lambda: _aio.run(obj())
+
+        # Plain sync function / method — caller invokes directly ------
+        if _inspect.isfunction(obj) or _inspect.isbuiltin(obj) or _inspect.ismethod(obj):
+            return None
+
+        # Generic: has .run() -----------------------------------------
+        if callable(getattr(obj, 'run', None)):
+            print(f"  ▶️  {{name}} → has .run()")
+            return lambda: obj.run()
+
+        # Fallback: callable but unknown type — try directly ----------
+        if callable(obj):
+            return None
+
+        return None
+
+    # Entry points: plain functions (main/run/start) checked before
+    # framework objects (app/application) to avoid picking a Flask app
+    # over an explicit main() function.
+    entry_points = ['main', 'run', 'start', 'setup', 'bot', 'client', 'app', 'application']
     
     for entry in entry_points:
-        if hasattr(module, entry):
-            attr = getattr(module, entry)
-            if callable(attr):
-                print(f"✅ Found {{entry}}(), calling...")
-                try:
-                    result = attr()
-                    if result and hasattr(result, 'run_polling'):
+        if not hasattr(module, entry):
+            continue
+        attr = getattr(module, entry)
+        if not callable(attr):
+            continue
+
+        print(f"✅ Entry point: {{entry}}")
+        sys.stdout.flush()
+        runner = _make_runner(entry, attr)
+
+        try:
+            if runner is not None:
+                runner()
+            else:
+                # Plain function
+                result = attr()
+                if result is not None:
+                    sub = _make_runner(f"{{entry}}() result", result)
+                    if sub:
+                        sub()
+                    elif callable(getattr(result, 'run_polling', None)):
                         result.run_polling()
-                    elif result and hasattr(result, 'run'):
+                    elif callable(getattr(result, 'run', None)):
                         result.run()
-                    elif result and hasattr(result, 'start'):
-                        result.start()
-                    elif result and hasattr(result, 'run_forever'):
+                    elif callable(getattr(result, 'run_forever', None)):
                         result.run_forever()
-                    elif result and hasattr(result, 'serve_forever'):
+                    elif callable(getattr(result, 'serve_forever', None)):
                         result.serve_forever()
-                except KeyboardInterrupt:
-                    print("\\n🛑 Bot stopped by user")
-                except Exception as e:
-                    print(f"❌ Error in {{entry}}: {{e}}")
-                heartbeat_running = False
-                sys.exit(0)
+        except KeyboardInterrupt:
+            print("\\n🛑 Bot stopped by user")
+        except SystemExit as _se:
+            sys.exit(_se.code)
+        except Exception as _err:
+            print(f"❌ Error in {{entry}}: {{type(_err).__name__}}: {{_err}}")
+            traceback.print_exc()
+            sys.stdout.flush()
+            heartbeat_running = False
+            sys.exit(1)
+
+        heartbeat_running = False
+        sys.exit(0)
     
-    print("⚠️ No entry point found, trying direct execution...")
+    print("⚠️ No recognised entry point — falling through to Method 2...")
+    sys.stdout.flush()
     
 except Exception as e:
     print(f"⚠️ Import method failed: {{type(e).__name__}}: {{e}}")
