@@ -1409,7 +1409,33 @@ try:
 
     module = importlib.util.module_from_spec(spec)
     sys.modules["user_bot"] = module
-    spec.loader.exec_module(module)
+
+    # ----------------------------------------------------------------
+    # Intercept bot.set_webhook() calls that fire at module level.
+    # Many webhook-mode bots call set_webhook() during initialisation;
+    # if we let that run it will point Telegram at the old server and
+    # polling will receive nothing.  We monkey-patch the telebot module
+    # BEFORE exec_module so any set_webhook() becomes a silent no-op.
+    # We restore the real method immediately after import.
+    # ----------------------------------------------------------------
+    _webhook_patches = []   # list of (obj, attr, original_value)
+    try:
+        import telebot as _tb_mod
+        _orig_sw = _tb_mod.TeleBot.set_webhook
+        def _noop_set_webhook(self, *a, **kw):
+            print("  ℹ️  [launcher] set_webhook() suppressed during import (will use polling)")
+        _tb_mod.TeleBot.set_webhook = _noop_set_webhook
+        _webhook_patches.append((_tb_mod.TeleBot, 'set_webhook', _orig_sw))
+    except ImportError:
+        pass   # telebot not installed — nothing to patch
+
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        # Always restore original set_webhook regardless of import success
+        for _obj, _attr, _orig in _webhook_patches:
+            setattr(_obj, _attr, _orig)
+
     print("✅ Module loaded successfully")
     sys.stdout.flush()
 
@@ -1440,6 +1466,33 @@ try:
         return False
 
     # ----------------------------------------------------------------
+    # _clear_webhook: remove any active Telegram webhook so polling
+    # can receive updates.  Bots deployed on webhook platforms (Choreo,
+    # Railway, Heroku, etc.) will have a live webhook that silently
+    # swallows all updates — polling never sees anything until it's gone.
+    # ----------------------------------------------------------------
+    def _clear_webhook(bot_obj, label='bot'):
+        import time as _time
+        try:
+            # telebot API
+            if callable(getattr(bot_obj, 'get_webhook_info', None)):
+                _wh = bot_obj.get_webhook_info()
+                _url = getattr(_wh, 'url', '') or ''
+                if _url:
+                    print(f"  ⚠️ Active webhook on {{label}}: {{_url[:60]}}...")
+                    print(f"  🔧 Removing webhook — switching to polling mode...")
+                    bot_obj.remove_webhook()
+                    _time.sleep(1)   # give Telegram a moment to propagate
+                    print(f"  ✅ Webhook removed — polling mode active")
+                else:
+                    print(f"  ✅ No webhook set on {{label}} — polling ready")
+            # PTB / aiogram: bot object lives at .bot
+            elif hasattr(bot_obj, 'bot') and callable(getattr(bot_obj.bot, 'get_webhook_info', None)):
+                _clear_webhook(bot_obj.bot, label + '.bot')
+        except Exception as _we:
+            print(f"  ⚠️ Could not check/remove webhook ({{_we}}) — trying polling anyway")
+
+    # ----------------------------------------------------------------
     # _make_runner: return a zero-arg callable that starts the object
     # correctly, or None if it should be called as a plain function.
     # ----------------------------------------------------------------
@@ -1452,22 +1505,34 @@ try:
         # also has a .run_webhooks() but the canonical method is polling().
         if callable(getattr(obj, 'polling', None)) and callable(getattr(obj, 'stop_polling', None)):
             print(f"  🤖 {{name}} → pyTelegramBotAPI TeleBot (.polling)")
-            return lambda: obj.polling(non_stop=True, timeout=60, long_polling_timeout=60)
+            def _run_telebot(_b=obj, _n=name):
+                _clear_webhook(_b, _n)
+                _b.polling(non_stop=True, timeout=60, long_polling_timeout=60)
+            return _run_telebot
 
         # ── aiogram Application ──────────────────────────────────────
         if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
             print(f"  🤖 {{name}} → aiogram Application (run_polling)")
-            return lambda: obj.run_polling()
+            def _run_aiogram(_a=obj, _n=name):
+                _clear_webhook(_a, _n)
+                _a.run_polling()
+            return _run_aiogram
 
         # ── python-telegram-bot Application ─────────────────────────
         if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
             print(f"  🤖 {{name}} → PTB Application (run_polling)")
-            return lambda: obj.run_polling()
+            def _run_ptb(_a=obj, _n=name):
+                _clear_webhook(_a, _n)
+                _a.run_polling()
+            return _run_ptb
 
         # ── Generic run_polling ──────────────────────────────────────
         if callable(getattr(obj, 'run_polling', None)):
             print(f"  🤖 {{name}} → has run_polling()")
-            return lambda: obj.run_polling()
+            def _run_generic(_a=obj, _n=name):
+                _clear_webhook(_a, _n)
+                _a.run_polling()
+            return _run_generic
 
         # ── Flask / Quart ────────────────────────────────────────────
         # IMPORTANT: never bind to PORT (=10000 on Render) — that port
