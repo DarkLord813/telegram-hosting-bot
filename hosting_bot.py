@@ -327,6 +327,23 @@ def get_deploy_folder(user_id, deployment_id):
     # Fallback: old behaviour (folder named by DB id) for records without folder_name
     return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
 
+
+def _find_available_port(preferred: int = 20000) -> int:
+    """Return an available TCP port, starting from preferred and sampling nearby."""
+    import socket, random
+    candidates = [preferred] + random.sample(
+        range(max(20000, preferred - 500), min(39999, preferred + 500)), 40
+    )
+    for port in candidates:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(('', port))
+                return port
+            except OSError:
+                continue
+    return preferred + 1  # best-effort fallback
+
 # ========== PROGRESS BAR FUNCTION ==========
 def create_progress_bar(percentage: float, width: int = 30, filled_char: str = "█", empty_char: str = "░") -> str:
     filled = int(width * percentage / 100)
@@ -1383,39 +1400,100 @@ try:
     print("📌 Method 1: Importing as module...")
     sys.stdout.flush()
     sys.path.insert(0, r"{deploy_folder}")
-    
-    import importlib.util
-    import inspect as _inspect
+
+    import importlib.util, inspect as _inspect, socket as _socket, threading as _thr
+
     spec = importlib.util.spec_from_file_location("user_bot", r"{dest_script}")
     if spec is None:
         raise ImportError(f"Cannot load module from {dest_script}")
-    
+
     module = importlib.util.module_from_spec(spec)
     sys.modules["user_bot"] = module
     spec.loader.exec_module(module)
     print("✅ Module loaded successfully")
     sys.stdout.flush()
-    
-    # ------------------------------------------------------------------
-    # _make_runner: detect what kind of object an entry point is and
-    # return a zero-argument callable that starts it properly.
-    # This stops us calling Flask/FastAPI WSGI apps as plain functions
-    # (which blows up with "missing environ and start_response").
-    # ------------------------------------------------------------------
+
+    # ----------------------------------------------------------------
+    # Helper: find a random free TCP port (so hosted bots never clash
+    # with the hosting bot's PORT=10000 health server).
+    # ----------------------------------------------------------------
+    def _free_port():
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.bind(('', 0))
+            return _s.getsockname()[1]
+
+    # ----------------------------------------------------------------
+    # Helper: True if the module contains any Telegram bot object
+    # (telebot, aiogram, PTB) — used to decide whether Flask should
+    # run as keep-alive thread rather than the main entry point.
+    # ----------------------------------------------------------------
+    def _module_has_telegram_bot():
+        _tg_names = ['bot', 'dp', 'dispatcher', 'application', 'updater', 'client']
+        for _n in _tg_names:
+            _obj = getattr(module, _n, None)
+            if _obj is None:
+                continue
+            if (callable(getattr(_obj, 'polling', None)) or     # telebot
+                    callable(getattr(_obj, 'run_polling', None)) or  # aiogram / PTB
+                    callable(getattr(_obj, 'start_polling', None))):
+                return True
+        return False
+
+    # ----------------------------------------------------------------
+    # _make_runner: return a zero-arg callable that starts the object
+    # correctly, or None if it should be called as a plain function.
+    # ----------------------------------------------------------------
     def _make_runner(name, obj):
         _cls     = type(obj).__name__.lower()
         _cls_mod = getattr(type(obj), '__module__', '') or ''
 
-        # Flask / Quart ------------------------------------------------
-        if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
-            _port = int(os.environ.get('PORT', 5000))
-            print(f"  🌐 {{name}} → Flask/Quart app (.run port={{_port}})")
-            return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
+        # ── pyTelegramBotAPI (telebot.TeleBot) ───────────────────────
+        # Must come BEFORE the generic .run() check because TeleBot
+        # also has a .run_webhooks() but the canonical method is polling().
+        if callable(getattr(obj, 'polling', None)) and callable(getattr(obj, 'stop_polling', None)):
+            print(f"  🤖 {{name}} → pyTelegramBotAPI TeleBot (.polling)")
+            return lambda: obj.polling(non_stop=True, timeout=60, long_polling_timeout=60)
 
-        # FastAPI / Starlette ------------------------------------------
+        # ── aiogram Application ──────────────────────────────────────
+        if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
+            print(f"  🤖 {{name}} → aiogram Application (run_polling)")
+            return lambda: obj.run_polling()
+
+        # ── python-telegram-bot Application ─────────────────────────
+        if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
+            print(f"  🤖 {{name}} → PTB Application (run_polling)")
+            return lambda: obj.run_polling()
+
+        # ── Generic run_polling ──────────────────────────────────────
+        if callable(getattr(obj, 'run_polling', None)):
+            print(f"  🤖 {{name}} → has run_polling()")
+            return lambda: obj.run_polling()
+
+        # ── Flask / Quart ────────────────────────────────────────────
+        # IMPORTANT: never bind to PORT (=10000 on Render) — that port
+        # belongs to the hosting bot itself.  Also, if a Telegram bot
+        # exists in the same module, Flask is just the keep-alive server
+        # and should run in a daemon thread, not as the main loop.
+        if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
+            _port = _free_port()
+            if _module_has_telegram_bot():
+                # Keep-alive only — start in background, then keep searching
+                print(f"  🌐 {{name}} → Flask keep-alive thread (port {{_port}}, Telegram bot will be main)")
+                def _flask_bg(_app=obj, _p=_port):
+                    try:
+                        _app.run(host='0.0.0.0', port=_p, debug=False, use_reloader=False)
+                    except Exception as _fe:
+                        print(f"  ⚠️ Flask keep-alive: {{_fe}}")
+                _thr.Thread(target=_flask_bg, daemon=True, name='FlaskKeepAlive').start()
+                return 'BACKGROUND'   # sentinel: continue entry-point loop
+            else:
+                print(f"  🌐 {{name}} → Flask/Quart main server (port {{_port}})")
+                return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
+
+        # ── FastAPI / Starlette ──────────────────────────────────────
         if _cls in ('fastapi', 'starlette') or 'fastapi' in _cls_mod or 'starlette' in _cls_mod:
-            _port = int(os.environ.get('PORT', 8000))
-            print(f"  🌐 {{name}} → FastAPI/Starlette app (uvicorn port={{_port}})")
+            _port = int(os.environ.get('PORT', _free_port()))
+            print(f"  🌐 {{name}} → FastAPI/Starlette (uvicorn port={{_port}})")
             def _run_asgi():
                 try:
                     import uvicorn
@@ -1430,23 +1508,8 @@ try:
                         sys.exit(1)
             return _run_asgi
 
-        # aiogram Application -----------------------------------------
-        if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
-            print(f"  🤖 {{name}} → aiogram Application (run_polling)")
-            return lambda: obj.run_polling()
-
-        # python-telegram-bot Application -----------------------------
-        if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
-            print(f"  🤖 {{name}} → PTB Application (run_polling)")
-            return lambda: obj.run_polling()
-
-        # Any object with run_polling ----------------------------------
-        if callable(getattr(obj, 'run_polling', None)):
-            print(f"  🤖 {{name}} → has run_polling()")
-            return lambda: obj.run_polling()
-
-        # discord.py / nextcord Client --------------------------------
-        if _cls in ('client', 'bot', 'autoclient') and hasattr(obj, 'run'):
+        # ── discord.py / nextcord Client ─────────────────────────────
+        if _cls in ('client', 'bot', 'autoclient') and callable(getattr(obj, 'run', None)):
             _tok = (os.environ.get('DISCORD_TOKEN')
                     or os.environ.get('TOKEN')
                     or os.environ.get('BOT_TOKEN', ''))
@@ -1455,32 +1518,36 @@ try:
                 return lambda: obj.run(_tok)
             print(f"  ⚠️ {{name}} looks like Discord client — set DISCORD_TOKEN env var")
 
-        # Async coroutine function ------------------------------------
+        # ── Async coroutine function ──────────────────────────────────
         if _inspect.iscoroutinefunction(obj):
             import asyncio as _aio
             print(f"  ⚡ {{name}} → async function (asyncio.run)")
             return lambda: _aio.run(obj())
 
-        # Plain sync function / method — caller invokes directly ------
+        # ── Plain sync function / method ─────────────────────────────
         if _inspect.isfunction(obj) or _inspect.isbuiltin(obj) or _inspect.ismethod(obj):
-            return None
+            return None   # caller does: result = obj()
 
-        # Generic: has .run() -----------------------------------------
+        # ── Generic .run() ───────────────────────────────────────────
         if callable(getattr(obj, 'run', None)):
             print(f"  ▶️  {{name}} → has .run()")
             return lambda: obj.run()
 
-        # Fallback: callable but unknown type — try directly ----------
+        # ── Fallback ─────────────────────────────────────────────────
         if callable(obj):
             return None
 
         return None
 
-    # Entry points: plain functions (main/run/start) checked before
-    # framework objects (app/application) to avoid picking a Flask app
-    # over an explicit main() function.
-    entry_points = ['main', 'run', 'start', 'setup', 'bot', 'client', 'app', 'application']
-    
+    # ----------------------------------------------------------------
+    # Entry point search.
+    # Telegram bot objects (bot, dp) come BEFORE web app objects (app)
+    # so a bot that has both a TeleBot and a Flask keep-alive doesn't
+    # accidentally start the web server as the main loop.
+    # ----------------------------------------------------------------
+    entry_points = ['main', 'run', 'start', 'bot', 'dp', 'dispatcher',
+                    'updater', 'setup', 'client', 'app', 'application']
+
     for entry in entry_points:
         if not hasattr(module, entry):
             continue
@@ -1492,16 +1559,22 @@ try:
         sys.stdout.flush()
         runner = _make_runner(entry, attr)
 
+        if runner == 'BACKGROUND':
+            # Flask started as daemon thread; keep searching for the real bot
+            continue
+
         try:
             if runner is not None:
                 runner()
             else:
-                # Plain function
+                # Plain function — call it, then handle any returned app
                 result = attr()
                 if result is not None:
                     sub = _make_runner(f"{{entry}}() result", result)
-                    if sub:
+                    if sub and sub != 'BACKGROUND':
                         sub()
+                    elif callable(getattr(result, 'polling', None)):
+                        result.polling(non_stop=True, timeout=60)
                     elif callable(getattr(result, 'run_polling', None)):
                         result.run_polling()
                     elif callable(getattr(result, 'run', None)):
@@ -1523,10 +1596,10 @@ try:
 
         heartbeat_running = False
         sys.exit(0)
-    
+
     print("⚠️ No recognised entry point — falling through to Method 2...")
     sys.stdout.flush()
-    
+
 except Exception as e:
     print(f"⚠️ Import method failed: {{type(e).__name__}}: {{e}}")
     traceback.print_exc()
@@ -1634,6 +1707,21 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             for k, v in env_vars_dict.items():
                 f.write(f"{k}={v}\n")
         update_logs(f"📝 Created .env with {len(env_vars_dict)} variables")
+        
+        # ---- Unique port assignment ----
+        # The hosting bot already holds the platform PORT (e.g. 10000 on Render).
+        # Give each deployed bot its own port so Flask keep-alive servers don't collide.
+        _hosting_port = int(os.environ.get('PORT', 10000))
+        _user_port    = int(env_vars_dict.get('PORT', 0) or 0)
+        if _user_port == 0 or _user_port == _hosting_port:
+            _deploy_port = _find_available_port(20000 + (deploy_id % 9000))
+            env_vars_dict['PORT']     = str(_deploy_port)
+            env_vars_dict['BOT_PORT'] = str(_deploy_port)
+            # Re-write .env with the updated PORT
+            with open(env_file, 'w') as f:
+                for k, v in env_vars_dict.items():
+                    f.write(f"{k}={v}\n")
+            update_logs(f"🔌 Assigned port {_deploy_port} (hosting bot uses {_hosting_port})")
         
         # Create enhanced launcher
         update_logs("🚀 Creating enhanced launcher...")
