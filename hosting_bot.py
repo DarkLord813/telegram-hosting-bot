@@ -82,6 +82,9 @@ FREE_DEPLOYMENT_DURATION_HOURS = int(os.environ.get("FREE_DEPLOYMENT_DURATION_HO
 # Exchange rate
 STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 
+# Referral reward
+REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 50))
+
 # Timeout settings
 PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
 
@@ -161,7 +164,10 @@ def init_db():
         temp_expiry INTEGER,
         temp_reward_type TEXT,
         pending_payment_payload TEXT,
-        last_expiry_notification TEXT
+        last_expiry_notification TEXT,
+        referral_code TEXT UNIQUE,
+        referred_by INTEGER DEFAULT NULL,
+        total_referrals INTEGER DEFAULT 0
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
@@ -298,13 +304,44 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_deployments_expire ON deployments(expire_time)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_expire ON subscriptions(end_date)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_redeem_codes_code ON redeem_codes(code)')
+    c.execute('''CREATE TABLE IF NOT EXISTS bug_reports (
+        report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        message TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        admin_reply TEXT,
+        replied_by INTEGER,
+        created_at TEXT,
+        replied_at TEXT
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+        referral_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER NOT NULL,
+        referred_id INTEGER NOT NULL UNIQUE,
+        created_at TEXT,
+        reward_coins INTEGER DEFAULT 0,
+        reward_given INTEGER DEFAULT 0
+    )''')
+
+    c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_user   ON bug_reports(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)')
     
-    # Migration: add folder_name column if missing (existing databases)
-    try:
-        c.execute("ALTER TABLE deployments ADD COLUMN folder_name TEXT")
-    except Exception:
-        pass  # Column already exists
+    # Migrations for existing databases
+    for _col, _type in [
+        ("folder_name",    "TEXT"),
+        ("referral_code",  "TEXT"),
+        ("referred_by",    "INTEGER"),
+        ("total_referrals","INTEGER DEFAULT 0"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}" if _col == "folder_name"
+                      else f"ALTER TABLE users ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
     
     conn.commit()
     conn.close()
@@ -823,7 +860,196 @@ def redeem_code(user_id, code):
     update_system_stats()
     return True, f"✅ Redeemed: {', '.join(reward_msg)}!"
 
-# ========== PREMIUM SUBSCRIPTION ==========
+# ==================== REFERRAL SYSTEM ====================
+
+def get_or_create_referral_code(user_id):
+    """Return (and lazily create) a user's unique referral code."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT referral_code FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    code = row[0] if row and row[0] else None
+    if not code:
+        code = f"ref{user_id}"
+        c.execute("UPDATE users SET referral_code = ? WHERE user_id = ?", (code, user_id))
+        conn.commit()
+    conn.close()
+    return code
+
+def get_bot_username():
+    """Fetch the bot's @username for building referral links."""
+    try:
+        with urllib.request.urlopen(f"{TELEGRAM_API}/getMe", timeout=10) as r:
+            data = json.loads(r.read())
+            return data.get("result", {}).get("username", "")
+    except Exception:
+        return ""
+
+def process_referral(referrer_id, new_user_id):
+    """Credit referrer when a new user joins via their link. Safe to call multiple times."""
+    if referrer_id == new_user_id:
+        return False
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    # Ensure the referrer exists
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,))
+    if not c.fetchone():
+        conn.close()
+        return False
+    # One referral per new user
+    try:
+        c.execute(
+            "INSERT INTO referrals (referrer_id, referred_id, created_at, reward_coins, reward_given) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (referrer_id, new_user_id, datetime.now().isoformat(), REFERRAL_REWARD_COINS))
+        c.execute("UPDATE users SET referred_by = ? WHERE user_id = ?", (referrer_id, new_user_id))
+        c.execute("UPDATE users SET total_referrals = total_referrals + 1 WHERE user_id = ?", (referrer_id,))
+        conn.commit()
+        conn.close()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False  # user already referred
+    # Give coins to referrer
+    update_user_coins(referrer_id, REFERRAL_REWARD_COINS, "referral_reward", f"referred_{new_user_id}")
+    # Mark reward as given
+    conn2 = sqlite3.connect(DATABASE_FILE)
+    conn2.execute("UPDATE referrals SET reward_given = 1 WHERE referred_id = ?", (new_user_id,))
+    conn2.commit()
+    conn2.close()
+    return True
+
+def show_referral_menu(chat_id, user_id, message_id=None):
+    code    = get_or_create_referral_code(user_id)
+    bot_username = get_bot_username()
+    ref_link = f"https://t.me/{bot_username}?start={code}" if bot_username else f"Your code: `{code}`"
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), COALESCE(SUM(reward_coins),0) FROM referrals WHERE referrer_id = ? AND reward_given = 1", (user_id,))
+    row = c.fetchone()
+    total_refs   = row[0] or 0
+    total_earned = row[1] or 0
+    c.execute("SELECT referred_id, created_at FROM referrals WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 5", (user_id,))
+    recent = c.fetchall()
+    conn.close()
+
+    recent_text = ""
+    for rid, rat in recent:
+        dt = datetime.fromisoformat(rat).strftime("%d %b")
+        recent_text += f"  • User `{rid}` — {dt}\n"
+
+    text = (
+        f"**👥 REFERRAL PROGRAMME**\n\n"
+        f"Invite friends and earn **{REFERRAL_REWARD_COINS} 🪙** for every person who joins!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 **Your referral link:**\n`{ref_link}`\n\n"
+        f"📊 **Your stats:**\n"
+        f"  👥 Total referrals: `{total_refs}`\n"
+        f"  🪙 Total earned:    `{total_earned}🪙`\n\n"
+        + (f"🕐 **Recent referrals:**\n{recent_text}\n" if recent_text else "")
+        + f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Share your link — every new user who starts the bot through it earns you coins!"
+    )
+    keyboard = {"inline_keyboard": [
+        [{"text": "📤 Share Link", "switch_inline_query": f"Join this bot hosting platform! {ref_link}"}],
+        [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
+    ]}
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+# ==================== BUG REPORT SYSTEM ====================
+
+def submit_bug_report(user_id, username, first_name, message_text):
+    """Save a bug report and broadcast it to all admins."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO bug_reports (user_id, username, first_name, message, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?)",
+        (user_id, username, first_name, message_text, datetime.now().isoformat()))
+    report_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Notify all admins
+    user_link = f"@{username}" if username else f"User `{user_id}`"
+    admin_text = (
+        f"**🐛 NEW BUG REPORT #{report_id}**\n\n"
+        f"From: {user_link} (`{user_id}`)\n"
+        f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n"
+        f"**Message:**\n{message_text}"
+    )
+    admin_kb = {"inline_keyboard": [
+        [{"text": f"✉️ Reply to #{report_id}", "callback_data": f"bug_reply_{report_id}"}],
+        [{"text": f"✅ Close #{report_id}",    "callback_data": f"bug_close_{report_id}"}]
+    ]}
+    for admin_id in ADMIN_IDS:
+        send_message(admin_id, admin_text, admin_kb)
+
+    return report_id
+
+def reply_to_bug_report(report_id, admin_id, reply_text):
+    """Save admin reply, mark report replied, and notify the user."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, first_name FROM bug_reports WHERE report_id = ?", (report_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, "Report not found"
+    target_user_id, username, first_name = row
+    c.execute(
+        "UPDATE bug_reports SET status='replied', admin_reply=?, replied_by=?, replied_at=? "
+        "WHERE report_id = ?",
+        (reply_text, admin_id, datetime.now().isoformat(), report_id))
+    conn.commit()
+    conn.close()
+
+    # Notify the user
+    send_message(target_user_id,
+        f"**✉️ REPLY TO YOUR BUG REPORT #{report_id}**\n\n"
+        f"An admin has replied to your report:\n\n"
+        f"_{reply_text}_\n\n"
+        f"Thank you for helping us improve the service! 🙏",
+        {"inline_keyboard": [[{"text": "🐛 Submit Another Report", "callback_data": "report_bug"}],
+                              [{"text": "🏠 Main Menu",            "callback_data": "main_menu"}]]})
+    return True, target_user_id
+
+def show_admin_bug_reports(chat_id, admin_id, message_id=None):
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT report_id, user_id, username, first_name, message, status, created_at "
+              "FROM bug_reports ORDER BY created_at DESC LIMIT 20")
+    reports = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM bug_reports WHERE status = 'open'")
+    open_count = c.fetchone()[0]
+    conn.close()
+
+    if not reports:
+        text = "**📋 BUG REPORTS**\n\nNo reports yet."
+        kb   = {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]}
+        if message_id: edit_message(chat_id, message_id, text, kb)
+        else:          send_message(chat_id, text, kb)
+        return
+
+    text = f"**📋 BUG REPORTS** ({open_count} open)\n\n"
+    buttons = []
+    for rep_id, uid, uname, fname, msg, status, created in reports:
+        icon   = "🔴" if status == "open" else "✅" if status == "replied" else "⚫"
+        who    = f"@{uname}" if uname else f"#{uid}"
+        dt     = datetime.fromisoformat(created).strftime("%d/%m %H:%M")
+        preview = msg[:40].replace("\n", " ") + ("…" if len(msg) > 40 else "")
+        text  += f"{icon} **#{rep_id}** {who} — {dt}\n   _{preview}_\n\n"
+        row_btns = [{"text": f"✉️ #{rep_id}", "callback_data": f"bug_reply_{rep_id}"},
+                    {"text": f"✅ Close",      "callback_data": f"bug_close_{rep_id}"}]
+        buttons.append(row_btns)
+
+    buttons.append([{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}])
+    kb = {"inline_keyboard": buttons}
+    if message_id: edit_message(chat_id, message_id, text, kb)
+    else:          send_message(chat_id, text, kb)
 def create_premium_invoice(chat_id, user_id, plan, duration_days, cost_stars):
     try:
         payload = f"premium_{plan}_{user_id}_{int(datetime.now().timestamp())}"
@@ -2366,17 +2592,39 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     edit_message(chat_id, message_id, text, keyboard)
 
 # ========== HANDLERS ==========
-def handle_start(chat_id, user_id, username, first_name):
+def handle_start(chat_id, user_id, username, first_name, start_param=""):
+    is_new = False
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    is_new = c.fetchone() is None
     c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date) VALUES (?, ?, ?, ?)",
               (user_id, username, first_name, datetime.now().isoformat()))
-    c.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (datetime.now().isoformat(), user_id))
+    c.execute("UPDATE users SET last_active = ?, username = ?, first_name = ? WHERE user_id = ?",
+              (datetime.now().isoformat(), username, first_name, user_id))
     conn.commit()
     conn.close()
-    
+
+    # ── Referral processing ──────────────────────────────────────────
+    if is_new and start_param and start_param.startswith("ref"):
+        try:
+            referrer_id = int(start_param[3:])  # "ref7713987088" → 7713987088
+            credited = process_referral(referrer_id, user_id)
+            if credited:
+                # Notify referrer
+                send_message(referrer_id,
+                    f"🎉 **Referral Bonus!**\n\n"
+                    f"Someone joined using your referral link!\n"
+                    f"You earned **{REFERRAL_REWARD_COINS} 🪙** coins.\n\n"
+                    f"Keep sharing to earn more!",
+                    {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
+        except Exception as _re:
+            print(f"⚠️ Referral processing error: {_re}")
+    # ─────────────────────────────────────────────────────────────────
+
     update_system_stats()
-    
+    get_or_create_referral_code(user_id)   # eagerly create code so it's ready
+
     if is_user_verified(user_id):
         balances = get_user_balances(user_id)
         is_premium = is_user_premium(user_id)
@@ -2637,27 +2885,42 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
 
 # ==================== MENU FUNCTIONS ====================
 def get_main_menu(user_id):
-    balances = get_user_balances(user_id)
+    balances  = get_user_balances(user_id)
     is_verified = is_user_verified(user_id)
-    is_premium = is_user_premium(user_id)
+    is_premium  = is_user_premium(user_id)
     verified_badge = "✅" if is_verified else "🔐"
-    premium_badge = "⭐" if is_premium else "🆓"
-    
+    premium_badge  = "⭐" if is_premium  else "🆓"
+
+    # Count open bug reports for admin badge
+    open_reports = 0
+    if is_admin(user_id):
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            open_reports = conn.execute(
+                "SELECT COUNT(*) FROM bug_reports WHERE status='open'").fetchone()[0]
+            conn.close()
+        except Exception:
+            pass
+
     keyboard = {
         "inline_keyboard": [
-            [{"text": f"{verified_badge} Join Channel", "callback_data": "check_verification"}],
-            [{"text": "📤 Deploy New Bot", "callback_data": "deploy_new"}],
+            [{"text": f"{verified_badge} Join Channel",         "callback_data": "check_verification"}],
+            [{"text": "📤 Deploy New Bot",                       "callback_data": "deploy_new"}],
             [{"text": f"{premium_badge} Free Deployment (24h)", "callback_data": "free_deployment"}],
-            [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+            [{"text": "📦 My Deployments",                      "callback_data": "my_deployments"}],
             [{"text": f"💰 {balances['coins']}🪙 | {balances['stars']}⭐", "callback_data": "my_balance"}],
-            [{"text": "🎫 Redeem Code", "callback_data": "redeem_code"}],
-            [{"text": "⭐ Premium Subscription", "callback_data": "subscribe_premium"}],
+            [{"text": "🎫 Redeem Code",                         "callback_data": "redeem_code"},
+             {"text": "👥 Referral",                             "callback_data": "my_referral"}],
+            [{"text": "⭐ Premium Subscription",                "callback_data": "subscribe_premium"},
+             {"text": "🐛 Report Bug",                          "callback_data": "report_bug"}],
         ]
     }
-    
+
     if is_admin(user_id):
-        keyboard["inline_keyboard"].append([{"text": "🔧 Admin Panel", "callback_data": "admin_panel"}])
-    
+        badge = f" ({open_reports} open)" if open_reports else ""
+        keyboard["inline_keyboard"].append(
+            [{"text": f"🔧 Admin Panel{badge}", "callback_data": "admin_panel"}])
+
     return keyboard
 
 def get_deploy_menu(user_id):
@@ -2707,6 +2970,21 @@ def get_env_keyboard(env_count):
 # ==================== ADMIN PANEL ====================
 def show_admin_panel(chat_id, message_id):
     stats = get_system_stats()
+
+    # Bug report counts
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        open_bugs    = conn.execute("SELECT COUNT(*) FROM bug_reports WHERE status='open'").fetchone()[0]
+        total_bugs   = conn.execute("SELECT COUNT(*) FROM bug_reports").fetchone()[0]
+        total_refs   = conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+        top_referrer = conn.execute(
+            "SELECT referrer_id, COUNT(*) c FROM referrals GROUP BY referrer_id ORDER BY c DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    except Exception:
+        open_bugs = total_bugs = total_refs = 0
+        top_referrer = None
+
     stats_text = (
         f"**📊 System Stats**\n\n"
         f"👥 Users: `{stats.get('total_users', 0)}`\n"
@@ -2716,21 +2994,27 @@ def show_admin_panel(chat_id, message_id):
         f"🆓 Free: `{stats.get('free_deployments', 0)}`\n"
         f"⭐ Premium: `{stats.get('premium_users', 0)}`\n"
         f"💰 Revenue: `${stats.get('revenue_usd', 0):.2f}`\n"
-        f"🪙 Coins Created: `{stats.get('coins_created', 0)}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
+        f"🪙 Coins Created: `{stats.get('coins_created', 0)}`\n"
+        f"🐛 Bug Reports: `{open_bugs}` open / `{total_bugs}` total\n"
+        f"👥 Referrals: `{total_refs}` total\n"
+        + (f"🏆 Top Referrer: `{top_referrer[0]}` ({top_referrer[1]} refs)\n" if top_referrer else "")
+        + f"\n━━━━━━━━━━━━━━━━━━━━━━"
     )
-    
+
+    open_badge = f" ({open_bugs})" if open_bugs else ""
     keyboard = {
         "inline_keyboard": [
-            [{"text": "🎫 Create Redeem Code", "callback_data": "admin_create_code"}],
-            [{"text": "🪙 Add Coins", "callback_data": "admin_add_coins"}],
-            [{"text": "📋 List Redeem Codes", "callback_data": "admin_list_codes"}],
-            [{"text": "👥 List Users", "callback_data": "admin_list_users"}],
-            [{"text": "📊 View Subscriptions", "callback_data": "admin_subscriptions"}],
-            [{"text": "🔙 Back to Main Menu", "callback_data": "main_menu"}]
+            [{"text": f"🐛 Bug Reports{open_badge}", "callback_data": "admin_bug_reports"},
+             {"text": "👥 Referral Stats",           "callback_data": "admin_referral_stats"}],
+            [{"text": "🎫 Create Redeem Code",       "callback_data": "admin_create_code"}],
+            [{"text": "🪙 Add Coins",                "callback_data": "admin_add_coins"}],
+            [{"text": "📋 List Redeem Codes",        "callback_data": "admin_list_codes"}],
+            [{"text": "👥 List Users",               "callback_data": "admin_list_users"}],
+            [{"text": "📊 View Subscriptions",       "callback_data": "admin_subscriptions"}],
+            [{"text": "🔙 Back to Main Menu",        "callback_data": "main_menu"}]
         ]
     }
-    
+
     edit_message(chat_id, message_id, f"**🔧 ADMIN PANEL**\n\n{stats_text}", keyboard)
 
 def admin_list_codes(chat_id, message_id):
@@ -3513,6 +3797,99 @@ def handle_callback(callback):
         handle_redeem(chat_id, user_id, message_id)
         return
 
+    # ========== REFERRAL ==========
+    if data == "my_referral":
+        show_referral_menu(chat_id, user_id, message_id)
+        return
+
+    # ========== BUG REPORT (user) ==========
+    if data == "report_bug":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_bug_report')
+        edit_message(chat_id, message_id,
+            "**🐛 REPORT A BUG**\n\n"
+            "Please describe the issue you're experiencing in as much detail as possible:\n\n"
+            "• What were you trying to do?\n"
+            "• What happened instead?\n"
+            "• Any error messages?\n\n"
+            "Type your report and send it:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+
+    # ========== ADMIN BUG REPORTS ==========
+    if data == "admin_bug_reports":
+        if is_admin(user_id):
+            show_admin_bug_reports(chat_id, user_id, message_id)
+        return
+
+    if data == "admin_referral_stats":
+        if not is_admin(user_id):
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute("""SELECT r.referrer_id, u.username, u.first_name, COUNT(*) cnt,
+                                COALESCE(SUM(r.reward_coins),0) earned
+                         FROM referrals r
+                         LEFT JOIN users u ON u.user_id = r.referrer_id
+                         GROUP BY r.referrer_id ORDER BY cnt DESC LIMIT 15""")
+            rows = c.fetchall()
+            total = c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+            coins_paid = c.execute("SELECT COALESCE(SUM(reward_coins),0) FROM referrals WHERE reward_given=1").fetchone()[0]
+            conn.close()
+
+            text = (f"**👥 REFERRAL STATS**\n\n"
+                    f"Total referrals: `{total}`\n"
+                    f"Coins paid out:  `{coins_paid}🪙`\n"
+                    f"Reward per ref:  `{REFERRAL_REWARD_COINS}🪙`\n\n"
+                    f"**Top Referrers:**\n")
+            for i, (rid, uname, fname, cnt, earned) in enumerate(rows, 1):
+                who = f"@{uname}" if uname else (fname or f"#{rid}")
+                text += f"{i}. {who} — `{cnt}` refs → `{earned}🪙`\n"
+            if not rows:
+                text += "_No referrals yet_"
+        except Exception as e:
+            text = f"❌ Error: {e}"
+        edit_message(chat_id, message_id, text,
+                     {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+        return
+
+    if data.startswith("bug_reply_"):
+        if is_admin(user_id):
+            report_id = int(data.split("_")[2])
+            set_user_step(user_id, f'awaiting_bug_reply_{report_id}')
+            # Get report info
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute("SELECT user_id, username, first_name, message FROM bug_reports WHERE report_id = ?", (report_id,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                who = f"@{row[1]}" if row[1] else f"User {row[0]}"
+                preview = row[3][:100]
+                edit_message(chat_id, message_id,
+                    f"**✉️ REPLY TO REPORT #{report_id}**\n\n"
+                    f"From: {who}\n"
+                    f"Message: _{preview}_\n\n"
+                    f"Type your reply and send it:",
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_bug_reports"}]]})
+            else:
+                edit_message(chat_id, message_id, "❌ Report not found.",
+                             {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_bug_reports"}]]})
+        return
+
+    if data.startswith("bug_close_"):
+        if is_admin(user_id):
+            report_id = int(data.split("_")[2])
+            conn = sqlite3.connect(DATABASE_FILE)
+            conn.execute("UPDATE bug_reports SET status='closed' WHERE report_id = ?", (report_id,))
+            conn.commit()
+            conn.close()
+            show_admin_bug_reports(chat_id, user_id, message_id)
+        return
+
 # ==================== USER STEP FUNCTIONS ====================
 def set_user_step(user_id, step, **kwargs):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -3573,16 +3950,50 @@ def handle_message(message):
     
     print(f"📨 Message from {first_name} ({user_id})")
     
-    if 'text' in message and message['text'] == '/start':
-        handle_start(chat_id, user_id, message['from'].get('username', ''), first_name)
+    if 'text' in message and message['text'].startswith('/start'):
+        parts = message['text'].split(maxsplit=1)
+        start_param = parts[1].strip() if len(parts) > 1 else ""
+        handle_start(chat_id, user_id, message['from'].get('username', ''), first_name, start_param)
         return
     
     user_step = get_user_step(user_id)
     
     if 'text' in message:
         text = message['text']
-        
-        if user_step.get('waiting_for_redeem') == 1:
+
+        # ── Bug report submission ────────────────────────────────────
+        if user_step.get('step') == 'awaiting_bug_report':
+            if text.strip():
+                uname = message['from'].get('username', '')
+                report_id = submit_bug_report(user_id, uname, first_name, text.strip())
+                set_user_step(user_id, None)
+                send_message(chat_id,
+                    f"✅ **Bug Report #{report_id} Submitted!**\n\n"
+                    f"Thank you for your report. An admin will review it and reply to you here.\n\n"
+                    f"You'll receive a notification when there's a reply.",
+                    {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
+            else:
+                send_message(chat_id, "❌ Report cannot be empty. Please describe the bug:",
+                             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+            return
+
+        # ── Admin replying to a bug report ───────────────────────────
+        if is_admin(user_id) and user_step.get('step', '').startswith('awaiting_bug_reply_'):
+            report_id = int(user_step['step'].split('_')[-1])
+            if text.strip():
+                ok, result = reply_to_bug_report(report_id, user_id, text.strip())
+                set_user_step(user_id, None)
+                if ok:
+                    send_message(chat_id,
+                        f"✅ **Reply sent to user `{result}` for report #{report_id}**",
+                        {"inline_keyboard": [
+                            [{"text": "📋 All Reports", "callback_data": "admin_bug_reports"}],
+                            [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+                else:
+                    send_message(chat_id, f"❌ Error: {result}")
+            else:
+                send_message(chat_id, "❌ Reply cannot be empty.")
+            return
             process_redeem(chat_id, user_id, text)
             return
         
