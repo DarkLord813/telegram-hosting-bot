@@ -56,7 +56,7 @@ else:
     BASE_DIR = Path("./bot_hosting_data")
 
 DEPLOYMENTS_DIR = BASE_DIR / "deployments"
-DATABASE_FILE = BASE_DIR / "bot_database.db"
+DATABASE_FILE = BASE_DIR / "hosting_bot.db"
 USER_FILES_DIR = BASE_DIR / "user_files"
 LOGS_DIR = BASE_DIR / "logs"
 PIP_CACHE_DIR = BASE_DIR / "pip_cache"
@@ -84,6 +84,14 @@ STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 
 # Referral reward
 REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 50))
+
+# ── GitHub Backup ─────────────────────────────────────────────────────────────
+GITHUB_TOKEN        = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO_OWNER   = os.environ.get("GITHUB_REPO_OWNER", "")
+GITHUB_REPO_NAME    = os.environ.get("GITHUB_REPO_NAME", "")
+GITHUB_BACKUP_BRANCH= os.environ.get("GITHUB_BACKUP_BRANCH", "main")
+GITHUB_BACKUP_PATH  = os.environ.get("GITHUB_BACKUP_PATH", "backups/hosting_bot.db")
+GITHUB_ENABLED      = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_REPO_NAME)
 
 # Timeout settings
 PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
@@ -208,7 +216,10 @@ def init_db():
         bot_type TEXT DEFAULT 'python_app',
         framework TEXT DEFAULT 'unknown',
         dependencies_installed TEXT,
-        folder_name TEXT
+        folder_name TEXT,
+        source_type TEXT DEFAULT 'upload',
+        github_repo TEXT,
+        github_branch TEXT DEFAULT 'main'
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS coin_transactions (
@@ -342,6 +353,14 @@ def init_db():
                       else f"ALTER TABLE users ADD COLUMN {_col} {_type}")
         except Exception:
             pass
+
+    for _col, _type in [("source_type","TEXT DEFAULT 'upload'"),
+                        ("github_repo", "TEXT"),
+                        ("github_branch","TEXT DEFAULT 'main'")]:
+        try:
+            c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
     
     conn.commit()
     conn.close()
@@ -363,6 +382,178 @@ def get_deploy_folder(user_id, deployment_id):
         pass
     # Fallback: old behaviour (folder named by DB id) for records without folder_name
     return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
+
+
+# ==================== GITHUB BACKUP SYSTEM ====================
+
+_github_push_lock   = threading.Lock()
+_last_backup_time   = 0.0
+_MIN_BACKUP_INTERVAL = 30          # minimum seconds between consecutive backups
+
+def _gh_api(method, path, payload=None):
+    """Raw GitHub Contents API call. Returns (http_status, response_dict)."""
+    url     = (f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/"
+               f"{GITHUB_REPO_NAME}/contents/{path}")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept":        "application/vnd.github+json",
+        "Content-Type":  "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = json.dumps(payload).encode() if payload else None
+    req  = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:    return e.code, json.loads(e.read())
+        except: return e.code, {}
+    except Exception as ex:
+        return 0, {"error": str(ex)}
+
+def _db_has_data():
+    """Return True only when the database contains real rows (not just schema)."""
+    if not DATABASE_FILE.exists():
+        return False
+    if DATABASE_FILE.stat().st_size < 8192:   # < 8 KB → almost certainly empty
+        return False
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c    = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM deployments")
+        deps  = c.fetchone()[0]
+        conn.close()
+        return users > 0 or deps > 0
+    except Exception:
+        return False
+
+def github_restore_db():
+    """
+    Download the database from GitHub and write it to DATABASE_FILE.
+    Must be called BEFORE init_db() so existing data is never overwritten by
+    a fresh schema.  Safe to call even when GitHub is not configured.
+    """
+    if not GITHUB_ENABLED:
+        print("ℹ️  GitHub backup not configured — skipping restore")
+        return False
+
+    print(f"🔄 Restoring from GitHub → "
+          f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_BACKUP_PATH} "
+          f"[branch: {GITHUB_BACKUP_BRANCH}]")
+
+    status, resp = _gh_api("GET", GITHUB_BACKUP_PATH)
+
+    if status == 404:
+        print("ℹ️  No backup found on GitHub — starting fresh")
+        return False
+    if status != 200:
+        print(f"⚠️  GitHub restore HTTP {status}: {resp.get('message', resp)}")
+        return False
+
+    try:
+        raw_b64  = resp.get("content", "").replace("\n", "")
+        db_bytes = base64.b64decode(raw_b64)
+
+        if len(db_bytes) < 1024:
+            print("⚠️  GitHub backup is too small — skipping restore (corrupt?)")
+            return False
+
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DATABASE_FILE, "wb") as f:
+            f.write(db_bytes)
+
+        size_kb = len(db_bytes) / 1024
+        print(f"✅ Database restored from GitHub ({size_kb:.1f} KB)")
+        return True
+    except Exception as e:
+        print(f"❌ GitHub restore error: {e}")
+        return False
+
+def github_backup_db(reason: str = "auto"):
+    """
+    Upload DATABASE_FILE to GitHub.  Thread-safe via push lock.
+    Silently skips when:
+      • GitHub is not configured
+      • The database is empty / has no real rows
+      • Another backup is already in flight
+      • The previous backup was less than _MIN_BACKUP_INTERVAL seconds ago
+    """
+    global _last_backup_time
+
+    if not GITHUB_ENABLED:
+        return False
+    if not _db_has_data():
+        print(f"⏭️  Backup skipped ({reason}): database has no data")
+        return False
+
+    now = datetime.now().timestamp()
+    if now - _last_backup_time < _MIN_BACKUP_INTERVAL:
+        return False   # too soon — silent
+
+    if not _github_push_lock.acquire(blocking=False):
+        return False   # another backup already running
+
+    try:
+        with open(DATABASE_FILE, "rb") as f:
+            db_bytes = f.read()
+
+        if len(db_bytes) < 1024:
+            return False
+
+        content_b64 = base64.b64encode(db_bytes).decode()
+
+        # We need the current file's SHA to update it (GitHub API requirement)
+        sha    = None
+        status, resp = _gh_api("GET", GITHUB_BACKUP_PATH)
+        if status == 200:
+            sha = resp.get("sha")
+        elif status not in (200, 404):
+            print(f"⚠️  GitHub SHA lookup failed (HTTP {status}) — backup aborted")
+            return False
+
+        commit = {
+            "message": f"backup: {reason} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            "content": content_b64,
+            "branch":  GITHUB_BACKUP_BRANCH,
+        }
+        if sha:
+            commit["sha"] = sha
+
+        status, resp = _gh_api("PUT", GITHUB_BACKUP_PATH, commit)
+
+        if status in (200, 201):
+            _last_backup_time = datetime.now().timestamp()
+            print(f"✅ DB backed up to GitHub ({len(db_bytes)/1024:.1f} KB) — {reason}")
+            return True
+        else:
+            print(f"⚠️  GitHub backup HTTP {status}: {resp.get('message', resp)}")
+            return False
+
+    except Exception as e:
+        print(f"❌ GitHub backup error: {e}")
+        return False
+    finally:
+        _github_push_lock.release()
+
+def async_backup(reason: str = "auto"):
+    """Fire-and-forget backup — never blocks the bot's response path."""
+    if GITHUB_ENABLED:
+        threading.Thread(
+            target=github_backup_db, args=(reason,),
+            daemon=True, name="GitHubBackup"
+        ).start()
+
+def _periodic_backup_thread():
+    """Safety-net: flush a backup every 30 minutes regardless of other triggers."""
+    sleep(300)   # wait 5 min before first periodic attempt
+    while True:
+        try:
+            github_backup_db("periodic")
+        except Exception as e:
+            print(f"⚠️  Periodic backup error: {e}")
+        sleep(1800)   # 30 minutes
 
 
 def _find_available_port(preferred: int = 20000) -> int:
@@ -581,7 +772,7 @@ def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
         user_info = get_user_info(user_id)
         admin_msg = f"🎉 NEW PREMIUM!\nUser: {user_info.get('first_name', 'Unknown')} ({user_id})\nPlan: {plan.upper()}\nAmount: {amount_stars}⭐\nResumed: {resumed_count}"
         notify_admin(admin_msg)
-        
+        async_backup(f"premium_{plan}_{user_id}")
         return True, resumed_count
     except Exception as e:
         print(f"❌ Activate premium error: {e}")
@@ -858,6 +1049,7 @@ def redeem_code(user_id, code):
     conn.commit()
     conn.close()
     update_system_stats()
+    async_backup(f"redeem_{user_id}")
     return True, f"✅ Redeemed: {', '.join(reward_msg)}!"
 
 # ==================== REFERRAL SYSTEM ====================
@@ -916,6 +1108,7 @@ def process_referral(referrer_id, new_user_id):
     conn2.execute("UPDATE referrals SET reward_given = 1 WHERE referred_id = ?", (new_user_id,))
     conn2.commit()
     conn2.close()
+    async_backup(f"referral_{referrer_id}")
     return True
 
 def show_referral_menu(chat_id, user_id, message_id=None):
@@ -988,6 +1181,7 @@ def submit_bug_report(user_id, username, first_name, message_text):
     for admin_id in ADMIN_IDS:
         send_message(admin_id, admin_text, admin_kb)
 
+    async_backup(f"bug_report_{report_id}")
     return report_id
 
 def reply_to_bug_report(report_id, admin_id, reply_text):
@@ -1416,63 +1610,190 @@ class AutoDependencyDetector:
         return requirements
 
 # ========== ENHANCED DEPENDENCY INSTALLATION ==========
-def install_dependencies_enhanced(reqs_file, update_logs):
+def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
+    """
+    VPS-grade installer.
+    - Installs into packages_dir (per-deployment isolation) when provided
+    - Falls back to system-wide install
+    - Handles requirements.txt, pyproject.toml, Pipfile, setup.py/cfg
+    - Upgrades pip first, retries individual failures
+    """
     if not reqs_file.exists():
         update_logs("✅ No requirements file found")
         return True, []
-    
+
     try:
         with open(reqs_file, 'r') as f:
-            requirements = f.read().strip()
-        
-        if not requirements:
+            raw = f.read().strip()
+        if not raw:
             update_logs("⚠️ requirements.txt is empty")
             return True, []
-        
-        packages = [p.strip() for p in requirements.split('\n') if p.strip() and not p.startswith('#')]
-        update_logs(f"📦 Found {len(packages)} package(s) to install")
-        
-        # Upgrade pip with progress
+
+        packages = [p.strip() for p in raw.split('\n')
+                    if p.strip() and not p.startswith('#') and not p.startswith('-')]
+        update_logs(f"📦 {len(packages)} package(s) to install")
+
+        # Upgrade pip silently first
         update_logs("🔄 Upgrading pip...")
-        update_logs(create_progress_bar(0, 25))
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], 
-                      capture_output=True, timeout=60)
-        update_logs(create_progress_bar(100, 25))
-        update_logs("✅ Pip upgraded")
-        
-        # Install packages with progress tracking
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+                       capture_output=True, timeout=60)
+
+        # Build base pip command
+        def _pip_cmd(pkg_or_flag, extra_flags=None):
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
+                   "--no-warn-script-location", "--quiet"]
+            if packages_dir:
+                cmd += ["--target", str(packages_dir)]
+            if extra_flags:
+                cmd += extra_flags
+            cmd.append(pkg_or_flag)
+            return cmd
+
         success_count = 0
         failed_packages = []
-        
+
         for i, package in enumerate(packages):
-            progress = (i / len(packages)) * 100
-            update_logs(create_progress_bar(progress, 25))
-            update_logs(f"   Installing: {package[:50]}...")
-            
-            success, message = UniversalDependencyInstaller.install_dependency(package, update_logs)
-            
-            if success:
-                success_count += 1
-                update_logs(f"   ✅ {package[:50]} installed")
+            pct = int((i / len(packages)) * 100)
+            update_logs(create_progress_bar(pct, 25))
+            update_logs(f"   ⬇️  {package[:60]}")
+
+            # Determine install type
+            pkg_lower = package.lower()
+            if pkg_lower.startswith('git+') or pkg_lower.startswith('hg+') or pkg_lower.startswith('svn+'):
+                cmd = _pip_cmd(package)
+            elif pkg_lower.endswith('.whl') or pkg_lower.endswith('.tar.gz'):
+                cmd = _pip_cmd(package)
+            elif '.git' in package or 'github.com' in package:
+                cmd = _pip_cmd(f"git+{package}" if not package.startswith('git+') else package)
             else:
-                failed_packages.append(package)
-                update_logs(f"   ❌ {package[:50]} failed: {message[:80]}")
-        
+                cmd = _pip_cmd(package)
+
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if res.returncode == 0:
+                success_count += 1
+                update_logs(f"   ✅ {package[:60]}")
+            else:
+                # Retry without --upgrade in case of version conflict
+                res2 = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet",
+                     *(["--target", str(packages_dir)] if packages_dir else []),
+                     package],
+                    capture_output=True, text=True, timeout=180)
+                if res2.returncode == 0:
+                    success_count += 1
+                    update_logs(f"   ✅ {package[:60]} (retry OK)")
+                else:
+                    failed_packages.append(package)
+                    err_line = (res.stderr or res.stdout or "")[-200:].strip().split('\n')[-1]
+                    update_logs(f"   ❌ {package[:50]}: {err_line[:80]}")
+
         update_logs(create_progress_bar(100, 25))
-        
         if failed_packages:
-            update_logs(f"⚠️ Failed: {len(failed_packages)} package(s)")
-            for pkg in failed_packages[:5]:
-                update_logs(f"   • {pkg[:50]}")
-        
-        update_logs(f"✅ Installed {success_count}/{len(packages)} packages")
-        
-        success_rate = success_count / len(packages) if packages else 1.0
-        return success_rate >= 0.8, failed_packages
-        
+            update_logs(f"⚠️ Failed ({len(failed_packages)}): {', '.join(p.split('==')[0][:20] for p in failed_packages[:5])}")
+        update_logs(f"✅ {success_count}/{len(packages)} packages installed")
+
+        return (success_count / len(packages)) >= 0.7 if packages else True, failed_packages
+
     except Exception as e:
-        update_logs(f"❌ Installation error: {str(e)}")
+        update_logs(f"❌ Installer error: {e}")
         return False, []
+
+
+def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
+    """
+    Scan a cloned repo directory for ALL supported requirement sources and
+    install everything.  Returns a flat list of packages installed.
+    """
+    packages_dir = deploy_folder / 'packages'
+    packages_dir.mkdir(exist_ok=True)
+
+    installed = []
+
+    # ── requirements.txt (and variants) ──────────────────────────────
+    for fname in ['requirements.txt', 'requirements-dev.txt', 'requirements_prod.txt',
+                  'requirements/base.txt', 'requirements/main.txt']:
+        req_path = deploy_folder / fname
+        if req_path.exists():
+            update_logs(f"📋 Found {fname}")
+            ok, failed = install_dependencies_enhanced(req_path, update_logs, packages_dir)
+            installed.extend([l.strip() for l in req_path.read_text().splitlines()
+                              if l.strip() and not l.startswith('#')])
+
+    # ── pyproject.toml (PEP 517/518) ─────────────────────────────────
+    pyproject = deploy_folder / 'pyproject.toml'
+    if pyproject.exists():
+        update_logs("📋 Found pyproject.toml — installing with pip...")
+        res = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '--quiet',
+             '--no-warn-script-location', '--target', str(packages_dir), '.'],
+            cwd=str(deploy_folder), capture_output=True, text=True, timeout=300)
+        if res.returncode == 0:
+            update_logs("✅ pyproject.toml dependencies installed")
+        else:
+            # Extract [tool.poetry.dependencies] or [project.dependencies] manually
+            try:
+                import re as _re
+                text = pyproject.read_text()
+                # PEP 621 style
+                deps = _re.findall(r'^\s*"([a-zA-Z0-9_\-]+)[>=<!\[\]"]*"', text, _re.M)
+                # Poetry style
+                deps += _re.findall(r'^\s*([a-zA-Z0-9_\-]+)\s*=\s*["\^~]', text, _re.M)
+                skip = {'python', 'pip', 'setuptools', 'wheel'}
+                deps = [d for d in dict.fromkeys(deps) if d.lower() not in skip]
+                if deps:
+                    update_logs(f"📦 Parsed {len(deps)} deps from pyproject.toml")
+                    tmp = deploy_folder / '_pyproject_reqs.txt'
+                    tmp.write_text('\n'.join(deps))
+                    install_dependencies_enhanced(tmp, update_logs, packages_dir)
+                    tmp.unlink(missing_ok=True)
+                    installed.extend(deps)
+            except Exception as pe:
+                update_logs(f"⚠️ pyproject.toml parse error: {pe}")
+
+    # ── Pipfile ───────────────────────────────────────────────────────
+    pipfile = deploy_folder / 'Pipfile'
+    if pipfile.exists():
+        update_logs("📋 Found Pipfile — extracting packages...")
+        try:
+            import re as _re
+            text = pipfile.read_text()
+            in_packages = False
+            pkgs = []
+            for line in text.splitlines():
+                if line.strip() in ('[packages]', '[dev-packages]'):
+                    in_packages = True
+                elif line.startswith('['):
+                    in_packages = False
+                elif in_packages:
+                    m = _re.match(r'^([a-zA-Z0-9_\-]+)\s*=', line)
+                    if m:
+                        pkgs.append(m.group(1))
+            if pkgs:
+                update_logs(f"📦 Parsed {len(pkgs)} deps from Pipfile")
+                tmp = deploy_folder / '_pipfile_reqs.txt'
+                tmp.write_text('\n'.join(pkgs))
+                install_dependencies_enhanced(tmp, update_logs, packages_dir)
+                tmp.unlink(missing_ok=True)
+                installed.extend(pkgs)
+        except Exception as pfe:
+            update_logs(f"⚠️ Pipfile parse error: {pfe}")
+
+    # ── setup.py / setup.cfg ──────────────────────────────────────────
+    for setup_file in ['setup.py', 'setup.cfg']:
+        sf = deploy_folder / setup_file
+        if sf.exists():
+            update_logs(f"📋 Found {setup_file} — installing package...")
+            res = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '--quiet',
+                 '--no-warn-script-location', '--target', str(packages_dir), '-e', '.'],
+                cwd=str(deploy_folder), capture_output=True, text=True, timeout=300)
+            if res.returncode == 0:
+                update_logs(f"✅ {setup_file} installed")
+            else:
+                update_logs(f"⚠️ {setup_file} install failed (check output log)")
+            break
+
+    return installed
 
 # ========== FRAMEWORK DETECTION ==========
 def detect_bot_framework(code_content: str) -> list:
@@ -1496,7 +1817,7 @@ def detect_bot_framework(code_content: str) -> list:
     return frameworks if frameworks else ['generic']
 
 # ========== ENHANCED LAUNCHER SCRIPT ==========
-def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs):
+def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs, packages_dir=None):
     frameworks = detect_bot_framework(code_content)
     framework_str = ', '.join(frameworks)
     update_logs(f"🔧 Framework detection: {framework_str}")
@@ -1509,6 +1830,9 @@ def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, c
         env_set_code.append(f'os.environ["{k}"] = "{escaped_v}"')
     
     env_set_str = "\n".join(env_set_code) if env_set_code else "# No custom environment variables"
+    
+    # Build packages_dir injection line for launcher
+    packages_dir_str = str(packages_dir) if packages_dir else str(deploy_folder / 'packages')
     
     with open(launcher_script, 'w', encoding='utf-8') as f:
         f.write(f'''#!/usr/bin/env python3
@@ -1525,6 +1849,12 @@ import signal
 import threading
 import traceback
 from pathlib import Path
+
+# ── Per-deployment packages directory (VPS isolation) ────────────────────────
+# Packages installed with --target land here and take priority over system libs
+_pkg_dir = r"{packages_dir_str}"
+if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
 
 # Change to deployment directory
 os.chdir(r"{deploy_folder}")
@@ -1916,6 +2246,382 @@ except Exception as e:
     return launcher_script, frameworks
 
 # ========== ENHANCED DEPLOYMENT FUNCTION ==========
+# ==================== GITHUB REPO DEPLOYMENT ====================
+
+def parse_github_url(raw: str):
+    """
+    Parse any GitHub URL/shorthand into (owner, repo, branch).
+    Supports:
+      github.com/owner/repo
+      https://github.com/owner/repo
+      https://github.com/owner/repo/tree/branch
+      owner/repo
+      owner/repo@branch
+    Returns (None,None,None) on failure.
+    """
+    import re as _re
+    raw = raw.strip().rstrip('/')
+
+    # Pull branch from @branch suffix
+    branch = None
+    if '@' in raw and 'github.com' not in raw.split('@')[0]:
+        raw, branch = raw.rsplit('@', 1)
+
+    raw = _re.sub(r'^https?://', '', raw)
+    raw = _re.sub(r'^github\.com/', '', raw)
+    raw = raw.rstrip('/')
+
+    parts = raw.split('/')
+    if len(parts) < 2:
+        return None, None, None
+
+    owner = parts[0]
+    repo  = parts[1].removesuffix('.git')
+
+    if not branch:
+        if len(parts) >= 4 and parts[2] == 'tree':
+            branch = '/'.join(parts[3:])
+        else:
+            branch = None   # will be resolved from API
+
+    return owner, repo, branch
+
+
+def resolve_default_branch(owner: str, repo: str, token: str = None) -> str:
+    """Ask GitHub API for the repo's default branch."""
+    headers = {"User-Agent": "BotHostingPlatform/1.0",
+               "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+            return data.get("default_branch", "main")
+    except Exception:
+        return "main"
+
+
+def get_repo_info(owner: str, repo: str, token: str = None) -> dict:
+    """Fetch basic repo metadata for display."""
+    headers = {"User-Agent": "BotHostingPlatform/1.0",
+               "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {}
+
+
+def download_github_repo(owner: str, repo: str, branch: str,
+                         dest_folder: Path, token: str = None,
+                         update_logs=None) -> bool:
+    """
+    Download a GitHub repo as a tarball and extract it to dest_folder.
+    Works for both public and private repos (private requires a valid token).
+    Does NOT require git to be installed.
+    """
+    import tarfile, io as _io
+
+    def _log(msg):
+        if update_logs:
+            update_logs(msg)
+        else:
+            print(msg)
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{branch}"
+    headers = {"User-Agent": "BotHostingPlatform/1.0",
+               "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    _log(f"⬇️  Downloading {owner}/{repo}@{branch}...")
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            tarball = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _log("❌ GitHub auth failed — check your token")
+        elif e.code == 404:
+            _log("❌ Repo not found — is it private? Provide a token")
+        else:
+            _log(f"❌ GitHub download HTTP {e.code}")
+        return False
+    except Exception as e:
+        _log(f"❌ Download error: {e}")
+        return False
+
+    size_kb = len(tarball) / 1024
+    _log(f"✅ Downloaded {size_kb:.0f} KB — extracting...")
+
+    try:
+        with tarfile.open(fileobj=_io.BytesIO(tarball), mode='r:gz') as tar:
+            members = tar.getmembers()
+            # GitHub tarballs contain a single top-level dir like "owner-repo-sha/"
+            # We strip it so files land directly in dest_folder
+            if members:
+                prefix = members[0].name.split('/')[0] + '/'
+            else:
+                prefix = ''
+
+            for member in members:
+                rel = member.name
+                if rel.startswith(prefix):
+                    rel = rel[len(prefix):]
+                if not rel:
+                    continue
+                member.name = rel
+                # Safety: no absolute paths or path traversal
+                if rel.startswith('/') or '..' in rel:
+                    continue
+                try:
+                    tar.extract(member, dest_folder)
+                except Exception:
+                    pass
+
+        _log(f"✅ Repo extracted to {dest_folder.name}/")
+        return True
+
+    except Exception as e:
+        _log(f"❌ Extraction error: {e}")
+        return False
+
+
+# Priority order for auto-detecting the main bot file
+_MAIN_FILE_CANDIDATES = [
+    'main.py', 'bot.py', 'app.py', 'run.py', 'start.py',
+    'index.py', 'server.py', 'handler.py', '__main__.py',
+]
+
+def find_main_file(folder: Path) -> list[Path]:
+    """
+    Return a ranked list of Python file candidates for the bot entry point.
+    Priority: known names → files with if __name__ == '__main__' → other .py
+    """
+    found = []
+
+    # 1. Known entry-point names first
+    for name in _MAIN_FILE_CANDIDATES:
+        p = folder / name
+        if p.exists():
+            found.append(p)
+
+    # 2. Any .py file with an if __name__ == '__main__' block
+    for p in sorted(folder.rglob('*.py')):
+        if p in found:
+            continue
+        try:
+            txt = p.read_text(errors='ignore')
+            if "__name__" in txt and "__main__" in txt:
+                found.append(p)
+        except Exception:
+            pass
+
+    # 3. Any remaining top-level .py files
+    for p in sorted(folder.glob('*.py')):
+        if p not in found:
+            found.append(p)
+
+    return found
+
+
+def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
+                       env_vars_dict, plan, duration,
+                       cost_coins, cost_stars, payment_method,
+                       is_free=False, main_file_name=None):
+    """
+    Full deployment flow for a GitHub repo:
+    download → detect requirements → install → launch.
+    """
+    status_msg = send_message(chat_id, "```\n🐙 GITHUB DEPLOYMENT STARTING\n```", None)
+    status_message_id = status_msg.get('result', {}).get('message_id') if status_msg else None
+    logs = []
+
+    def update_logs(msg):
+        logs.append(msg)
+        if status_message_id:
+            try:
+                edit_message(chat_id, status_message_id,
+                             f"```\n🐙 GITHUB DEPLOY\n\n{chr(10).join(logs[-25:])[-3000:]}\n```", None)
+            except Exception:
+                pass
+
+    try:
+        deploy_id     = int(datetime.now().timestamp())
+        deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
+        deploy_folder.mkdir(parents=True, exist_ok=True)
+        packages_dir  = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
+
+        # ── Download repo ────────────────────────────────────────────
+        if not download_github_repo(owner, repo, branch, deploy_folder, token, update_logs):
+            edit_message(chat_id, status_message_id,
+                "❌ **GitHub download failed.**\n\n"
+                "• For private repos: ensure the token has `repo` scope\n"
+                "• Check the repo URL and branch name",
+                {"inline_keyboard": [[{"text": "🔄 Try Again", "callback_data": "github_deploy"},
+                                      [{"text": "🏠 Menu",    "callback_data": "main_menu"}]]]})
+            return False
+
+        # ── Install all requirement sources ──────────────────────────
+        update_logs("📦 Installing all dependencies (VPS mode)...")
+        install_from_repo_requirements(deploy_folder, update_logs)
+
+        # ── Detect main file ─────────────────────────────────────────
+        if main_file_name:
+            dest_script = deploy_folder / main_file_name
+        else:
+            candidates = find_main_file(deploy_folder)
+            dest_script = candidates[0] if candidates else None
+
+        if not dest_script or not dest_script.exists():
+            update_logs("❌ No main Python file found — cannot launch")
+            return False
+
+        update_logs(f"🎯 Entry point: {dest_script.relative_to(deploy_folder)}")
+
+        # ── Read code for framework detection ────────────────────────
+        try:
+            code_content = dest_script.read_text(errors='ignore')
+        except Exception:
+            code_content = ""
+
+        file_size = dest_script.stat().st_size
+
+        # ── Write .env ───────────────────────────────────────────────
+        env_file = deploy_folder / ".env"
+        # Assign unique port
+        _hosting_port = int(os.environ.get('PORT', 10000))
+        if int(env_vars_dict.get('PORT', 0) or 0) in (0, _hosting_port):
+            _deploy_port = _find_available_port(20000 + (deploy_id % 9000))
+            env_vars_dict['PORT'] = str(_deploy_port)
+            env_vars_dict['BOT_PORT'] = str(_deploy_port)
+        with open(env_file, 'w') as f:
+            for k, v in env_vars_dict.items():
+                f.write(f"{k}={v}\n")
+        update_logs(f"📝 .env written ({len(env_vars_dict)} vars)")
+
+        # ── Create launcher ──────────────────────────────────────────
+        update_logs("🔧 Creating launcher...")
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
+            packages_dir=packages_dir)
+
+        # ── Start script ─────────────────────────────────────────────
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
+            f"nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
+        start_script.chmod(0o755)
+
+        update_logs("🚀 Starting bot...")
+        subprocess.run([str(start_script)], cwd=str(deploy_folder),
+                       capture_output=True, text=True)
+
+        update_logs("⏳ Waiting for initialization (12s)...")
+        sleep(12)
+
+        # ── Check alive ──────────────────────────────────────────────
+        pid_file  = deploy_folder / "pid.txt"
+        proc_pid  = None
+        log_file  = deploy_folder / "output.log"
+        if pid_file.exists():
+            try:
+                proc_pid = int(pid_file.read_text().strip())
+            except Exception:
+                pass
+
+        is_running = False
+        if proc_pid:
+            try:
+                os.kill(proc_pid, 0)
+                is_running = True
+            except Exception:
+                pass
+
+        # ── Show last log lines ──────────────────────────────────────
+        if log_file.exists() and log_file.stat().st_size > 0:
+            lines = [l for l in log_file.read_text(errors='replace').split('\n') if l.strip()]
+            for line in lines[-20:]:
+                update_logs(f"   {line[:120]}")
+
+        if is_running:
+            start_time  = datetime.now()
+            expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS if is_free else duration * 24)
+
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute('''INSERT INTO deployments
+                (user_id, file_name, file_size, requirements, env_vars, plan, payment_method,
+                 cost_coins, cost_stars, start_time, expire_time, status, proc_pid,
+                 install_log, deploy_log, is_free, is_paused, framework,
+                 dependencies_installed, folder_name, source_type, github_repo, github_branch)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (user_id, dest_script.name, file_size, "", json.dumps(env_vars_dict),
+                 plan, payment_method, cost_coins, cost_stars,
+                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 "\n".join(logs[-100:]), "GitHub bot running",
+                 1 if is_free else 0, 0, ', '.join(frameworks),
+                 json.dumps([]), str(deploy_id),
+                 "github", f"{owner}/{repo}", branch))
+            deployment_db_id = c.lastrowid
+            conn.commit()
+            conn.close()
+
+            set_user_step(user_id, None)
+            with deployment_lock:
+                active_deployments[deployment_db_id] = proc_pid
+
+            expire_str = expire_time.strftime('%Y-%m-%d %H:%M')
+            edit_message(chat_id, status_message_id,
+                f"**🎉 GITHUB DEPLOYMENT SUCCESSFUL!**\n\n"
+                f"🐙 **Repo:** `{owner}/{repo}`\n"
+                f"🌿 **Branch:** `{branch}`\n"
+                f"🎯 **Entry:** `{dest_script.name}`\n"
+                f"🔧 **Framework:** {', '.join(frameworks)}\n"
+                f"📋 **Plan:** {plan.upper()}\n"
+                f"📅 **Expires:** `{expire_str}`\n"
+                f"🆔 **ID:** `{deployment_db_id}`",
+                {"inline_keyboard": [
+                    [{"text": "📄 Runtime Logs",  "callback_data": f"view_runtime_logs_{deployment_db_id}"}],
+                    [{"text": "🔄 Restart",        "callback_data": f"restart_deploy_{deployment_db_id}"}],
+                    [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                    [{"text": "🏠 Menu",           "callback_data": "main_menu"}],
+                ]})
+
+            async_backup(f"github_deploy_{deployment_db_id}")
+            return True
+        else:
+            err_tail = ""
+            if log_file.exists():
+                err_tail = log_file.read_text(errors='replace')[-2500:].strip()
+            edit_message(chat_id, status_message_id,
+                f"❌ **GITHUB DEPLOYMENT FAILED**\n\n"
+                f"Repo: `{owner}/{repo}@{branch}`\n\n"
+                f"**Last output:**\n```\n{err_tail[-1500:]}\n```\n\n"
+                "Common fixes:\n"
+                "• Set `BOT_TOKEN` in env vars\n"
+                "• Check the main file name\n"
+                "• Verify requirements are correct",
+                {"inline_keyboard": [[{"text": "🔄 Retry", "callback_data": "github_deploy"},
+                                      {"text": "🏠 Menu",  "callback_data": "main_menu"}]]})
+            return False
+
+    except Exception as e:
+        print(f"❌ deploy_from_github error: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
 def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars, 
                      plan, duration, cost_coins, cost_stars, payment_method, is_free=False):
     status_msg = send_message(chat_id, "```\n🚀 STARTING DEPLOYMENT\n```", None)
@@ -1942,6 +2648,8 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         deploy_id = int(datetime.now().timestamp())
         deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
         deploy_folder.mkdir(parents=True, exist_ok=True)
+        packages_dir = deploy_folder / 'packages'
+        packages_dir.mkdir(exist_ok=True)
         
         saved_path, saved_filename = save_user_file(user_id, temp_file, Path(temp_file).name)
         file_size = saved_path.stat().st_size
@@ -1987,7 +2695,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             reqs_file = deploy_folder / "requirements.txt"
             with open(reqs_file, 'w') as f:
                 f.write('\n'.join(requirements_list))
-            deps_success, failed = install_dependencies_enhanced(reqs_file, update_logs)
+            deps_success, failed = install_dependencies_enhanced(reqs_file, update_logs, packages_dir)
         
         if not deps_success and requirements_list:
             update_logs("⚠️ Some dependencies failed to install - continuing anyway")
@@ -2016,7 +2724,9 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         
         # Create enhanced launcher
         update_logs("🚀 Creating enhanced launcher...")
-        launcher_script, frameworks = create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs)
+        launcher_script, frameworks = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
+            packages_dir=packages_dir)
         
         # Create start script
         start_script = deploy_folder / "start.sh"
@@ -2120,7 +2830,8 @@ echo $! > pid.txt
             if proc_pid:
                 with deployment_lock:
                     active_deployments[deployment_db_id] = proc_pid
-            
+
+            async_backup(f"deployment_{deployment_db_id}")
             return True
         else:
             # Read the TAIL of the log — that's where the error actually is
@@ -2622,6 +3333,10 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
             print(f"⚠️ Referral processing error: {_re}")
     # ─────────────────────────────────────────────────────────────────
 
+    if is_new:
+        async_backup(f"new_user_{user_id}")
+    # ─────────────────────────────────────────────────────────────────
+
     update_system_stats()
     get_or_create_referral_code(user_id)   # eagerly create code so it's ready
 
@@ -2906,6 +3621,7 @@ def get_main_menu(user_id):
         "inline_keyboard": [
             [{"text": f"{verified_badge} Join Channel",         "callback_data": "check_verification"}],
             [{"text": "📤 Deploy New Bot",                       "callback_data": "deploy_new"}],
+            [{"text": "🐙 Deploy from GitHub",                   "callback_data": "github_deploy"}],
             [{"text": f"{premium_badge} Free Deployment (24h)", "callback_data": "free_deployment"}],
             [{"text": "📦 My Deployments",                      "callback_data": "my_deployments"}],
             [{"text": f"💰 {balances['coins']}🪙 | {balances['stars']}⭐", "callback_data": "my_balance"}],
@@ -3316,6 +4032,7 @@ def confirm_add_coins(admin_id, chat_id, message_id):
     update_user_coins(int(target_user_id), amount, "admin_add", f"by_admin_{admin_id}")
     
     new_balance = get_user_balances(int(target_user_id))['coins']
+    async_backup(f"admin_coins_{target_user_id}")
     
     set_user_step(admin_id, None, temp_target_user=None, temp_coins_amount=None)
     
@@ -3332,6 +4049,95 @@ def confirm_add_coins(admin_id, chat_id, message_id):
         f"Your new balance: `{new_balance}🪙`\n\n"
         f"Use your coins to purchase premium subscription!",
         {"inline_keyboard": [[{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]]})
+
+# ==================== GITHUB DEPLOY HELPERS ====================
+
+def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
+    """
+    After we have owner/repo/branch (and optionally token):
+    fetch repo info, resolve branch, ask for env vars.
+    """
+    owner  = step.get('temp_github_owner', '')
+    repo   = step.get('temp_github_repo', '')
+    branch = step.get('temp_github_branch', '') or None
+
+    if not owner or not repo:
+        send_message(chat_id, "❌ Missing repo info. Start again.",
+                     {"inline_keyboard": [[{"text": "🐙 GitHub Deploy", "callback_data": "github_deploy"}]]})
+        return
+
+    # Resolve branch
+    if not branch:
+        send_message(chat_id, f"🔄 Fetching repo info for `{owner}/{repo}`...")
+        info = get_repo_info(owner, repo, token)
+        branch = info.get('default_branch', 'main')
+
+    description = ""
+    try:
+        info = get_repo_info(owner, repo, token)
+        description = info.get('description', '') or ''
+        lang = info.get('language', '') or ''
+        stars = info.get('stargazers_count', 0)
+        description = f"_{description[:80]}_\n" if description else ''
+    except Exception:
+        lang = ''; stars = 0
+
+    # Save state and move to env vars step
+    set_user_step(user_id, 'awaiting_env_vars',
+                  temp_github_owner=owner,
+                  temp_github_repo=repo,
+                  temp_github_branch=branch,
+                  temp_github_token=token or '',
+                  temp_plan='free',
+                  temp_duration=str(FREE_DEPLOYMENT_DURATION_HOURS),
+                  temp_source='github')
+
+    msg = (
+        f"**🐙 REPO CONFIRMED**\n\n"
+        f"Repo:   `{owner}/{repo}`\n"
+        f"Branch: `{branch}`\n"
+        + (f"Lang:   `{lang}` | ⭐ {stars}\n" if lang else "")
+        + (description)
+        + f"\n✅ Now send environment variables (one per line):\n"
+        f"`BOT_TOKEN=xxxx`\n`OTHER_VAR=value`\n\n"
+        f"Or send a dot `.` to skip:"
+    )
+    kb = {"inline_keyboard": [[{"text": "⏭️ Skip (no env vars)", "callback_data": "github_skip_env"}],
+                               [{"text": "❌ Cancel", "callback_data": "main_menu"}]]}
+    if message_id:
+        edit_message(chat_id, message_id, msg, kb)
+    else:
+        send_message(chat_id, msg, kb)
+
+
+def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
+    """Final step: kick off the actual GitHub deployment."""
+    owner    = step.get('temp_github_owner', '')
+    repo     = step.get('temp_github_repo', '')
+    branch   = step.get('temp_github_branch', 'main')
+    token    = step.get('temp_github_token') or None
+    env_raw  = step.get('temp_env_vars', '')
+
+    env_vars_dict = {}
+    if env_raw and env_raw.strip() != '.':
+        for line in env_raw.strip().splitlines():
+            if '=' in line:
+                k, _, v = line.partition('=')
+                k = k.strip(); v = v.strip()
+                if k:
+                    env_vars_dict[k] = v
+    if token:
+        env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token   # stored in .env for reference
+
+    set_user_step(user_id, None)
+    deploy_from_github(
+        chat_id, user_id,
+        owner, repo, branch, token,
+        env_vars_dict,
+        plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
+        cost_coins=0, cost_stars=0, payment_method='free',
+        is_free=True, main_file_name=main_file_name)
+
 
 # ==================== CALLBACK HANDLER ====================
 def handle_callback(callback):
@@ -3792,9 +4598,55 @@ def handle_callback(callback):
         handle_balance(chat_id, user_id, message_id)
         return
     
-    # ========== REDEEM CODE ==========
-    if data == "redeem_code":
-        handle_redeem(chat_id, user_id, message_id)
+    # ========== GITHUB DEPLOY ==========
+    if data == "github_deploy":
+        if not is_user_verified(user_id):
+            send_verification_required(chat_id, user_id, "User", message_id)
+            return
+        set_user_step(user_id, 'awaiting_github_url')
+        edit_message(chat_id, message_id,
+            "**🐙 DEPLOY FROM GITHUB**\n\n"
+            "Send me the GitHub repository URL or shorthand:\n\n"
+            "**Examples:**\n"
+            "`https://github.com/owner/repo`\n"
+            "`github.com/owner/repo`\n"
+            "`owner/repo`\n"
+            "`owner/repo@branch` ← specific branch\n\n"
+            "Supports **public and private** repos.\n"
+            "For private repos you'll be asked for a token next.",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+
+    if data == "github_public":
+        step = get_user_step(user_id)
+        _start_github_deploy(chat_id, user_id, message_id, step, token=None)
+        return
+
+    if data == "github_skip_env":
+        step = get_user_step(user_id)
+        step['temp_env_vars'] = '.'
+        _launch_github_deploy(chat_id, user_id, step)
+        return
+
+    if data == "github_private":
+        set_user_step(user_id, 'awaiting_github_token',
+                      temp_github_owner=get_user_step(user_id).get('temp_github_owner'),
+                      temp_github_repo=get_user_step(user_id).get('temp_github_repo'),
+                      temp_github_branch=get_user_step(user_id).get('temp_github_branch'))
+        edit_message(chat_id, message_id,
+            "**🔑 PRIVATE REPO — GitHub Token**\n\n"
+            "Send your **GitHub Personal Access Token** (PAT).\n\n"
+            "The token needs the `repo` scope.\n"
+            "Create one at: `github.com/settings/tokens`\n\n"
+            "⚠️ Your token is only stored in `.env` inside the deployment folder and is never logged.",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+        return
+
+    if data.startswith("github_main_"):
+        # Admin selected main file from multi-file picker
+        step = get_user_step(user_id)
+        file_name = data[len("github_main_"):]
+        _launch_github_deploy(chat_id, user_id, step, main_file_name=file_name)
         return
 
     # ========== REFERRAL ==========
@@ -3961,6 +4813,48 @@ def handle_message(message):
     if 'text' in message:
         text = message['text']
 
+        # ── GitHub deploy: env vars (from _start_github_deploy) ──────
+        if user_step.get('step') == 'awaiting_env_vars' and user_step.get('temp_source') == 'github':
+            user_step['temp_env_vars'] = text.strip()
+            _launch_github_deploy(chat_id, user_id, user_step)
+            return
+
+        # ── GitHub deploy: URL ───────────────────────────────────────
+        if user_step.get('step') == 'awaiting_github_url':
+            owner, repo, branch = parse_github_url(text.strip())
+            if not owner or not repo:
+                send_message(chat_id,
+                    "❌ Couldn't parse that URL. Try `owner/repo` or full GitHub URL:",
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                return
+            set_user_step(user_id, 'awaiting_github_visibility',
+                          temp_github_owner=owner,
+                          temp_github_repo=repo,
+                          temp_github_branch=branch or '')
+            send_message(chat_id,
+                f"**🐙 Repo detected:** `{owner}/{repo}`"
+                + (f"\n**Branch:** `{branch}`" if branch else ""),
+                {"inline_keyboard": [
+                    [{"text": "🌐 Public repo",  "callback_data": "github_public"}],
+                    [{"text": "🔒 Private repo", "callback_data": "github_private"}],
+                    [{"text": "❌ Cancel",        "callback_data": "main_menu"}],
+                ]})
+            return
+
+        # ── GitHub deploy: PAT for private repo ──────────────────────
+        if user_step.get('step') == 'awaiting_github_token':
+            token_val = text.strip()
+            if not token_val.startswith('gh'):
+                send_message(chat_id,
+                    "⚠️ That doesn't look like a GitHub token (should start with `ghp_` or `github_pat_`).\n"
+                    "Send it again or cancel:",
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+                return
+            step = get_user_step(user_id)
+            step['temp_github_token'] = token_val
+            _start_github_deploy(chat_id, user_id, None, step, token=token_val)
+            return
+
         # ── Bug report submission ────────────────────────────────────
         if user_step.get('step') == 'awaiting_bug_report':
             if text.strip():
@@ -3998,7 +4892,11 @@ def handle_message(message):
             return
         
         if user_step.get('waiting_for_env') == 1 and text and not text.startswith('/'):
-            env_vars = user_step.get('env_vars', {}).copy()
+            # ── GitHub deploy env vars path ───────────────────────────
+            if user_step.get('temp_source') == 'github':
+                user_step['temp_env_vars'] = text.strip()
+                _launch_github_deploy(chat_id, user_id, user_step)
+                return
             added = 0
             
             lines = text.strip().split('\n')
@@ -4188,6 +5086,7 @@ def handle_successful_payment(message):
             
             deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements, env_vars, 
                             plan, duration, cost_coins, cost_stars, payment_method)
+            async_backup(f"stars_payment_{user_id}")
             
             c.execute('UPDATE pending_deployments SET status = "completed" WHERE payload = ?', (invoice_payload,))
         conn.commit()
@@ -4335,6 +5234,12 @@ def start_health_server():
 def main():
     global LAST_UPDATE_ID
     
+    # ── Restore database from GitHub BEFORE init_db() ──────────────
+    # This must happen first so we never overwrite existing data with
+    # a fresh empty schema.
+    github_restore_db()
+    # ───────────────────────────────────────────────────────────────
+    
     init_db()
     
     # Start health check server for cloud platforms
@@ -4342,8 +5247,9 @@ def main():
         start_health_server()
     
     # Start background monitors
-    threading.Thread(target=deployment_expiry_monitor, daemon=True, name="ExpiryMonitor").start()
-    threading.Thread(target=process_health_monitor, daemon=True, name="HealthMonitor").start()
+    threading.Thread(target=deployment_expiry_monitor,  daemon=True, name="ExpiryMonitor").start()
+    threading.Thread(target=process_health_monitor,     daemon=True, name="HealthMonitor").start()
+    threading.Thread(target=_periodic_backup_thread,    daemon=True, name="PeriodicBackup").start()
     
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
