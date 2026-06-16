@@ -83,7 +83,7 @@ FREE_DEPLOYMENT_DURATION_HOURS = int(os.environ.get("FREE_DEPLOYMENT_DURATION_HO
 STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 
 # Referral reward
-REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 50))
+REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 5))
 
 # ── GitHub Backup ─────────────────────────────────────────────────────────────
 GITHUB_TOKEN        = os.environ.get("GITHUB_TOKEN", "")
@@ -750,32 +750,252 @@ def can_use_free_deployment(user_id):
     else:
         return False, f"Free tier limit reached ({used_count}/{FREE_USER_MAX_DEPLOYMENTS})"
 
+def stop_free_deployments_for_user(user_id):
+    """
+    Stop all active/paused free-tier (is_free=1) deployments for a user.
+    Called when premium is activated to eliminate duplicates.
+    Returns the count of bots stopped.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT deployment_id, proc_pid FROM deployments
+                 WHERE user_id = ? AND is_free = 1 AND status IN ('active','paused')""",
+              (user_id,))
+    rows = c.fetchall()
+    stopped = 0
+    for dep_id, proc_pid in rows:
+        if proc_pid:
+            try:
+                os.kill(proc_pid, signal.SIGTERM)
+            except Exception:
+                pass
+        c.execute("""UPDATE deployments SET status='stopped', proc_pid=NULL, is_paused=0
+                     WHERE deployment_id=?""", (dep_id,))
+        with deployment_lock:
+            active_deployments.pop(dep_id, None)
+        stopped += 1
+    conn.commit()
+    conn.close()
+    return stopped
+
+
+def resume_premium_deployment(user_id, duration_days):
+    """
+    Find the most recent stopped/paused premium deployment for this user,
+    restart it with the new expiry window, and return (dep_id, success).
+    This is called right after a new premium subscription is activated so the
+    user's bot picks up exactly where it left off — database fully intact.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT deployment_id, file_name, env_vars, folder_name, proc_pid
+                 FROM deployments
+                 WHERE user_id = ? AND is_free = 0
+                       AND status IN ('stopped','paused','failed')
+                 ORDER BY start_time DESC LIMIT 1""", (user_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return None, False
+
+    dep_id, file_name, env_vars_json, folder_name_val, old_pid = row
+
+    # Kill stale process if any
+    if old_pid:
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+    deploy_folder = get_deploy_folder(user_id, dep_id)
+    start_script  = deploy_folder / "start.sh"
+    launcher      = deploy_folder / "run.py"
+
+    if not start_script.exists() or not launcher.exists():
+        return dep_id, False
+
+    # Re-run the bot
+    result = subprocess.run([str(start_script)], cwd=str(deploy_folder),
+                            capture_output=True, text=True)
+    sleep(5)
+
+    pid_file  = deploy_folder / "pid.txt"
+    new_pid   = None
+    if pid_file.exists():
+        try:
+            new_pid = int(pid_file.read_text().strip())
+        except Exception:
+            pass
+
+    running = False
+    if new_pid:
+        try:
+            os.kill(new_pid, 0)
+            running = True
+        except Exception:
+            pass
+
+    if running:
+        new_expire = datetime.now() + timedelta(days=duration_days)
+        conn2 = sqlite3.connect(DATABASE_FILE)
+        conn2.execute("""UPDATE deployments
+                         SET status='active', proc_pid=?, is_paused=0,
+                             expire_time=?, start_time=?
+                         WHERE deployment_id=?""",
+                      (new_pid, new_expire.isoformat(), datetime.now().isoformat(), dep_id))
+        conn2.commit()
+        conn2.close()
+        with deployment_lock:
+            active_deployments[dep_id] = new_pid
+        async_backup(f"premium_resume_{dep_id}")
+        return dep_id, True
+
+    return dep_id, False
+
+
+def continue_deployment_as_free(deployment_id, user_id, chat_id):
+    """
+    Downgrade a stopped/expired premium deployment to a fresh 24-hr free slot.
+    The deploy folder and database are untouched — the bot resumes from the
+    exact state it was in when premium expired.
+    """
+    deploy_folder = get_deploy_folder(user_id, deployment_id)
+    start_script  = deploy_folder / "start.sh"
+    launcher      = deploy_folder / "run.py"
+
+    if not start_script.exists() or not launcher.exists():
+        send_message(chat_id,
+            "❌ Deployment files not found — please deploy a new bot.",
+            {"inline_keyboard": [[{"text": "🚀 Deploy New Bot", "callback_data": "deploy_new"}]]})
+        return False
+
+    # Kill stale PID first
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT proc_pid FROM deployments WHERE deployment_id=?", (deployment_id,))
+    r = c.fetchone()
+    conn.close()
+    if r and r[0]:
+        try:
+            os.kill(r[0], signal.SIGTERM)
+        except Exception:
+            pass
+
+    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+    sleep(5)
+
+    pid_file = deploy_folder / "pid.txt"
+    new_pid  = None
+    if pid_file.exists():
+        try:
+            new_pid = int(pid_file.read_text().strip())
+        except Exception:
+            pass
+
+    running = False
+    if new_pid:
+        try:
+            os.kill(new_pid, 0)
+            running = True
+        except Exception:
+            pass
+
+    if running:
+        new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+        conn2 = sqlite3.connect(DATABASE_FILE)
+        conn2.execute("""UPDATE deployments
+                         SET status='active', proc_pid=?, is_paused=0,
+                             is_free=1, expire_time=?, start_time=?
+                         WHERE deployment_id=?""",
+                      (new_pid, new_expire.isoformat(),
+                       datetime.now().isoformat(), deployment_id))
+        conn2.commit()
+        conn2.close()
+        with deployment_lock:
+            active_deployments[deployment_id] = new_pid
+
+        async_backup(f"continue_as_free_{deployment_id}")
+        send_message(chat_id,
+            f"✅ **Bot Resumed (Free 24h)**\n\n"
+            f"Deployment `#{deployment_id}` is running again.\n"
+            f"Your database and settings are intact.\n"
+            f"Expires: `{new_expire.strftime('%Y-%m-%d %H:%M')}`",
+            {"inline_keyboard": [
+                [{"text": "📄 View Logs",       "callback_data": f"view_runtime_logs_{deployment_id}"}],
+                [{"text": "⭐ Get Premium",      "callback_data": "subscribe_premium"}],
+                [{"text": "🏠 Menu",            "callback_data": "main_menu"}],
+            ]})
+        return True
+    else:
+        log_tail = ""
+        lf = deploy_folder / "output.log"
+        if lf.exists():
+            log_tail = lf.read_text(errors='replace')[-800:].strip()
+        send_message(chat_id,
+            f"❌ **Failed to resume bot**\n\n"
+            f"```\n{log_tail[-500:]}\n```\n\n"
+            "The process exited immediately. Check your env vars.",
+            {"inline_keyboard": [
+                [{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}],
+                [{"text": "🚀 Deploy New Bot", "callback_data": "deploy_new"}],
+            ]})
+        return False
+
+
+def count_github_deployments(user_id):
+    """Count active/paused GitHub-sourced deployments for a user."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT COUNT(*) FROM deployments
+                 WHERE user_id=? AND source_type='github'
+                 AND status IN ('active','paused')""", (user_id,))
+    n = c.fetchone()[0]
+    conn.close()
+    return n
+
+
 def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
     try:
         end_date = datetime.now() + timedelta(days=duration_days)
-        
+
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
-        
-        c.execute('''UPDATE users SET is_premium = 1, premium_expires = ?, premium_plan = ? WHERE user_id = ?''',
+        c.execute("UPDATE users SET is_premium=1, premium_expires=?, premium_plan=? WHERE user_id=?",
                   (end_date.isoformat(), plan, user_id))
-        
-        c.execute('''INSERT INTO subscriptions (user_id, plan, amount_stars, amount_coins, start_date, end_date, status)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                  (user_id, plan, amount_stars, amount_coins, datetime.now().isoformat(), end_date.isoformat(), 'active'))
-        
+        c.execute("""INSERT INTO subscriptions
+                     (user_id, plan, amount_stars, amount_coins, start_date, end_date, status)
+                     VALUES (?,?,?,?,?,?,?)""",
+                  (user_id, plan, amount_stars, amount_coins,
+                   datetime.now().isoformat(), end_date.isoformat(), 'active'))
         conn.commit()
-        
-        resumed_count = resume_paused_deployments(user_id)
-        
         conn.close()
+
+        # 1. Stop all free-tier bots (no duplicates while premium runs)
+        stopped_free = stop_free_deployments_for_user(user_id)
+
+        # 2. Resume the most recent stopped/paused premium deployment
+        resumed_dep_id, premium_resumed = resume_premium_deployment(user_id, duration_days)
+
+        # 3. If no prior premium deployment exists, fall back to resuming paused ones
+        paused_resumed = 0
+        if not premium_resumed:
+            paused_resumed = resume_paused_deployments(user_id)
+
         update_system_stats()
-        
-        user_info = get_user_info(user_id)
-        admin_msg = f"🎉 NEW PREMIUM!\nUser: {user_info.get('first_name', 'Unknown')} ({user_id})\nPlan: {plan.upper()}\nAmount: {amount_stars}⭐\nResumed: {resumed_count}"
-        notify_admin(admin_msg)
+
+        user_info   = get_user_info(user_id)
+        notify_admin(
+            f"🎉 NEW PREMIUM!\n"
+            f"User: {user_info.get('first_name','?')} ({user_id})\n"
+            f"Plan: {plan.upper()} | Amount: {amount_stars}⭐\n"
+            f"Premium dep resumed: #{resumed_dep_id} ({premium_resumed})\n"
+            f"Free bots stopped: {stopped_free}")
+
         async_backup(f"premium_{plan}_{user_id}")
-        return True, resumed_count
+        total_resumed = (1 if premium_resumed else paused_resumed)
+        return True, total_resumed
+
     except Exception as e:
         print(f"❌ Activate premium error: {e}")
         return False, 0
@@ -2614,6 +2834,21 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 pass
 
     try:
+        # ── Free-tier GitHub deployment limit: 1 concurrent slot ────
+        if not is_user_premium(user_id) and not is_admin(user_id):
+            active_gh = count_github_deployments(user_id)
+            if active_gh >= 1:
+                send_message(chat_id,
+                    "⚠️ **GitHub Deployment Limit Reached**\n\n"
+                    "Free users can have **1 active GitHub deployment** at a time (24hrs).\n\n"
+                    "Stop or wait for your existing GitHub deployment to expire, "
+                    "or upgrade to Premium for unlimited deployments.",
+                    {"inline_keyboard": [
+                        [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                        [{"text": "⭐ Get Premium",     "callback_data": "subscribe_premium"}],
+                    ]})
+                return False
+
         deploy_id     = int(datetime.now().timestamp())
         deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)
         deploy_folder.mkdir(parents=True, exist_ok=True)
@@ -3159,115 +3394,142 @@ def restart_deployment(deployment_id, user_id, chat_id):
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
-        
-        c.execute("SELECT proc_pid, file_name, user_id, is_paused, env_vars, status, start_time, expire_time FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        c.execute("""SELECT proc_pid, file_name, user_id, is_paused, env_vars,
+                            status, start_time, expire_time, is_free, plan
+                     FROM deployments WHERE deployment_id=?""", (deployment_id,))
         row = c.fetchone()
-        
+
         if not row:
             send_message(chat_id, "❌ Deployment not found")
             return False
-        
-        proc_pid, file_name, owner_id, is_paused, env_vars_json, status, start_time_str, expire_time_str = row
-        
+
+        proc_pid, file_name, owner_id, is_paused, env_vars_json, \
+            status, start_time_str, expire_time_str, is_free, plan = row
+
         if owner_id != user_id and not is_admin(user_id):
             send_message(chat_id, "❌ Permission denied")
             return False
-        
-        if is_paused:
-            send_message(chat_id, "❌ This deployment is paused. Renew premium to resume.")
+
+        # Paused premium bots require premium renewal, not a simple restart
+        if is_paused and not is_free:
+            send_message(chat_id,
+                "⏸️ This premium deployment is paused.\n\n"
+                "Purchase or renew premium to resume it — your database stays intact.",
+                {"inline_keyboard": [[{"text": "⭐ Renew Premium", "callback_data": "subscribe_premium"}]]})
             return False
-        
+
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
-        dest_script = deploy_folder / file_name
-        
+        dest_script   = deploy_folder / file_name
+
         if not deploy_folder.exists():
-            send_message(chat_id, f"❌ Deployment folder missing!")
+            send_message(chat_id, "❌ Deployment folder missing — please create a new deployment.")
             return False
-        
         if not dest_script.exists():
-            send_message(chat_id, f"❌ Bot file `{file_name}` missing!\n\nPlease delete this deployment and create a new one.")
+            send_message(chat_id,
+                f"❌ Bot file `{file_name}` missing.\n\nPlease delete this deployment and create a new one.")
             return False
-        
+
+        # Kill any stale process
         if proc_pid:
             try:
                 os.kill(proc_pid, signal.SIGTERM)
-                sleep(2)
-            except:
+                sleep(1)
+            except Exception:
                 pass
-        
+
         env_vars = json.loads(env_vars_json) if env_vars_json else {}
-        
-        # Read code content for launcher
-        with open(dest_script, 'r', encoding='utf-8') as f:
-            code_content = f.read()
-        
-        launcher_script, _ = create_enhanced_launcher_script(deploy_folder, dest_script, env_vars, code_content, lambda x: None)
-        
+
+        try:
+            code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            code_content = ""
+
+        launcher_script, _ = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+
+        # Rewrite .env and start.sh to ensure they're fresh
         env_file = deploy_folder / ".env"
-        with open(env_file, 'w') as f:
-            for k, v in env_vars.items():
-                f.write(f"{k}={v}\n")
-        
+        env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+
         start_script = deploy_folder / "start.sh"
-        with open(start_script, 'w') as f:
-            f.write(f"""#!/bin/bash
-cd "{deploy_folder}"
-export PYTHONUNBUFFERED=1
-nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &
-echo $! > pid.txt
-""")
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
         start_script.chmod(0o755)
-        
-        result = subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True, text=True)
-        
-        sleep(3)
-        
+
+        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+        sleep(4)
+
         pid_file = deploy_folder / "pid.txt"
-        new_pid = None
+        new_pid  = None
         if pid_file.exists():
-            with open(pid_file, 'r') as f:
-                try:
-                    new_pid = int(f.read().strip())
-                except:
-                    pass
-        
+            try:
+                new_pid = int(pid_file.read_text().strip())
+            except Exception:
+                pass
+
         is_running = False
         if new_pid:
             try:
                 os.kill(new_pid, 0)
                 is_running = True
-            except:
+            except Exception:
                 pass
-        
+
         if is_running:
-            c.execute("UPDATE deployments SET proc_pid = ?, status = 'active', is_paused = 0 WHERE deployment_id = ?",
-                      (new_pid, deployment_id))
+            # For stopped/expired bots: extend expiry from now
+            current_expire = datetime.fromisoformat(expire_time_str)
+            if status in ('stopped', 'failed') or current_expire < datetime.now():
+                if is_free:
+                    new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+                else:
+                    # Premium restart: keep original duration window
+                    original_hours = max(1, (current_expire - datetime.fromisoformat(start_time_str)).total_seconds() / 3600)
+                    new_expire = datetime.now() + timedelta(hours=original_hours)
+                c.execute("""UPDATE deployments
+                             SET proc_pid=?, status='active', is_paused=0, expire_time=?, start_time=?
+                             WHERE deployment_id=?""",
+                          (new_pid, new_expire.isoformat(), datetime.now().isoformat(), deployment_id))
+            else:
+                c.execute("UPDATE deployments SET proc_pid=?, status='active', is_paused=0 WHERE deployment_id=?",
+                          (new_pid, deployment_id))
+
             conn.commit()
             conn.close()
-            
             with deployment_lock:
                 active_deployments[deployment_id] = new_pid
-            
-            send_message(chat_id, f"✅ Deployment `{deployment_id}` restarted successfully!")
+
+            async_backup(f"restart_{deployment_id}")
+            send_message(chat_id,
+                f"✅ **Bot #{deployment_id} Restarted**\n\n"
+                f"Your database and settings are preserved.\n"
+                f"Bot is running from the same deployment folder.",
+                {"inline_keyboard": [
+                    [{"text": "📄 View Logs",       "callback_data": f"view_runtime_logs_{deployment_id}"}],
+                    [{"text": "📦 My Deployments",  "callback_data": "my_deployments"}],
+                ]})
             return True
         else:
-            log_file = deploy_folder / "output.log"
-            error_msg = ""
-            if log_file.exists():
-                with open(log_file, 'r') as f:
-                    error_output = f.read()[-500:]
-                    if error_output:
-                        error_msg = f"\n\n**Error output:**\n```\n{error_output}\n```"
-            
-            c.execute("UPDATE deployments SET status = 'failed' WHERE deployment_id = ?", (deployment_id,))
+            log_tail = ""
+            lf = deploy_folder / "output.log"
+            if lf.exists():
+                log_tail = lf.read_text(errors='replace')[-600:].strip()
+            c.execute("UPDATE deployments SET status='failed' WHERE deployment_id=?", (deployment_id,))
             conn.commit()
             conn.close()
-            
-            send_message(chat_id, f"❌ Failed to restart deployment `{deployment_id}`{error_msg}")
+            send_message(chat_id,
+                f"❌ **Bot #{deployment_id} failed to start**\n\n"
+                f"```\n{log_tail[-400:]}\n```\n\n"
+                "Check your env vars and try again.",
+                {"inline_keyboard": [
+                    [{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}],
+                    [{"text": "🔄 Retry",     "callback_data": f"restart_deploy_{deployment_id}"}],
+                ]})
             return False
-        
+
     except Exception as e:
-        send_message(chat_id, f"❌ Error restarting: {str(e)}")
+        print(f"❌ restart_deployment error: {e}")
+        send_message(chat_id, f"❌ Error restarting: {e}")
         return False
 
 def stop_deployment(deployment_id):
@@ -3424,11 +3686,31 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         reqs_text = reqs_text[:200] + "..."
     
     keyboard = {"inline_keyboard": []}
+
     if status == "active":
-        keyboard["inline_keyboard"].append([{"text": "🛑 Stop Bot", "callback_data": f"stop_deploy_{dep_id}"}])
-        keyboard["inline_keyboard"].append([{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}])
+        keyboard["inline_keyboard"].append(
+            [{"text": "🛑 Stop Bot",    "callback_data": f"stop_deploy_{dep_id}"},
+             {"text": "🔄 Restart",     "callback_data": f"restart_deploy_{dep_id}"}])
+
     elif status == "paused":
-        keyboard["inline_keyboard"].append([{"text": "💰 Renew Premium to Resume", "callback_data": "subscribe_premium"}])
+        if is_free:
+            keyboard["inline_keyboard"].append(
+                [{"text": "🔄 Restart (Free 24h)", "callback_data": f"restart_deploy_{dep_id}"}])
+        else:
+            keyboard["inline_keyboard"].append(
+                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"},
+                 {"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
+
+    elif status in ("stopped", "failed"):
+        if is_free:
+            keyboard["inline_keyboard"].append(
+                [{"text": "🔄 Restart Bot (Free 24h)", "callback_data": f"restart_deploy_{dep_id}"}])
+        else:
+            # Premium deployment stopped — offer both paths
+            keyboard["inline_keyboard"].append(
+                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"}])
+            keyboard["inline_keyboard"].append(
+                [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
     
     keyboard["inline_keyboard"].append([{"text": "📋 View Install Logs", "callback_data": f"view_install_logs_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "📄 View Runtime Logs", "callback_data": f"view_runtime_logs_{dep_id}"}])
@@ -4884,7 +5166,19 @@ def handle_callback(callback):
                      {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
         return
 
-    if data.startswith("bug_reply_"):
+    if data.startswith("continue_as_free_"):
+        dep_id = int(data.split("_")[3])
+        # Verify ownership
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM deployments WHERE deployment_id=?", (dep_id,))
+        row = c.fetchone()
+        conn.close()
+        if row and (row[0] == user_id or is_admin(user_id)):
+            continue_deployment_as_free(dep_id, row[0], chat_id)
+        else:
+            send_message(chat_id, "❌ Permission denied")
+        return
         if is_admin(user_id):
             report_id = int(data.split("_")[2])
             set_user_step(user_id, f'awaiting_bug_reply_{report_id}')
@@ -4923,14 +5217,14 @@ def set_user_step(user_id, step, **kwargs):
     """
     Persist workflow state for a user.
     Known high-frequency fields are stored in dedicated columns for query speed.
-    ALL kwargs (including ad-hoc ones like temp_github_owner) are also stored
-    in pending_json so nothing is ever silently discarded.
+    ALL kwargs are also stored in pending_json so nothing is ever silently discarded.
+    When step=None (clear state) pending_json is fully reset to prevent
+    stale state (e.g. temp_source='github') from leaking into future flows.
     """
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
 
-    # ── Dedicated columns (fast lookups) ─────────────────────────────
     _KNOWN = {'temp_file', 'requirements', 'env_vars', 'plan', 'payment_method',
               'duration', 'cost_coins', 'cost_stars', 'waiting_for_env',
               'waiting_for_reqs', 'waiting_for_redeem', 'temp_target_user',
@@ -4947,19 +5241,22 @@ def set_user_step(user_id, step, **kwargs):
                 val = json.dumps(val)
             values.append(val)
 
-    # ── pending_json: stores ALL kwargs (superset, survives schema changes) ──
-    # Read existing pending_json first so we only overwrite keys provided
-    c.execute("SELECT pending_json FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    try:
-        existing = json.loads(row[0] or '{}') if row else {}
-    except Exception:
-        existing = {}
+    # When clearing state, wipe pending_json entirely so no stale keys remain
+    if step is None:
+        pending = json.dumps({})
+    else:
+        c.execute("SELECT pending_json FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        try:
+            existing = json.loads(row[0] or '{}') if row else {}
+        except Exception:
+            existing = {}
+        existing.update(kwargs)
+        existing['_step'] = step
+        pending = json.dumps(existing)
 
-    existing.update(kwargs)       # overlay new values
-    existing['_step'] = step      # keep step in JSON too for one-stop reads
     updates.append("pending_json = ?")
-    values.append(json.dumps(existing))
+    values.append(pending)
 
     values.append(user_id)
     c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
@@ -5361,7 +5658,6 @@ def deployment_expiry_monitor():
             expired = c.fetchall()
 
             for dep_id, uid, proc_pid, is_free, plan, folder_name_val in expired:
-                # Kill the process if it's still running
                 if proc_pid:
                     try:
                         os.kill(proc_pid, signal.SIGTERM)
@@ -5369,26 +5665,39 @@ def deployment_expiry_monitor():
                         pass
 
                 c.execute("""UPDATE deployments
-                             SET status = 'stopped', proc_pid = NULL, is_paused = 0
-                             WHERE deployment_id = ?""", (dep_id,))
-
+                             SET status='stopped', proc_pid=NULL, is_paused=0
+                             WHERE deployment_id=?""", (dep_id,))
                 with deployment_lock:
                     active_deployments.pop(dep_id, None)
 
                 print(f"⏰ Expired deployment {dep_id} (user {uid}) stopped")
 
-                # Notify user
+                # Notify user with relevant action buttons
                 try:
-                    plan_label = "Free" if is_free else plan.capitalize()
-                    send_message(uid,
-                        f"⏰ **Deployment #{dep_id} Expired**\n\n"
-                        f"Plan: `{plan_label}`\n"
-                        f"Your bot has been stopped automatically.\n\n"
-                        f"Deploy a new bot or renew your subscription!",
-                        {"inline_keyboard": [
-                            [{"text": "🚀 Deploy New Bot", "callback_data": "deploy_new"}],
-                            [{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]
-                        ]})
+                    if is_free:
+                        # Free bot expired: offer restart for another 24h
+                        send_message(uid,
+                            f"⏰ **Free Bot #{dep_id} Expired**\n\n"
+                            f"Your 24-hour deployment has ended.\n"
+                            f"Restart for another 24h — your database is intact.",
+                            {"inline_keyboard": [
+                                [{"text": "🔄 Restart (Free 24h)",  "callback_data": f"restart_deploy_{dep_id}"}],
+                                [{"text": "⭐ Get Premium",          "callback_data": "subscribe_premium"}],
+                                [{"text": "📦 My Deployments",       "callback_data": "my_deployments"}],
+                            ]})
+                    else:
+                        # Premium bot expired: reactivate or continue free
+                        send_message(uid,
+                            f"⏰ **Premium Bot #{dep_id} Expired**\n\n"
+                            f"Your `{plan.upper()}` plan has ended.\n\n"
+                            f"**Options:**\n"
+                            f"• ⭐ Reactivate Premium — bot resumes immediately with full history\n"
+                            f"• 🆓 Continue as Free — bot runs 24h more, database preserved",
+                            {"inline_keyboard": [
+                                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"}],
+                                [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}],
+                                [{"text": "📦 My Deployments",       "callback_data": "my_deployments"}],
+                            ]})
                 except Exception:
                     pass
 
@@ -5428,11 +5737,27 @@ def process_health_monitor():
 
                 if not alive:
                     c.execute("""UPDATE deployments
-                                 SET status = 'stopped', proc_pid = NULL
-                                 WHERE deployment_id = ?""", (dep_id,))
+                                 SET status='stopped', proc_pid=NULL
+                                 WHERE deployment_id=?""", (dep_id,))
                     with deployment_lock:
                         active_deployments.pop(dep_id, None)
-                    print(f"💀 Dead process detected for deployment {dep_id} (user {uid}) — marked stopped")
+                    print(f"💀 Dead process for deployment {dep_id} (user {uid}) — marked stopped")
+
+                    # Notify user
+                    try:
+                        c.execute("SELECT is_free FROM deployments WHERE deployment_id=?", (dep_id,))
+                        r2 = c.fetchone()
+                        is_free = r2[0] if r2 else 1
+                        send_message(uid,
+                            f"⚠️ **Bot #{dep_id} Crashed**\n\n"
+                            f"Your bot process stopped unexpectedly.\n"
+                            f"Your database is safe — click Restart to bring it back.",
+                            {"inline_keyboard": [
+                                [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
+                                [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}],
+                            ]})
+                    except Exception:
+                        pass
 
             conn.commit()
             conn.close()
