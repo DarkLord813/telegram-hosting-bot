@@ -175,7 +175,8 @@ def init_db():
         last_expiry_notification TEXT,
         referral_code TEXT UNIQUE,
         referred_by INTEGER DEFAULT NULL,
-        total_referrals INTEGER DEFAULT 0
+        total_referrals INTEGER DEFAULT 0,
+        pending_json TEXT DEFAULT '{}'
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
@@ -347,6 +348,7 @@ def init_db():
         ("referral_code",  "TEXT"),
         ("referred_by",    "INTEGER"),
         ("total_referrals","INTEGER DEFAULT 0"),
+        ("pending_json",   "TEXT DEFAULT '{}'"),
     ]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}" if _col == "folder_name"
@@ -1796,25 +1798,135 @@ def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
     return installed
 
 # ========== FRAMEWORK DETECTION ==========
+# ── Platform detection patterns ──────────────────────────────────────────────
+_PLATFORM_PATTERNS = {
+    # Telegram
+    'telegram_telebot':  ['import telebot', 'from telebot', 'TeleBot('],
+    'telegram_aiogram':  ['import aiogram', 'from aiogram', 'Dispatcher(', 'Router()'],
+    'telegram_ptb':      ['from telegram', 'from telegram.ext', 'Application.builder', 'ApplicationBuilder'],
+    'telegram_pyrogram': ['import pyrogram', 'from pyrogram', 'Client('],
+    'telegram_telethon': ['import telethon', 'from telethon', 'TelegramClient('],
+    # WhatsApp
+    'whatsapp_pywa':     ['import pywa', 'from pywa', 'WhatsApp('],
+    'whatsapp_heyoo':    ['import heyoo', 'from heyoo', 'WhatsApp('],
+    'whatsapp_twilio':   ['from twilio', 'import twilio', 'MessagingResponse('],
+    'whatsapp_cloud':    ['WHATSAPP_TOKEN', 'PHONE_NUMBER_ID', 'graph.facebook.com', 'whatsapp/messages'],
+    # Discord
+    'discord_py':        ['import discord', 'from discord', 'discord.Client(', 'commands.Bot('],
+    'discord_nextcord':  ['import nextcord', 'from nextcord'],
+    'discord_disnake':   ['import disnake', 'from disnake'],
+    'discord_pycord':    ['import py_cord', 'from py_cord'],
+    # Slack
+    'slack':             ['from slack_sdk', 'import slack_sdk', 'from slack_bolt', 'import slack_bolt', 'WebClient('],
+    # Twitter / X
+    'twitter':           ['import tweepy', 'from tweepy', 'tweepy.Client', 'tweepy.API'],
+    # Line
+    'line':              ['from linebot', 'import linebot', 'LineBotApi(', 'WebhookHandler('],
+    # Viber
+    'viber':             ['from viberbot', 'import viberbot', 'ViberApi('],
+    # Matrix
+    'matrix':            ['from nio import', 'import nio', 'matrix_client', 'AsyncClient('],
+    # IRC
+    'irc':               ['import irc', 'from irc.bot', 'SingleServerIRCBot('],
+    # Web frameworks (keep last — bot frameworks above take priority)
+    'flask':             ['from flask import', 'import flask', 'Flask(__name__)'],
+    'fastapi':           ['from fastapi', 'import fastapi', 'FastAPI()'],
+    'django':            ['import django', 'from django', 'DJANGO_SETTINGS'],
+    'aiohttp':           ['import aiohttp', 'from aiohttp'],
+    'starlette':         ['from starlette', 'import starlette'],
+}
+
+# Human-readable labels for display
+_PLATFORM_LABELS = {
+    'telegram_telebot':  '📱 Telegram (pyTelegramBotAPI)',
+    'telegram_aiogram':  '📱 Telegram (aiogram)',
+    'telegram_ptb':      '📱 Telegram (python-telegram-bot)',
+    'telegram_pyrogram': '📱 Telegram (Pyrogram)',
+    'telegram_telethon': '📱 Telegram (Telethon)',
+    'whatsapp_pywa':     '💬 WhatsApp (PyWA)',
+    'whatsapp_heyoo':    '💬 WhatsApp (heyoo)',
+    'whatsapp_twilio':   '💬 WhatsApp (Twilio)',
+    'whatsapp_cloud':    '💬 WhatsApp (Cloud API)',
+    'discord_py':        '🎮 Discord (discord.py)',
+    'discord_nextcord':  '🎮 Discord (nextcord)',
+    'discord_disnake':   '🎮 Discord (disnake)',
+    'discord_pycord':    '🎮 Discord (py-cord)',
+    'slack':             '💼 Slack',
+    'twitter':           '🐦 Twitter/X (Tweepy)',
+    'line':              '💚 Line',
+    'viber':             '💜 Viber',
+    'matrix':            '🔷 Matrix',
+    'irc':               '📡 IRC',
+    'flask':             '🌐 Flask',
+    'fastapi':           '🌐 FastAPI',
+    'django':            '🌐 Django',
+    'aiohttp':           '🌐 aiohttp',
+    'starlette':         '🌐 Starlette',
+}
+
+# Required env vars hints per platform
+PLATFORM_ENV_HINTS = {
+    'telegram_telebot':  '`BOT_TOKEN` — your Telegram bot token from @BotFather',
+    'telegram_aiogram':  '`BOT_TOKEN` — your Telegram bot token from @BotFather',
+    'telegram_ptb':      '`BOT_TOKEN` — your Telegram bot token from @BotFather',
+    'telegram_pyrogram': '`API_ID`, `API_HASH`, `BOT_TOKEN` — from my.telegram.org + @BotFather',
+    'telegram_telethon': '`API_ID`, `API_HASH` — from my.telegram.org',
+    'whatsapp_pywa':     '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID` — from Meta Developer Portal',
+    'whatsapp_heyoo':    '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID` — from Meta Developer Portal',
+    'whatsapp_twilio':   '`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER` — from Twilio Console',
+    'whatsapp_cloud':    '`WHATSAPP_TOKEN`, `PHONE_NUMBER_ID`, `VERIFY_TOKEN` — from Meta Developer Portal',
+    'discord_py':        '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
+    'discord_nextcord':  '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
+    'discord_disnake':   '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
+    'discord_pycord':    '`DISCORD_TOKEN` — from Discord Developer Portal → Bot → Token',
+    'slack':             '`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — from api.slack.com',
+    'twitter':           '`TWITTER_API_KEY`, `TWITTER_API_SECRET`, `TWITTER_BEARER_TOKEN` — from developer.twitter.com',
+    'line':              '`LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET` — from Line Developer Console',
+    'viber':             '`VIBER_AUTH_TOKEN` — from Viber Admin Panel',
+    'matrix':            '`MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` — from your Matrix server',
+    'irc':               '`IRC_SERVER`, `IRC_PORT`, `IRC_NICK`, `IRC_CHANNEL`',
+    'flask':             '`PORT` (optional, default 5000)',
+    'fastapi':           '`PORT` (optional, default 8000)',
+    'django':            '`SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`',
+}
+
 def detect_bot_framework(code_content: str) -> list:
-    frameworks = []
-    
-    if 'telegram' in code_content.lower() or 'telegram.ext' in code_content:
-        frameworks.append('telegram')
-    if 'discord' in code_content.lower():
-        frameworks.append('discord')
-    if 'flask' in code_content.lower():
-        frameworks.append('flask')
-    if 'fastapi' in code_content.lower():
-        frameworks.append('fastapi')
-    if 'django' in code_content.lower():
-        frameworks.append('django')
-    if 'aiohttp' in code_content.lower():
-        frameworks.append('aiohttp')
-    if 'aiogram' in code_content.lower():
-        frameworks.append('aiogram')
-    
-    return frameworks if frameworks else ['generic']
+    """Detect all bot frameworks/platforms used in the code."""
+    detected = []
+    code_lower = code_content.lower()
+
+    for platform, patterns in _PLATFORM_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.lower() in code_lower:
+                detected.append(platform)
+                break   # one match per platform is enough
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for p in detected:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+
+    return result if result else ['generic']
+
+
+def get_platform_env_hint(frameworks: list) -> str:
+    """Return env var hints for the detected platforms."""
+    hints = []
+    for fw in frameworks:
+        hint = PLATFORM_ENV_HINTS.get(fw)
+        if hint and hint not in hints:
+            label = _PLATFORM_LABELS.get(fw, fw)
+            hints.append(f"**{label}:**\n{hint}")
+    return '\n\n'.join(hints) if hints else ''
+
+
+def get_platform_label(frameworks: list) -> str:
+    """Return a human-readable platform summary."""
+    labels = [_PLATFORM_LABELS.get(fw, fw) for fw in frameworks if fw != 'generic']
+    return ', '.join(labels) if labels else '🤖 Generic Python Bot'
 
 # ========== ENHANCED LAUNCHER SCRIPT ==========
 def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs, packages_dir=None):
@@ -2054,67 +2166,114 @@ try:
     # ----------------------------------------------------------------
     def _make_runner(name, obj):
         _cls     = type(obj).__name__.lower()
-        _cls_mod = getattr(type(obj), '__module__', '') or ''
+        _cls_mod = (getattr(type(obj), '__module__', '') or '').lower()
 
-        # ── pyTelegramBotAPI (telebot.TeleBot) ───────────────────────
-        # Must come BEFORE the generic .run() check because TeleBot
-        # also has a .run_webhooks() but the canonical method is polling().
+        # ── pyTelegramBotAPI (telebot) ────────────────────────────────
         if callable(getattr(obj, 'polling', None)) and callable(getattr(obj, 'stop_polling', None)):
-            print(f"  🤖 {{name}} → pyTelegramBotAPI TeleBot (.polling)")
+            print(f"  📱 {{name}} → Telegram (pyTelegramBotAPI) → polling")
             def _run_telebot(_b=obj, _n=name):
                 _clear_webhook(_b, _n)
                 _b.polling(non_stop=True, timeout=60, long_polling_timeout=60)
             return _run_telebot
 
-        # ── aiogram Application ──────────────────────────────────────
+        # ── aiogram Application ───────────────────────────────────────
         if hasattr(obj, 'run_polling') and hasattr(obj, 'run_webhook'):
-            print(f"  🤖 {{name}} → aiogram Application (run_polling)")
+            print(f"  📱 {{name}} → Telegram (aiogram) → run_polling")
             def _run_aiogram(_a=obj, _n=name):
                 _clear_webhook(_a, _n)
                 _a.run_polling()
             return _run_aiogram
 
-        # ── python-telegram-bot Application ─────────────────────────
+        # ── python-telegram-bot Application ──────────────────────────
         if hasattr(obj, 'run_polling') and hasattr(obj, 'initialize'):
-            print(f"  🤖 {{name}} → PTB Application (run_polling)")
+            print(f"  📱 {{name}} → Telegram (PTB) → run_polling")
             def _run_ptb(_a=obj, _n=name):
                 _clear_webhook(_a, _n)
                 _a.run_polling()
             return _run_ptb
 
-        # ── Generic run_polling ──────────────────────────────────────
+        # ── Generic run_polling ───────────────────────────────────────
         if callable(getattr(obj, 'run_polling', None)):
-            print(f"  🤖 {{name}} → has run_polling()")
-            def _run_generic(_a=obj, _n=name):
+            print(f"  📱 {{name}} → has run_polling()")
+            def _run_genpoll(_a=obj, _n=name):
                 _clear_webhook(_a, _n)
                 _a.run_polling()
-            return _run_generic
+            return _run_genpoll
 
-        # ── Flask / Quart ────────────────────────────────────────────
-        # IMPORTANT: never bind to PORT (=10000 on Render) — that port
-        # belongs to the hosting bot itself.  Also, if a Telegram bot
-        # exists in the same module, Flask is just the keep-alive server
-        # and should run in a daemon thread, not as the main loop.
+        # ── Pyrogram / Telethon client ────────────────────────────────
+        if _cls in ('client',) and 'pyrogram' in _cls_mod:
+            print(f"  📱 {{name}} → Telegram (Pyrogram) → run")
+            return lambda: obj.run()
+        if 'telethon' in _cls_mod and hasattr(obj, 'run_until_disconnected'):
+            print(f"  📱 {{name}} → Telegram (Telethon)")
+            return lambda: obj.run_until_disconnected()
+
+        # ── PyWA (WhatsApp Cloud API) ─────────────────────────────────
+        if 'pywa' in _cls_mod or (hasattr(obj, 'run_forever') and 'whatsapp' in str(type(obj)).lower()):
+            print(f"  💬 {{name}} → WhatsApp (PyWA) → run_forever")
+            return lambda: obj.run_forever()
+
+        # ── Discord.py / nextcord / disnake / py-cord ────────────────
+        _is_discord = ('discord' in _cls_mod or 'nextcord' in _cls_mod
+                       or 'disnake' in _cls_mod or 'py_cord' in _cls_mod
+                       or 'pycord' in _cls_mod)
+        if _is_discord and callable(getattr(obj, 'run', None)):
+            _tok = (os.environ.get('DISCORD_TOKEN')
+                    or os.environ.get('TOKEN')
+                    or os.environ.get('BOT_TOKEN', ''))
+            if _tok:
+                print(f"  🎮 {{name}} → Discord → .run(token)")
+                return lambda: obj.run(_tok)
+            print(f"  ⚠️ Discord object found but no DISCORD_TOKEN env var set")
+
+        # ── Slack Bolt App ────────────────────────────────────────────
+        if 'slack' in _cls_mod and callable(getattr(obj, 'start', None)):
+            _port = int(os.environ.get('PORT', _free_port()))
+            print(f"  💼 {{name}} → Slack Bolt → .start(port={{_port}})")
+            return lambda: obj.start(port=_port)
+
+        # ── Tweepy StreamingClient / Stream ──────────────────────────
+        if 'tweepy' in _cls_mod:
+            if callable(getattr(obj, 'filter', None)):
+                print(f"  🐦 {{name}} → Twitter/X (Tweepy Stream) → .filter()")
+                return lambda: obj.filter()
+            if callable(getattr(obj, 'sample', None)):
+                print(f"  🐦 {{name}} → Twitter/X (Tweepy) → .sample()")
+                return lambda: obj.sample()
+
+        # ── Line SDK ─────────────────────────────────────────────────
+        # Line bots use Flask/ASGI webhooks — Flask detection below handles them
+
+        # ── Matrix (matrix-nio) ───────────────────────────────────────
+        if 'nio' in _cls_mod and callable(getattr(obj, 'sync_forever', None)):
+            print(f"  🔷 {{name}} → Matrix (nio) → sync_forever")
+            return lambda: obj.sync_forever()
+
+        # ── IRC (irc.bot) ─────────────────────────────────────────────
+        if 'irc' in _cls_mod and callable(getattr(obj, 'start', None)):
+            print(f"  📡 {{name}} → IRC → .start()")
+            return lambda: obj.start()
+
+        # ── Flask / Quart ─────────────────────────────────────────────
         if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
             _port = _free_port()
             if _module_has_telegram_bot():
-                # Keep-alive only — start in background, then keep searching
-                print(f"  🌐 {{name}} → Flask keep-alive thread (port {{_port}}, Telegram bot will be main)")
+                print(f"  🌐 {{name}} → Flask keep-alive thread (port {{_port}})")
                 def _flask_bg(_app=obj, _p=_port):
                     try:
                         _app.run(host='0.0.0.0', port=_p, debug=False, use_reloader=False)
                     except Exception as _fe:
                         print(f"  ⚠️ Flask keep-alive: {{_fe}}")
                 _thr.Thread(target=_flask_bg, daemon=True, name='FlaskKeepAlive').start()
-                return 'BACKGROUND'   # sentinel: continue entry-point loop
+                return 'BACKGROUND'
             else:
-                print(f"  🌐 {{name}} → Flask/Quart main server (port {{_port}})")
+                print(f"  🌐 {{name}} → Flask/Quart → .run(port={{_port}})")
                 return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
 
-        # ── FastAPI / Starlette ──────────────────────────────────────
+        # ── FastAPI / Starlette ───────────────────────────────────────
         if _cls in ('fastapi', 'starlette') or 'fastapi' in _cls_mod or 'starlette' in _cls_mod:
             _port = int(os.environ.get('PORT', _free_port()))
-            print(f"  🌐 {{name}} → FastAPI/Starlette (uvicorn port={{_port}})")
+            print(f"  🌐 {{name}} → FastAPI/Starlette → uvicorn (port={{_port}})")
             def _run_asgi():
                 try:
                     import uvicorn
@@ -2129,32 +2288,31 @@ try:
                         sys.exit(1)
             return _run_asgi
 
-        # ── discord.py / nextcord Client ─────────────────────────────
-        if _cls in ('client', 'bot', 'autoclient') and callable(getattr(obj, 'run', None)):
-            _tok = (os.environ.get('DISCORD_TOKEN')
-                    or os.environ.get('TOKEN')
-                    or os.environ.get('BOT_TOKEN', ''))
-            if _tok:
-                print(f"  🎮 {{name}} → Discord client (.run token)")
-                return lambda: obj.run(_tok)
-            print(f"  ⚠️ {{name}} looks like Discord client — set DISCORD_TOKEN env var")
+        # ── Django WSGI/ASGI ──────────────────────────────────────────
+        if 'django' in _cls_mod:
+            _port = int(os.environ.get('PORT', _free_port()))
+            print(f"  🌐 {{name}} → Django → runserver port {{_port}}")
+            import subprocess as _sp
+            return lambda: _sp.run([sys.executable, 'manage.py', 'runserver',
+                                     f'0.0.0.0:{{_port}}', '--noreload'],
+                                    cwd=str(os.getcwd()))
 
         # ── Async coroutine function ──────────────────────────────────
         if _inspect.iscoroutinefunction(obj):
             import asyncio as _aio
-            print(f"  ⚡ {{name}} → async function (asyncio.run)")
+            print(f"  ⚡ {{name}} → async function → asyncio.run")
             return lambda: _aio.run(obj())
 
-        # ── Plain sync function / method ─────────────────────────────
+        # ── Plain sync function / method ──────────────────────────────
         if _inspect.isfunction(obj) or _inspect.isbuiltin(obj) or _inspect.ismethod(obj):
-            return None   # caller does: result = obj()
+            return None   # caller does obj()
 
-        # ── Generic .run() ───────────────────────────────────────────
+        # ── Generic .run() ────────────────────────────────────────────
         if callable(getattr(obj, 'run', None)):
             print(f"  ▶️  {{name}} → has .run()")
             return lambda: obj.run()
 
-        # ── Fallback ─────────────────────────────────────────────────
+        # ── Fallback: callable ────────────────────────────────────────
         if callable(obj):
             return None
 
@@ -2813,7 +2971,7 @@ echo $! > pid.txt
             success_text = (
                 f"**🎉 DEPLOYMENT SUCCESSFUL!** 🎉\n\n"
                 f"📁 **File:** `{dest_script.name}`\n"
-                f"🔧 **Framework:** {', '.join(frameworks)}\n"
+                f"🤖 **Platform:** {get_platform_label(frameworks)}\n"
                 f"📋 **Plan:** {plan.upper()}\n"
                 f"⏱️ **Duration:** {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}\n"
                 f"📅 **Expires:** {expire_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -4401,11 +4559,29 @@ def handle_callback(callback):
                      cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
                      payment_method=user_step.get('payment_method'),
                      env_vars=user_step.get('env_vars', {}))
+
+        # Detect platform from uploaded file to show relevant hints
+        platform_hint = ""
+        try:
+            temp_file = user_step.get('temp_file')
+            if temp_file and Path(temp_file).exists():
+                code = Path(temp_file).read_text(errors='ignore')
+                fws  = detect_bot_framework(code)
+                plabel = get_platform_label(fws)
+                phint  = get_platform_env_hint(fws)
+                if plabel and fws != ['generic']:
+                    platform_hint = f"\n🔍 **Detected: {plabel}**\n"
+                if phint:
+                    platform_hint += f"\n**Required env vars:**\n{phint}\n"
+        except Exception:
+            pass
+
         edit_message(chat_id, message_id,
-            f"**🔧 ENVIRONMENT VARIABLES (Optional)**\n\n"
-            f"Send environment variables one per line:\n"
-            f"```\nBOT_TOKEN=your_token_here\nAPI_KEY=your_api_key\nDATABASE_URL=postgresql://...\n```\n\n"
-            f"**Note:** All variables will be available via `os.environ.get('KEY')`\n\n"
+            f"**🔧 ENVIRONMENT VARIABLES**\n"
+            f"{platform_hint}\n"
+            f"Send variables one per line:\n"
+            f"```\nBOT_TOKEN=your_token\nAPI_KEY=abc123\nDATABASE_URL=postgresql://...\n```\n\n"
+            f"All vars are available via `os.environ.get('KEY')`\n\n"
             f"Or use the buttons below:",
             get_env_keyboard(0))
         return
@@ -4744,55 +4920,110 @@ def handle_callback(callback):
 
 # ==================== USER STEP FUNCTIONS ====================
 def set_user_step(user_id, step, **kwargs):
+    """
+    Persist workflow state for a user.
+    Known high-frequency fields are stored in dedicated columns for query speed.
+    ALL kwargs (including ad-hoc ones like temp_github_owner) are also stored
+    in pending_json so nothing is ever silently discarded.
+    """
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    
+
+    # ── Dedicated columns (fast lookups) ─────────────────────────────
+    _KNOWN = {'temp_file', 'requirements', 'env_vars', 'plan', 'payment_method',
+              'duration', 'cost_coins', 'cost_stars', 'waiting_for_env',
+              'waiting_for_reqs', 'waiting_for_redeem', 'temp_target_user',
+              'temp_coins_amount', 'temp_stars_amount', 'temp_expiry', 'temp_reward_type'}
+
     updates = ["step = ?"]
-    values = [step]
-    
-    for key in ['temp_file', 'requirements', 'env_vars', 'plan', 'payment_method', 'duration', 
-                'cost_coins', 'cost_stars', 'waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem', 
-                'temp_target_user', 'temp_coins_amount', 'temp_stars_amount', 'temp_expiry', 'temp_reward_type']:
+    values  = [step]
+
+    for key in _KNOWN:
         if key in kwargs:
             updates.append(f"{key} = ?")
-            if key == 'env_vars' and kwargs[key] is not None:
-                values.append(json.dumps(kwargs[key]))
-            else:
-                values.append(kwargs[key])
-    
+            val = kwargs[key]
+            if key == 'env_vars' and val is not None and not isinstance(val, str):
+                val = json.dumps(val)
+            values.append(val)
+
+    # ── pending_json: stores ALL kwargs (superset, survives schema changes) ──
+    # Read existing pending_json first so we only overwrite keys provided
+    c.execute("SELECT pending_json FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    try:
+        existing = json.loads(row[0] or '{}') if row else {}
+    except Exception:
+        existing = {}
+
+    existing.update(kwargs)       # overlay new values
+    existing['_step'] = step      # keep step in JSON too for one-stop reads
+    updates.append("pending_json = ?")
+    values.append(json.dumps(existing))
+
     values.append(user_id)
     c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
     conn.commit()
     conn.close()
 
+
 def get_user_step(user_id):
+    """
+    Return full workflow state for a user.
+    Merges dedicated column values and pending_json into one dict so callers
+    can read any kwarg that was ever passed to set_user_step.
+    """
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("SELECT step, temp_file, requirements, env_vars, plan, payment_method, duration, cost_coins, cost_stars, waiting_for_env, waiting_for_reqs, waiting_for_redeem, temp_target_user, temp_coins_amount, temp_stars_amount, temp_expiry, temp_reward_type FROM users WHERE user_id = ?", (user_id,))
+    c.execute("""SELECT step, temp_file, requirements, env_vars, plan, payment_method,
+                        duration, cost_coins, cost_stars, waiting_for_env,
+                        waiting_for_reqs, waiting_for_redeem, temp_target_user,
+                        temp_coins_amount, temp_stars_amount, temp_expiry,
+                        temp_reward_type, pending_json
+                 FROM users WHERE user_id = ?""", (user_id,))
     row = c.fetchone()
     conn.close()
-    if row:
-        env_vars = {}
-        if row[3]:
+
+    _DEFAULTS = {
+        'step': None, 'temp_file': None, 'requirements': None, 'env_vars': {},
+        'plan': None, 'payment_method': None, 'duration': None,
+        'cost_coins': None, 'cost_stars': None,
+        'waiting_for_env': 0, 'waiting_for_reqs': 0, 'waiting_for_redeem': 0,
+        'temp_target_user': None, 'temp_coins_amount': None,
+        'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None,
+    }
+
+    if not row:
+        return _DEFAULTS.copy()
+
+    # Parse pending_json first (lower priority)
+    try:
+        pj = json.loads(row[17] or '{}')
+    except Exception:
+        pj = {}
+
+    # Build result: pending_json as base, then overlay dedicated columns
+    result = {**_DEFAULTS, **pj}
+
+    col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
+               'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
+               'waiting_for_redeem','temp_target_user','temp_coins_amount',
+               'temp_stars_amount','temp_expiry','temp_reward_type']
+
+    for i, key in enumerate(col_map):
+        val = row[i]
+        if val is None:
+            continue
+        if key == 'env_vars':
             try:
-                env_vars = json.loads(row[3])
-            except:
-                env_vars = {}
-        return {
-            'step': row[0], 'temp_file': row[1], 'requirements': row[2],
-            'env_vars': env_vars, 'plan': row[4], 'payment_method': row[5],
-            'duration': row[6], 'cost_coins': row[7], 'cost_stars': row[8],
-            'waiting_for_env': row[9] or 0, 'waiting_for_reqs': row[10] or 0,
-            'waiting_for_redeem': row[11] or 0, 'temp_target_user': row[12],
-            'temp_coins_amount': row[13], 'temp_stars_amount': row[14],
-            'temp_expiry': row[15], 'temp_reward_type': row[16]
-        }
-    return {'step': None, 'temp_file': None, 'requirements': None, 'env_vars': {},
-            'plan': None, 'payment_method': None, 'duration': None, 'cost_coins': None,
-            'cost_stars': None, 'waiting_for_env': 0, 'waiting_for_reqs': 0,
-            'waiting_for_redeem': 0, 'temp_target_user': None, 'temp_coins_amount': None,
-            'temp_stars_amount': None, 'temp_expiry': None, 'temp_reward_type': None}
+                val = json.loads(val)
+            except Exception:
+                val = {}
+        elif key in ('waiting_for_env','waiting_for_reqs','waiting_for_redeem'):
+            val = int(val or 0)
+        result[key] = val
+
+    return result
 
 # ==================== MESSAGE HANDLER ====================
 def handle_message(message):
