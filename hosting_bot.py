@@ -3649,11 +3649,14 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
     
     if is_free:
-        remaining = (expire_time - datetime.now()).total_seconds() / 3600
-        cost_text = "FREE"
-        remaining_text = f"{int(remaining)}h"
+        remaining_secs = max(0, (expire_time - datetime.now()).total_seconds())
+        remaining_h    = int(remaining_secs / 3600)
+        remaining_m    = int((remaining_secs % 3600) / 60)
+        cost_text      = "FREE"
+        remaining_text = f"{remaining_h}h {remaining_m}m" if remaining_secs > 0 else "Expired"
     else:
-        remaining = (expire_time - datetime.now()).days
+        remaining_secs = max(0, (expire_time - datetime.now()).total_seconds())
+        remaining_days = int(remaining_secs / 86400)
         if payment == "stars":
             cost_text = f"{cost_stars}⭐"
         elif payment == "coins":
@@ -3662,7 +3665,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
             cost_text = "FREE (Premium)"
         else:
             cost_text = f"{cost_coins}🪙"
-        remaining_text = f"{remaining}d"
+        remaining_text = f"{remaining_days}d" if remaining_secs > 0 else "Expired"
     
     if status == "active":
         status_emoji = "🟢 ACTIVE"
@@ -4579,6 +4582,33 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
         is_free=True, main_file_name=main_file_name)
 
 
+def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
+    """Central dispatch from env_done/env_skip to the correct deploy path."""
+    plan         = user_step.get('plan') or 'free'
+    temp_file    = user_step.get('temp_file')
+    requirements = user_step.get('requirements')
+    duration     = user_step.get('duration')
+    cost_stars   = user_step.get('cost_stars')
+    cost_coins   = user_step.get('cost_coins')
+
+    if plan == 'free':
+        set_user_step(user_id, None)
+        deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements, env_vars)
+    elif is_user_premium(user_id) or is_admin(user_id):
+        set_user_step(user_id, None)
+        deploy_paid_bot(chat_id, user_id, temp_file, requirements, env_vars,
+                        plan, duration, 0, 0, 'premium_free')
+    else:
+        # Non-premium paid plan — show payment options
+        edit_message(chat_id, message_id,
+            f"**💰 Choose Payment Method**\n\n"
+            f"Plan: **{plan.upper()}**\n"
+            f"Duration: {duration} days\n"
+            f"Env vars: {len(env_vars)}\n\n"
+            f"Cost: `{cost_stars}⭐` or `{cost_coins}🪙`",
+            get_payment_keyboard(plan, cost_stars, cost_coins))
+
+
 # ==================== CALLBACK HANDLER ====================
 def handle_callback(callback):
     callback_id = callback['id']
@@ -4835,37 +4865,37 @@ def handle_callback(callback):
     
     if data == "reqs_no":
         user_step = get_user_step(user_id)
-        set_user_step(user_id, 'awaiting_env', waiting_for_env=1,
-                     temp_file=user_step.get('temp_file'), requirements=None,
-                     plan=user_step.get('plan'), duration=user_step.get('duration'),
-                     cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
-                     payment_method=user_step.get('payment_method'),
-                     env_vars=user_step.get('env_vars', {}))
-
-        # Detect platform from uploaded file to show relevant hints
+        # Detect platform for env var hints
         platform_hint = ""
         try:
-            temp_file = user_step.get('temp_file')
-            if temp_file and Path(temp_file).exists():
-                code = Path(temp_file).read_text(errors='ignore')
-                fws  = detect_bot_framework(code)
+            tf = user_step.get('temp_file')
+            if tf and Path(tf).exists():
+                code   = Path(tf).read_text(errors='ignore')
+                fws    = detect_bot_framework(code)
                 plabel = get_platform_label(fws)
                 phint  = get_platform_env_hint(fws)
-                if plabel and fws != ['generic']:
-                    platform_hint = f"\n🔍 **Detected: {plabel}**\n"
+                if fws and fws != ['generic']:
+                    platform_hint = f"\n\n🔍 **Detected: {plabel}**"
                 if phint:
-                    platform_hint += f"\n**Required env vars:**\n{phint}\n"
+                    platform_hint += f"\n\n**Required env vars:**\n{phint}"
         except Exception:
             pass
-
+        set_user_step(user_id, 'awaiting_env',
+                     waiting_for_env=1, waiting_for_reqs=0,
+                     temp_file=user_step.get('temp_file'),
+                     requirements=None,
+                     plan=user_step.get('plan'),
+                     duration=user_step.get('duration'),
+                     cost_coins=user_step.get('cost_coins'),
+                     cost_stars=user_step.get('cost_stars'),
+                     payment_method=user_step.get('payment_method'),
+                     env_vars=user_step.get('env_vars') or {})
         edit_message(chat_id, message_id,
-            f"**🔧 ENVIRONMENT VARIABLES**\n"
-            f"{platform_hint}\n"
-            f"Send variables one per line:\n"
-            f"```\nBOT_TOKEN=your_token\nAPI_KEY=abc123\nDATABASE_URL=postgresql://...\n```\n\n"
-            f"All vars are available via `os.environ.get('KEY')`\n\n"
-            f"Or use the buttons below:",
-            get_env_keyboard(0))
+            f"**🔧 ENVIRONMENT VARIABLES**{platform_hint}\n\n"
+            "Send variables one per line:\n"
+            "```\nBOT_TOKEN=your_token\nAPI_KEY=abc123\n```\n\n"
+            "Or deploy without any:",
+            get_env_keyboard(len(user_step.get('env_vars') or {})))
         return
     
     # ========== ENVIRONMENT VARIABLES ==========
@@ -4910,47 +4940,17 @@ def handle_callback(callback):
     
     if data == "env_skip":
         user_step = get_user_step(user_id)
-        
-        if user_step.get('plan') == 'free':
-            deploy_free_bot_with_logs(chat_id, user_id, user_step.get('temp_file'),
-                                     user_step.get('requirements'), {})
-        else:
-            if is_user_premium(user_id) or is_admin(user_id):
-                deploy_paid_bot(chat_id, user_id, user_step.get('temp_file'),
-                                user_step.get('requirements'), {},
-                                user_step.get('plan'), user_step.get('duration'), 0, 0, 'premium_free')
-            else:
-                edit_message(chat_id, message_id,
-                    f"**💰 Choose Payment Method**\n\n"
-                    f"Plan: {user_step.get('plan', 'monthly').upper()}\n"
-                    f"Duration: {user_step.get('duration', 30)} days\n\n"
-                    f"Cost: {user_step.get('cost_stars')}⭐ or {user_step.get('cost_coins')}🪙",
-                    get_payment_keyboard(user_step.get('plan', 'monthly'), 
-                                        user_step.get('cost_stars'), 
-                                        user_step.get('cost_coins')))
+        env_vars  = {}   # skip means deploy with no vars
+        _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars)
         return
-    
+
     if data == "env_done":
         user_step = get_user_step(user_id)
-        
-        if user_step.get('plan') == 'free':
-            deploy_free_bot_with_logs(chat_id, user_id, user_step.get('temp_file'),
-                                     user_step.get('requirements'), user_step.get('env_vars', {}))
-        else:
-            if is_user_premium(user_id) or is_admin(user_id):
-                deploy_paid_bot(chat_id, user_id, user_step.get('temp_file'),
-                                user_step.get('requirements'), user_step.get('env_vars', {}),
-                                user_step.get('plan'), user_step.get('duration'), 0, 0, 'premium_free')
-            else:
-                edit_message(chat_id, message_id,
-                    f"**💰 Choose Payment Method**\n\n"
-                    f"Plan: {user_step.get('plan', 'monthly').upper()}\n"
-                    f"Duration: {user_step.get('duration', 30)} days\n"
-                    f"Environment variables: {len(user_step.get('env_vars', {}))}\n\n"
-                    f"Cost: {user_step.get('cost_stars')}⭐ or {user_step.get('cost_coins')}🪙",
-                    get_payment_keyboard(user_step.get('plan', 'monthly'), 
-                                        user_step.get('cost_stars'), 
-                                        user_step.get('cost_coins')))
+        raw = user_step.get('env_vars') or {}
+        if isinstance(raw, str):
+            try:    raw = json.loads(raw)
+            except Exception: raw = {}
+        _dispatch_deploy(chat_id, user_id, message_id, user_step, dict(raw))
         return
     
     if data == "cancel_deploy":
@@ -5087,16 +5087,17 @@ def handle_callback(callback):
         return
 
     if data == "github_private":
+        step = get_user_step(user_id)
         set_user_step(user_id, 'awaiting_github_token',
-                      temp_github_owner=get_user_step(user_id).get('temp_github_owner'),
-                      temp_github_repo=get_user_step(user_id).get('temp_github_repo'),
-                      temp_github_branch=get_user_step(user_id).get('temp_github_branch'))
+                      temp_github_owner=step.get('temp_github_owner'),
+                      temp_github_repo=step.get('temp_github_repo'),
+                      temp_github_branch=step.get('temp_github_branch'))
         edit_message(chat_id, message_id,
             "**🔑 PRIVATE REPO — GitHub Token**\n\n"
             "Send your **GitHub Personal Access Token** (PAT).\n\n"
             "The token needs the `repo` scope.\n"
             "Create one at: `github.com/settings/tokens`\n\n"
-            "⚠️ Your token is only stored in `.env` inside the deployment folder and is never logged.",
+            "⚠️ Stored only in `.env` inside the deployment folder, never logged.",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
         return
 
@@ -5416,49 +5417,98 @@ def handle_message(message):
             else:
                 send_message(chat_id, "❌ Reply cannot be empty.")
             return
+
+        # ── Redeem code ──────────────────────────────────────────────
+        if user_step.get('waiting_for_redeem') == 1 and text and not text.startswith('/'):
             process_redeem(chat_id, user_id, text)
             return
-        
-        if user_step.get('waiting_for_env') == 1 and text and not text.startswith('/'):
-            # ── GitHub deploy env vars path ───────────────────────────
+
+        # ── Admin coins: awaiting target user ────────────────────────
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_coins_target':
+            target = text.strip().lstrip('@')
+            if target:
+                set_user_step(user_id, 'awaiting_coins_amount', temp_target_user=target)
+                send_message(chat_id,
+                    f"🪙 **Add coins to `{target}`**\n\nEnter amount or pick preset:",
+                    {"inline_keyboard": [
+                        [{"text": "50",   "callback_data": "coin_preset_50"},
+                         {"text": "100",  "callback_data": "coin_preset_100"},
+                         {"text": "500",  "callback_data": "coin_preset_500"}],
+                        [{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
+            else:
+                send_message(chat_id, "❌ Please send a username or user ID.")
+            return
+
+        # ── Admin coins: awaiting amount ──────────────────────────────
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_coins_amount':
+            try:
+                amount = int(text.strip())
+                if amount <= 0:
+                    raise ValueError("non-positive")
+                target = user_step.get('temp_target_user', '?')
+                set_user_step(user_id, 'awaiting_coins_confirm',
+                             temp_target_user=target, temp_coins_amount=amount)
+                send_message(chat_id,
+                    f"Confirm: add **{amount}🪙** to `{target}`?",
+                    {"inline_keyboard": [
+                        [{"text": "✅ Confirm", "callback_data": "confirm_add_coins"},
+                         {"text": "❌ Cancel",  "callback_data": "admin_panel"}]]})
+            except (ValueError, TypeError):
+                send_message(chat_id, "❌ Send a positive whole number (e.g. `50`).")
+            return
+
+        # ── Env vars (waiting_for_env=1 OR step in awaiting_env* ) ───
+        _wants_env = (
+            user_step.get('waiting_for_env') == 1 or
+            user_step.get('step') in ('awaiting_env', 'awaiting_env_vars')
+        )
+        if _wants_env and text and not text.startswith('/'):
+            # GitHub path
             if user_step.get('temp_source') == 'github':
                 user_step['temp_env_vars'] = text.strip()
                 _launch_github_deploy(chat_id, user_id, user_step)
                 return
+            # Regular path – initialise env_vars safely
+            raw = user_step.get('env_vars') or {}
+            if isinstance(raw, str):
+                try:    raw = json.loads(raw)
+                except Exception: raw = {}
+            env_vars = dict(raw)
             added = 0
-            
-            lines = text.strip().split('\n')
-            for line in lines:
+            for line in text.strip().split('\n'):
                 line = line.strip()
                 if '=' in line:
-                    first_eq = line.find('=')
-                    key = line[:first_eq].strip()
-                    value = line[first_eq+1:].strip()
-                    if key:
-                        env_vars[key] = value
+                    eq = line.index('=')
+                    k, v = line[:eq].strip(), line[eq+1:].strip()
+                    if k:
+                        env_vars[k] = v
                         added += 1
-            
-            if added > 0:
-                set_user_step(user_id, 'awaiting_env', waiting_for_env=1,
-                             temp_file=user_step.get('temp_file'),
-                             requirements=user_step.get('requirements'),
-                             env_vars=env_vars,
-                             plan=user_step.get('plan'), duration=user_step.get('duration'),
-                             cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
-                             payment_method=user_step.get('payment_method'))
+            set_user_step(user_id, 'awaiting_env',
+                         waiting_for_env=1,
+                         temp_file=user_step.get('temp_file'),
+                         requirements=user_step.get('requirements'),
+                         env_vars=env_vars,
+                         plan=user_step.get('plan'),
+                         duration=user_step.get('duration'),
+                         cost_coins=user_step.get('cost_coins'),
+                         cost_stars=user_step.get('cost_stars'),
+                         payment_method=user_step.get('payment_method'))
+            if added:
                 send_message(chat_id,
-                    f"✅ Added `{added}` environment variable(s)!\n\n"
-                    f"Total: `{len(env_vars)}`\n\n"
-                    f"All variables will be available via `os.environ.get('KEY')`\n\n"
-                    f"Send more or use buttons:",
+                    f"✅ **{added}** variable(s) saved — total: `{len(env_vars)}`\n\nSend more, or:",
                     get_env_keyboard(len(env_vars)))
             else:
-                send_message(chat_id, 
-                    f"❌ No valid KEY=VALUE pairs found.\n\n"
-                    f"Format each variable on a new line:\n"
-                    f"```\nKEY1=value1\nKEY2=value2\n```\n\n"
-                    f"Example: BOT_TOKEN=123456:ABC\nAPI_KEY=your_key",
-                    get_env_keyboard(len(user_step.get('env_vars', {}))))
+                send_message(chat_id,
+                    "❌ No valid `KEY=VALUE` pairs found.\n\n"
+                    "Format (one per line):\n```\nBOT_TOKEN=123:ABC\nAPI_KEY=xyz\n```",
+                    get_env_keyboard(len(env_vars)))
+            return
+
+        # ── Waiting for requirements file ─────────────────────────────
+        if user_step.get('waiting_for_reqs') == 1 and text and not text.startswith('/'):
+            send_message(chat_id,
+                "📦 Please **upload** your `requirements.txt` file, or click **Auto-detect**.",
+                get_reqs_keyboard())
             return
         
         if not is_user_verified(user_id):
@@ -5483,34 +5533,39 @@ def handle_message(message):
             send_verification_required(chat_id, user_id, first_name, None)
             return
         
-        # Requirements file
-        if user_step.get('waiting_for_reqs') == 1 and file_name == 'requirements.txt':
+        # Requirements file — accept requirements.txt or any .txt upload when waiting
+        if user_step.get('waiting_for_reqs') == 1 and (
+                file_name == 'requirements.txt' or
+                (file_name.endswith('.txt') and 'req' in file_name.lower()) or
+                file_name.endswith('.txt')):
             file_id = doc['file_id']
             file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
-            
             if file_info and file_info.get('ok'):
                 file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
-                
                 try:
-                    with urllib.request.urlopen(file_url) as response:
-                        requirements_text = response.read().decode('utf-8')
-                    
-                    set_user_step(user_id, 'awaiting_env', waiting_for_env=1, waiting_for_reqs=0,
-                                 temp_file=user_step.get('temp_file'), requirements=requirements_text,
-                                 env_vars=user_step.get('env_vars', {}),
-                                 plan=user_step.get('plan'), duration=user_step.get('duration'),
-                                 cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
+                    with urllib.request.urlopen(file_url) as resp:
+                        requirements_text = resp.read().decode('utf-8', errors='replace')
+                    set_user_step(user_id, 'awaiting_env',
+                                 waiting_for_env=1, waiting_for_reqs=0,
+                                 temp_file=user_step.get('temp_file'),
+                                 requirements=requirements_text,
+                                 env_vars=user_step.get('env_vars') or {},
+                                 plan=user_step.get('plan'),
+                                 duration=user_step.get('duration'),
+                                 cost_coins=user_step.get('cost_coins'),
+                                 cost_stars=user_step.get('cost_stars'),
                                  payment_method=user_step.get('payment_method'))
-                    
+                    pkg_count = len([l for l in requirements_text.splitlines()
+                                     if l.strip() and not l.startswith('#')])
                     send_message(chat_id,
-                        f"**✅ Requirements received!**\n\n"
-                        f"```\n{requirements_text[:500]}\n```\n\n"
-                        f"**🔧 ENVIRONMENT VARIABLES (Optional)**\n\n"
-                        f"Send KEY=VALUE (one per line). All variables will be available via `os.environ.get('KEY')`\n\n"
-                        f"Or use buttons:",
+                        f"✅ **Requirements received!** ({pkg_count} packages)\n\n"
+                        f"```\n{requirements_text[:400]}\n```\n\n"
+                        "Now set environment variables, or deploy directly:",
                         get_env_keyboard(0))
                 except Exception as e:
-                    send_message(chat_id, f"❌ Error: {e}")
+                    send_message(chat_id, f"❌ Error reading file: {e}")
+            else:
+                send_message(chat_id, "❌ Could not download file from Telegram.")
             return
         
         # Python file for deployment
