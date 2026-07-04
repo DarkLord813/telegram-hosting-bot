@@ -2820,6 +2820,103 @@ print("🚀 STARTING BOT")
 print("=" * 50)
 sys.stdout.flush()
 
+# ── Token aliasing: bridge common token variable names ────────────────────
+# Many bots use different env var names for the same token.
+# We copy whichever is set to all the others so the bot finds it regardless.
+_TOKEN_ALIASES = ['BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+                  'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN']
+_found_token = None
+for _alias in _TOKEN_ALIASES:
+    _found_token = os.environ.get(_alias)
+    if _found_token:
+        break
+if _found_token:
+    for _alias in _TOKEN_ALIASES:
+        if not os.environ.get(_alias):
+            os.environ[_alias] = _found_token
+    print(f"✅ Token aliased to all common names")
+else:
+    print("⚠️  No token found — set BOT_TOKEN or TELEGRAM_TOKEN in env vars")
+
+# ── Pre-install critical packages from bot file imports ───────────────────
+# This runs BEFORE Method 1 import so packages are available immediately.
+_PKG_INSTALL_MAP = {{
+    'telebot':       'pyTelegramBotAPI',
+    'telegram':      'python-telegram-bot',
+    'aiogram':       'aiogram',
+    'pyrogram':      'pyrogram',
+    'telethon':      'telethon',
+    'discord':       'discord.py',
+    'nextcord':      'nextcord',
+    'disnake':       'disnake',
+    'slack_sdk':     'slack-sdk',
+    'slack_bolt':    'slack-bolt',
+    'tweepy':        'tweepy',
+    'linebot':       'line-bot-sdk',
+    'viberbot':      'viberbot',
+    'pywa':          'pywa',
+    'flask':         'flask',
+    'fastapi':       'fastapi',
+    'uvicorn':       'uvicorn',
+    'aiohttp':       'aiohttp',
+    'dotenv':        'python-dotenv',
+    'requests':      'requests',
+    'httpx':         'httpx',
+    'pydantic':      'pydantic',
+    'sqlalchemy':    'SQLAlchemy',
+    'motor':         'motor',
+    'pymongo':       'pymongo',
+    'redis':         'redis',
+    'celery':        'celery',
+    'aiosqlite':     'aiosqlite',
+    'tortoise':      'tortoise-orm',
+    'loguru':        'loguru',
+}}
+
+def _pre_install(bot_file):
+    """Scan bot file imports and install any missing packages."""
+    try:
+        import importlib.util as _ilu, subprocess as _sp, re as _re
+        with open(bot_file, 'r', errors='ignore') as _f:
+            _code = _f.read()
+
+        # Extract top-level module names from import statements
+        _imported = set()
+        for _m in _re.findall(r'^import\\s+([\\w]+)', _code, _re.M):
+            _imported.add(_m)
+        for _m in _re.findall(r'^from\\s+([\\w]+)', _code, _re.M):
+            _imported.add(_m)
+
+        _to_install = []
+        for _mod, _pkg in _PKG_INSTALL_MAP.items():
+            if _mod in _imported:
+                # Check if already importable
+                if _ilu.find_spec(_mod) is None:
+                    _to_install.append(_pkg)
+
+        if _to_install:
+            print(f"📦 Auto-installing {len(_to_install)} missing package(s): {{', '.join(_to_install)}}")
+            sys.stdout.flush()
+            _pkg_dir = r"{packages_dir_str}"
+            for _pkg in _to_install:
+                _cmd = [sys.executable, '-m', 'pip', 'install', '--quiet',
+                        '--no-warn-script-location', '--disable-pip-version-check']
+                if _pkg_dir and os.path.isdir(_pkg_dir):
+                    _cmd += ['--target', _pkg_dir]
+                _cmd.append(_pkg)
+                _r = _sp.run(_cmd, capture_output=True, timeout=120)
+                _ok = '✅' if _r.returncode == 0 else '❌'
+                print(f"  {{_ok}} {{_pkg}}")
+                sys.stdout.flush()
+        else:
+            print("✅ All required packages already installed")
+            sys.stdout.flush()
+    except Exception as _pe:
+        print(f"⚠️  Pre-install scan error: {{_pe}}")
+
+_pre_install(r"{dest_script}")
+sys.stdout.flush()
+
 # ========== METHOD 1: Import and run ==========
 try:
     print("📌 Method 1: Importing as module...")
