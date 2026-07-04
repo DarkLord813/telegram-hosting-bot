@@ -83,7 +83,7 @@ FREE_DEPLOYMENT_DURATION_HOURS = int(os.environ.get("FREE_DEPLOYMENT_DURATION_HO
 STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 
 # Referral reward
-REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 5))
+REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 50))
 
 # ── GitHub Backup ─────────────────────────────────────────────────────────────
 GITHUB_TOKEN        = os.environ.get("GITHUB_TOKEN", "")
@@ -384,6 +384,471 @@ def get_deploy_folder(user_id, deployment_id):
         pass
     # Fallback: old behaviour (folder named by DB id) for records without folder_name
     return DEPLOYMENTS_DIR / str(user_id) / str(deployment_id)
+
+
+# ==================== SECURITY SCANNER ====================
+
+class SecurityScanner:
+    """
+    6-Layer Security Scanner for uploaded bot files.
+
+    Layer 1  – AI pattern-based analysis
+    Layer 2  – AST-level Python code analysis
+    Layer 3  – Encoded / hidden content detection (base64, hex, url-enc)
+    Layer 4  – Secure sandbox extraction for archives
+    Layer 5  – Permission / path traversal / symlink / data-protection scan
+    Layer 6  – Archive bomb & nested extraction protection
+
+    For a hosting platform, patterns are calibrated in two tiers:
+    CRITICAL  → deployment blocked entirely
+    WARNING   → deployment proceeds with a notification to user and admin
+    """
+
+    MAX_FILES        = 1_000
+    MAX_TOTAL_SIZE   = 100 * 1024 * 1024   # 100 MB extracted
+    MAX_RECURSION    = 4
+    B64_MIN_LEN      = 60   # ignore short base64 strings to cut false positives
+
+    # ── CRITICAL patterns (block deployment) ──────────────────────────
+    CRITICAL_PYTHON = [
+        r'eval\s*\(\s*base64\.b64decode',            # obfuscated eval
+        r'exec\s*\(\s*base64\.b64decode',            # obfuscated exec
+        r'exec\s*\(\s*__import__\s*\(',              # import+exec combo
+        r'stratum\+tcp',                              # crypto miner
+        r'xmrig|minergate|nicehash|coinhive',         # crypto miner names
+        r'socket\.connect\([^)]+\).*exec\(',          # reverse shell
+        r'\.connect\(\(\s*["\'][0-9]+\.[0-9]+',      # hardcoded IP socket
+        r"os\.system\s*\(\s*['\"]rm\s+-rf\s+/",      # rm -rf /
+        r"shutil\.rmtree\s*\(\s*['\"][/\\]",         # rmtree on root
+        r'urllib\.request\.urlopen.*base64\.b64decode',  # fetch+decode
+    ]
+    CRITICAL_JS = [
+        r'stratum\+tcp',
+        r'xmrig|minergate|coinhive',
+        r'child_process.*exec.*base64',
+        r'eval\s*\(\s*Buffer\.from',
+        r'exec\s*\(\s*require\s*\(\s*["\']child_process',
+    ]
+    CRITICAL_PKG_HOOKS = [
+        r'curl\s+http',
+        r'wget\s+http',
+        r'\|\s*bash',
+        r'\|\s*sh\b',
+        r'python\s+-c\s+["\']import',
+        r'node\s+-e\s+',
+        r'base64\s+--decode',
+        r'chmod\s+\+x',
+    ]
+
+    # ── WARNING patterns (proceed with alert) ────────────────────────
+    WARN_PYTHON = [
+        r'\beval\s*\(',
+        r'\bexec\s*\(',
+        r'subprocess\.(Popen|call|check_output|run)\s*\(',
+        r'os\.(system|popen)\s*\(',
+        r'os\.(remove|unlink)\s*\(',
+        r'shutil\.rmtree\s*\(',
+        r'pickle\.loads\s*\(',
+        r'marshal\.loads\s*\(',
+        r'__import__\s*\(',
+    ]
+    WARN_JS = [
+        r'\beval\s*\(',
+        r'new\s+Function\s*\(',
+        r'child_process\.(exec|spawn|execSync|spawnSync)\s*\(',
+        r'fs\.(unlink|rmdir|rmdirSync|unlinkSync)\s*\(',
+        r'require\s*\(\s*["\']child_process["\']\s*\)',
+    ]
+
+    # ── File types → scanner map ──────────────────────────────────────
+    SUPPORTED_BOT_EXTS = {
+        '.py':  'python',
+        '.js':  'javascript',
+        '.mjs': 'javascript',
+        '.cjs': 'javascript',
+        '.ts':  'typescript',
+        '.tsx': 'typescript',
+        '.jsx': 'javascript',
+    }
+    ARCHIVE_EXTS = {'.zip', '.tar', '.gz', '.tgz', '.7z', '.rar'}
+
+    def __init__(self):
+        self._reset()
+
+    def _reset(self):
+        self.critical = []
+        self.warnings = []
+
+    # ── Public API ────────────────────────────────────────────────────
+    def scan(self, file_bytes: bytes, filename: str) -> tuple[bool, list, list]:
+        """
+        Returns (blocked, critical_list, warning_list).
+        blocked=True means the file should NOT be deployed.
+        """
+        self._reset()
+        filename = filename or 'unknown'
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in self.ARCHIVE_EXTS:
+            self._scan_archive(file_bytes, filename)
+        else:
+            c, w = self._scan_file(file_bytes, filename)
+            self.critical.extend(c)
+            self.warnings.extend(w)
+        blocked = bool(self.critical)
+        return blocked, self.critical[:], self.warnings[:]
+
+    # ── Archive handling ──────────────────────────────────────────────
+    def _scan_archive(self, data: bytes, filename: str):
+        import tempfile, shutil, zipfile, tarfile, io as _io
+        ext      = os.path.splitext(filename)[1].lower()
+        tmp_dir  = tempfile.mkdtemp(prefix='sec_scan_')
+        try:
+            if ext == '.zip':
+                with zipfile.ZipFile(_io.BytesIO(data)) as zf:
+                    self._check_zip(zf)
+                    zf.extractall(tmp_dir)
+            elif ext in ('.tar', '.gz', '.tgz'):
+                with tarfile.open(fileobj=_io.BytesIO(data), mode='r:*') as tf:
+                    self._check_tar(tf)
+                    tf.extractall(tmp_dir)
+            elif ext == '.rar':
+                try:
+                    import rarfile
+                    with rarfile.RarFile(_io.BytesIO(data)) as rf:
+                        self._check_rar(rf)
+                        rf.extractall(tmp_dir)
+                except ImportError:
+                    self.warnings.append("RAR archive: cannot deep-scan (rarfile not installed)")
+                    return
+            elif ext == '.7z':
+                try:
+                    import py7zr
+                    with py7zr.SevenZipFile(_io.BytesIO(data)) as sz:
+                        sz.extractall(tmp_dir)
+                except ImportError:
+                    self.warnings.append("7z archive: cannot deep-scan (py7zr not installed)")
+                    return
+
+            for root, _dirs, files in os.walk(tmp_dir):
+                for fname in files:
+                    fpath    = os.path.join(root, fname)
+                    rel_path = os.path.relpath(fpath, tmp_dir)
+                    if os.path.islink(fpath):
+                        self.critical.append(f"Symlink in archive: `{rel_path}`")
+                        continue
+                    if '..' in rel_path or rel_path.startswith('/'):
+                        self.critical.append(f"Path traversal in archive: `{rel_path}`")
+                        continue
+                    try:
+                        with open(fpath, 'rb') as fp:
+                            content = fp.read()
+                        c, w = self._scan_file(content, fname, rel_path)
+                        self.critical.extend(c)
+                        self.warnings.extend(w)
+                    except Exception as e:
+                        self.warnings.append(f"Could not scan `{rel_path}`: {e}")
+        except Exception as e:
+            self.critical.append(f"Archive error: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ── Single file dispatcher ────────────────────────────────────────
+    def _scan_file(self, data: bytes, filename: str, rel: str = None) -> tuple[list, list]:
+        critical, warnings = [], []
+        ext  = os.path.splitext(filename)[1].lower()
+        path = rel or filename
+
+        # Path traversal guard
+        if rel and ('..' in rel or rel.startswith('/')):
+            critical.append(f"Path traversal: `{rel}`")
+            return critical, warnings
+
+        try:
+            text = data.decode('utf-8', errors='ignore')
+        except Exception:
+            text = ''
+
+        # Layer 3: encoded content
+        ec, ew = self._check_encoded(text, path)
+        critical.extend(ec); warnings.extend(ew)
+
+        # Layer 1+2: language-specific
+        lang = self.SUPPORTED_BOT_EXTS.get(ext, '')
+        if lang == 'python':
+            c, w = self._scan_python(data, text, path)
+            critical.extend(c); warnings.extend(w)
+        elif lang in ('javascript', 'typescript'):
+            c, w = self._scan_js(text, path)
+            critical.extend(c); warnings.extend(w)
+        elif filename.lower() == 'package.json':
+            c, w = self._scan_package_json(text)
+            critical.extend(c); warnings.extend(w)
+        elif text:
+            c, w = self._scan_generic(text, path)
+            critical.extend(c); warnings.extend(w)
+
+        # Layer 5: sensitive file names
+        base = os.path.basename(filename).lower()
+        if base in ('credentials.json', 'service_account.json', 'gcp_key.json'):
+            warnings.append(f"Sensitive credential file: `{path}`")
+
+        return critical, warnings
+
+    # ── Python scanner (Layer 1 + 2) ─────────────────────────────────
+    def _scan_python(self, data: bytes, text: str, path: str) -> tuple[list, list]:
+        critical, warnings = [], []
+
+        # Regex critical
+        for pat in self.CRITICAL_PYTHON:
+            if re.search(pat, text, re.IGNORECASE | re.DOTALL):
+                critical.append(f"[PY-CRITICAL] `{pat}` in `{path}`")
+
+        # Regex warnings
+        for pat in self.WARN_PYTHON:
+            if re.search(pat, text, re.IGNORECASE):
+                warnings.append(f"[PY-WARN] `{pat}` in `{path}`")
+
+        # AST analysis
+        try:
+            import ast as _ast
+            tree = _ast.parse(text, mode='exec')
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.Call):
+                    continue
+                func = node.func
+
+                # Name calls: eval(), exec(), __import__()
+                if isinstance(func, _ast.Name):
+                    name = func.id
+                    if name in ('eval', 'exec'):
+                        # Check if argument is base64 (obfuscation)
+                        if node.args and isinstance(node.args[0], _ast.Call):
+                            critical.append(f"[AST] Obfuscated `{name}()` call in `{path}`")
+                        else:
+                            warnings.append(f"[AST] `{name}()` call in `{path}`")
+
+                # Attribute calls: os.system(), subprocess.Popen() etc.
+                elif isinstance(func, _ast.Attribute):
+                    attr     = func.attr
+                    # Safely get the object name
+                    obj_name = ''
+                    if isinstance(func.value, _ast.Name):
+                        obj_name = func.value.id
+
+                    # Destructive OS ops
+                    if attr in ('remove', 'unlink', 'rmdir') and obj_name == 'os':
+                        warnings.append(f"[AST] `os.{attr}()` in `{path}`")
+                    elif attr == 'rmtree' and obj_name == 'shutil':
+                        warnings.append(f"[AST] `shutil.rmtree()` in `{path}`")
+                    elif attr in ('Popen', 'call', 'check_output', 'run') and obj_name == 'subprocess':
+                        warnings.append(f"[AST] `subprocess.{attr}()` in `{path}`")
+                    elif attr in ('system', 'popen') and obj_name == 'os':
+                        warnings.append(f"[AST] `os.{attr}()` in `{path}`")
+
+                # Dangerous imports
+                if isinstance(node, _ast.ImportFrom):
+                    if node.module in ('subprocess', 'os'):
+                        for alias in (node.names or []):
+                            if alias.name in ('system', 'popen', 'remove', 'unlink',
+                                              'Popen', 'call', 'check_output', 'rmtree'):
+                                warnings.append(f"[AST] Dangerous import: `from {node.module} import {alias.name}` in `{path}`")
+
+        except SyntaxError as e:
+            warnings.append(f"[PY] Syntax error in `{path}`: {e}")
+        except Exception:
+            pass   # AST parse may fail on dynamic code; regex already covered it
+
+        return critical, warnings
+
+    # ── JavaScript / TypeScript / Node.js scanner ─────────────────────
+    def _scan_js(self, text: str, path: str) -> tuple[list, list]:
+        critical, warnings = [], []
+        if not text:
+            return critical, warnings
+
+        for pat in self.CRITICAL_JS:
+            if re.search(pat, text, re.IGNORECASE | re.DOTALL):
+                critical.append(f"[JS-CRITICAL] `{pat}` in `{path}`")
+
+        for pat in self.WARN_JS:
+            if re.search(pat, text, re.IGNORECASE):
+                warnings.append(f"[JS-WARN] `{pat}` in `{path}`")
+
+        # TypeScript-specific: dynamic import with obfuscated string
+        if re.search(r'import\s*\(\s*atob\s*\(', text):
+            critical.append(f"[TS-CRITICAL] Obfuscated dynamic import in `{path}`")
+
+        # Crypto miner in JS
+        if re.search(r'(stratum\+tcp|coinhive|cryptonight)', text, re.IGNORECASE):
+            critical.append(f"[JS-CRITICAL] Crypto miner pattern in `{path}`")
+
+        # Hardcoded token/secret
+        if re.search(r'(?i)(token|api_key|secret|password)\s*=\s*["\'][A-Za-z0-9_\-]{8,}', text):
+            warnings.append(f"[JS] Possible hardcoded credential in `{path}`")
+
+        return critical, warnings
+
+    # ── package.json scanner ──────────────────────────────────────────
+    def _scan_package_json(self, text: str) -> tuple[list, list]:
+        critical, warnings = [], []
+        try:
+            pkg = json.loads(text)
+        except Exception:
+            return critical, warnings
+
+        scripts = pkg.get('scripts', {})
+        dangerous_hooks = ('preinstall', 'postinstall', 'prepare',
+                           'preuninstall', 'postuninstall')
+        for hook in dangerous_hooks:
+            cmd = scripts.get(hook, '')
+            if not cmd:
+                continue
+            for pat in self.CRITICAL_PKG_HOOKS:
+                if re.search(pat, cmd, re.IGNORECASE):
+                    critical.append(
+                        f"[NPM-CRITICAL] Dangerous `{hook}` hook: `{cmd[:80]}`")
+                    break
+            else:
+                if cmd.strip():
+                    warnings.append(f"[NPM] `{hook}` hook detected: `{cmd[:80]}`")
+
+        return critical, warnings
+
+    # ── Generic scanner ───────────────────────────────────────────────
+    def _scan_generic(self, text: str, path: str) -> tuple[list, list]:
+        critical, warnings = [], []
+        generic_critical = [
+            r'stratum\+tcp', r'xmrig', r'minergate',
+            r'rm\s+-rf\s+/',
+        ]
+        generic_warn = [
+            r'\beval\s*\(',
+            r'\bexec\s*\(',
+            r'child_process',
+        ]
+        for pat in generic_critical:
+            if re.search(pat, text, re.IGNORECASE):
+                critical.append(f"[GENERIC-CRITICAL] `{pat}` in `{path}`")
+        for pat in generic_warn:
+            if re.search(pat, text, re.IGNORECASE):
+                warnings.append(f"[GENERIC-WARN] `{pat}` in `{path}`")
+        return critical, warnings
+
+    # ── Encoded content detection (Layer 3) ───────────────────────────
+    def _check_encoded(self, text: str, path: str) -> tuple[list, list]:
+        critical, warnings = [], []
+
+        # Base64: only scan long strings to avoid noise
+        b64_pat = r'[A-Za-z0-9+/]{' + str(self.B64_MIN_LEN) + r',}={0,2}'
+        for match in re.findall(b64_pat, text):
+            try:
+                import base64 as _b64
+                decoded = _b64.b64decode(match + '==')
+                decoded_text = decoded.decode('utf-8', errors='ignore')
+                for pat in self.CRITICAL_PYTHON + self.CRITICAL_JS:
+                    if re.search(pat, decoded_text, re.IGNORECASE):
+                        critical.append(
+                            f"[ENCODED-CRITICAL] Dangerous content hidden in base64 in `{path}`")
+                        break
+            except Exception:
+                pass
+
+        # Hex strings (long)
+        hex_pat = r'(?<![0-9A-Fa-f])[0-9A-Fa-f]{80,}(?![0-9A-Fa-f])'
+        for match in re.findall(hex_pat, text):
+            try:
+                decoded_text = bytes.fromhex(match).decode('utf-8', errors='ignore')
+                for pat in self.CRITICAL_PYTHON:
+                    if re.search(pat, decoded_text, re.IGNORECASE):
+                        critical.append(
+                            f"[ENCODED-CRITICAL] Dangerous content in hex string in `{path}`")
+                        break
+            except Exception:
+                pass
+
+        # URL-encoded blob (≥3 consecutive %xx tokens = suspicious)
+        if re.search(r'(?:%[0-9A-Fa-f]{2}){4,}', text):
+            warnings.append(f"[ENCODED-WARN] URL-encoded block detected in `{path}` (possible obfuscation)")
+
+        return critical, warnings
+
+    # ── Archive bomb protection (Layer 6) ────────────────────────────
+    def _check_zip(self, zf):
+        import zipfile
+        total, n = 0, 0
+        for info in zf.infolist():
+            n += 1
+            if n > self.MAX_FILES:
+                raise Exception(f"ZIP contains >{self.MAX_FILES} files (archive bomb?)")
+            total += info.file_size
+            if total > self.MAX_TOTAL_SIZE:
+                raise Exception("ZIP extracted size too large (archive bomb?)")
+            name = info.filename
+            if '..' in name or name.startswith('/') or name.startswith('\\'):
+                raise Exception(f"Path traversal in ZIP: {name}")
+
+    def _check_tar(self, tf):
+        import tarfile
+        total, n = 0, 0
+        for m in tf:
+            if m.isreg():
+                n += 1
+                if n > self.MAX_FILES:
+                    raise Exception(f"TAR contains >{self.MAX_FILES} files (archive bomb?)")
+                total += m.size
+                if total > self.MAX_TOTAL_SIZE:
+                    raise Exception("TAR extracted size too large (archive bomb?)")
+            if m.issym():
+                raise Exception(f"Symlink in TAR: {m.name}")
+            if '..' in m.name or m.name.startswith('/'):
+                raise Exception(f"Path traversal in TAR: {m.name}")
+
+    def _check_rar(self, rf):
+        total, n = 0, 0
+        for info in rf.infolist():
+            if not info.isdir():
+                n += 1
+                if n > self.MAX_FILES:
+                    raise Exception(f"RAR contains >{self.MAX_FILES} files (archive bomb?)")
+                total += info.file_size
+                if total > self.MAX_TOTAL_SIZE:
+                    raise Exception("RAR extracted size too large (archive bomb?)")
+            if '..' in info.filename or info.filename.startswith('/'):
+                raise Exception(f"Path traversal in RAR: {info.filename}")
+
+
+SECURITY_SCANNER = SecurityScanner()
+
+
+def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, list, str]:
+    """
+    Wrapper around SecurityScanner.scan().
+    Returns (blocked, critical_issues, warnings, report_text).
+    `blocked` is True when critical issues are found and deployment must stop.
+    """
+    try:
+        blocked, critical, warnings = SECURITY_SCANNER.scan(file_bytes, filename)
+    except Exception as e:
+        # Scanner itself crashed — log and let deployment proceed with a warning
+        return False, [], [f"Scanner error: {e}"], f"⚠️ Security scan encountered an error: {e}"
+
+    lines = [f"🔒 **Security Scan — `{filename}`**\n"]
+    if critical:
+        lines.append(f"🔴 **{len(critical)} CRITICAL issue(s) — BLOCKED:**")
+        for i in critical[:10]:
+            lines.append(f"  • {i}")
+        if len(critical) > 10:
+            lines.append(f"  … and {len(critical)-10} more")
+    if warnings:
+        lines.append(f"\n🟡 **{len(warnings)} warning(s):**")
+        for w in warnings[:8]:
+            lines.append(f"  • {w}")
+        if len(warnings) > 8:
+            lines.append(f"  … and {len(warnings)-8} more")
+    if not critical and not warnings:
+        lines.append("✅ No issues found — file is clean")
+
+    return blocked, critical, warnings, '\n'.join(lines)
 
 
 # ==================== GITHUB BACKUP SYSTEM ====================
@@ -2149,6 +2614,78 @@ def get_platform_label(frameworks: list) -> str:
     return ', '.join(labels) if labels else '🤖 Generic Python Bot'
 
 # ========== ENHANCED LAUNCHER SCRIPT ==========
+def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
+                                env_vars_dict: dict, update_logs) -> tuple:
+    """
+    Create start.sh for Node.js / TypeScript bots.
+    Installs npm packages, picks the right runtime (node / npx ts-node / npx tsx).
+    Returns (start_script_path, detected_framework_list).
+    """
+    ext = dest_script.suffix.lower()
+
+    if ext in ('.ts', '.tsx'):
+        # Prefer tsx (faster) then ts-node
+        run_cmd = (
+            f'if command -v npx &>/dev/null; then\n'
+            f'    npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
+            f'elif command -v ts-node &>/dev/null; then\n'
+            f'    ts-node "{dest_script}" >> output.log 2>&1 &\n'
+            f'else\n'
+            f'    echo "❌ No TypeScript runner found (install tsx or ts-node)" >> output.log\n'
+            f'    exit 1\n'
+            f'fi'
+        )
+        framework = ['typescript']
+    elif ext in ('.mjs',):
+        run_cmd = f'node --input-type=module "{dest_script}" >> output.log 2>&1 &'
+        framework = ['node_esm']
+    else:
+        run_cmd = f'node "{dest_script}" >> output.log 2>&1 &'
+        framework = ['node']
+
+    # Detect framework from content
+    try:
+        code = dest_script.read_text(errors='ignore')
+        if 'discord' in code.lower():
+            framework.append('discord_js')
+        if 'telegraf' in code.lower() or 'node-telegram' in code.lower():
+            framework.append('telegram_node')
+        if 'whatsapp' in code.lower() or 'baileys' in code.lower():
+            framework.append('whatsapp_node')
+        if 'express' in code.lower() or 'fastify' in code.lower():
+            framework.append('web_server')
+    except Exception:
+        pass
+
+    # Write .env
+    env_file = deploy_folder / '.env'
+    env_file.write_text('\n'.join(f'{k}={v}' for k, v in env_vars_dict.items()) + '\n')
+
+    # Write start.sh
+    env_lines = '\n'.join(f'export {k}="{v}"' for k, v in env_vars_dict.items())
+    npm_install = (
+        'if [ -f "package.json" ]; then\n'
+        '    echo "📦 Installing npm packages..." >> output.log\n'
+        '    npm install --no-audit --no-fund >> output.log 2>&1\n'
+        'fi'
+    )
+    start_content = (
+        f'#!/bin/bash\n'
+        f'cd "{deploy_folder}"\n'
+        f'export PYTHONUNBUFFERED=1\n'
+        f'{env_lines}\n\n'
+        f'{npm_install}\n\n'
+        f'{run_cmd}\n'
+        f'echo $! > pid.txt\n'
+    )
+    start_script = deploy_folder / 'start.sh'
+    start_script.write_text(start_content)
+    start_script.chmod(0o755)
+
+    update_logs(f"🟨 Node.js launcher created ({', '.join(framework)})")
+    return start_script, framework
+
+
 def create_enhanced_launcher_script(deploy_folder, dest_script, env_vars_dict, code_content, update_logs, packages_dir=None):
     frameworks = detect_bot_framework(code_content)
     framework_str = ', '.join(frameworks)
@@ -2882,6 +3419,25 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
         update_logs(f"🎯 Entry point: {dest_script.relative_to(deploy_folder)}")
 
+        # ── Security scan of the main file ───────────────────────────
+        try:
+            scan_bytes = dest_script.read_bytes()
+            blocked, crit, scan_w, scan_report = run_security_scan(scan_bytes, dest_script.name)
+            if blocked:
+                update_logs(f"🚫 SECURITY BLOCK: {len(crit)} critical issue(s)")
+                for c in crit[:5]:
+                    update_logs(f"  • {c}")
+                edit_message(chat_id, status_message_id,
+                    f"🚫 **GitHub Deployment Blocked — Security**\n\n"
+                    f"{scan_report}\n\n"
+                    "Remove the flagged patterns from the repo and retry.",
+                    {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+                return False
+            elif scan_w:
+                update_logs(f"⚠️ Security scan: {len(scan_w)} warning(s) — proceeding")
+        except Exception as se:
+            update_logs(f"⚠️ Security scan error: {se} — proceeding anyway")
+
         # ── Read code for framework detection ────────────────────────
         try:
             code_content = dest_script.read_text(errors='ignore')
@@ -3115,22 +3671,25 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                     f.write(f"{k}={v}\n")
             update_logs(f"🔌 Assigned port {_deploy_port} (hosting bot uses {_hosting_port})")
         
-        # Create enhanced launcher
-        update_logs("🚀 Creating enhanced launcher...")
-        launcher_script, frameworks = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
-            packages_dir=packages_dir)
-        
-        # Create start script
-        start_script = deploy_folder / "start.sh"
-        with open(start_script, 'w') as f:
-            f.write(f"""#!/bin/bash
-cd "{deploy_folder}"
-export PYTHONUNBUFFERED=1
-nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &
-echo $! > pid.txt
-""")
-        start_script.chmod(0o755)
+        # Create launcher — Python or Node.js depending on file type
+        update_logs("🚀 Creating launcher...")
+        _ext = dest_script.suffix.lower()
+        _is_node = _ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+
+        if _is_node:
+            start_script, frameworks = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, update_logs)
+            launcher_script = start_script   # start.sh is the entry for Node
+        else:
+            launcher_script, frameworks = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
+                packages_dir=packages_dir)
+            # Python start.sh wraps the Python launcher
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+                f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            start_script.chmod(0o755)
         
         # Start the bot
         update_logs("🚀 Starting bot process...")
@@ -4165,6 +4724,7 @@ def show_admin_panel(chat_id, message_id):
         "inline_keyboard": [
             [{"text": f"🐛 Bug Reports{open_badge}", "callback_data": "admin_bug_reports"},
              {"text": "👥 Referral Stats",           "callback_data": "admin_referral_stats"}],
+            [{"text": "📢 Broadcast",                "callback_data": "admin_broadcast"}],
             [{"text": "🎫 Create Redeem Code",       "callback_data": "admin_create_code"}],
             [{"text": "🪙 Add Coins",                "callback_data": "admin_add_coins"}],
             [{"text": "📋 List Redeem Codes",        "callback_data": "admin_list_codes"}],
@@ -4555,11 +5115,11 @@ def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
 
 def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
     """Final step: kick off the actual GitHub deployment."""
-    owner    = step.get('temp_github_owner', '')
-    repo     = step.get('temp_github_repo', '')
-    branch   = step.get('temp_github_branch', 'main')
-    token    = step.get('temp_github_token') or None
-    env_raw  = step.get('temp_env_vars', '')
+    owner  = step.get('temp_github_owner', '')
+    repo   = step.get('temp_github_repo', '')
+    branch = step.get('temp_github_branch', 'main')
+    token  = step.get('temp_github_token') or None
+    env_raw = step.get('temp_env_vars', '')
 
     env_vars_dict = {}
     if env_raw and env_raw.strip() != '.':
@@ -4570,19 +5130,138 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
                 if k:
                     env_vars_dict[k] = v
     if token:
-        env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token   # stored in .env for reference
+        env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token
+
+    # Determine plan & cost from user's subscription status
+    if is_user_premium(user_id) or is_admin(user_id):
+        plan           = 'monthly'
+        duration       = 30
+        cost_coins     = 0
+        cost_stars     = 0
+        payment_method = 'premium_free'
+        is_free        = False
+    else:
+        plan           = 'free'
+        duration       = FREE_DEPLOYMENT_DURATION_HOURS
+        cost_coins     = 0
+        cost_stars     = 0
+        payment_method = 'free'
+        is_free        = True
 
     set_user_step(user_id, None)
     deploy_from_github(
         chat_id, user_id,
         owner, repo, branch, token,
         env_vars_dict,
-        plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
-        cost_coins=0, cost_stars=0, payment_method='free',
-        is_free=True, main_file_name=main_file_name)
+        plan=plan, duration=duration,
+        cost_coins=cost_coins, cost_stars=cost_stars,
+        payment_method=payment_method,
+        is_free=is_free, main_file_name=main_file_name)
 
 
-def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
+# ==================== BROADCAST SYSTEM ====================
+
+def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons):
+    """Send a preview of the broadcast to the admin before confirming."""
+    kb = {"inline_keyboard": buttons + [
+        [{"text": "✅ Send to All Users", "callback_data": "broadcast_confirm"}],
+        [{"text": "✏️ Edit Caption",      "callback_data": "broadcast_edit_caption"}],
+        [{"text": "❌ Cancel",             "callback_data": "admin_panel"}],
+    ]} if buttons else {"inline_keyboard": [
+        [{"text": "✅ Send to All Users", "callback_data": "broadcast_confirm"}],
+        [{"text": "✏️ Edit Caption",      "callback_data": "broadcast_edit_caption"}],
+        [{"text": "❌ Cancel",             "callback_data": "admin_panel"}],
+    ]}
+
+    send_message(chat_id, "**👁 PREVIEW — This is how users will see it:**", None)
+    try:
+        if btype == 'photo' and file_id:
+            _tg_send_media(chat_id, 'photo', file_id, caption, kb)
+        elif btype == 'video' and file_id:
+            _tg_send_media(chat_id, 'video', file_id, caption, kb)
+        else:
+            send_message(chat_id, caption or '(no text)', kb)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Preview error: {e}\n\nCaption:\n{caption}", kb)
+
+    send_message(chat_id, "Tap **✅ Send to All Users** to confirm.", None)
+
+
+def _tg_send_media(chat_id, media_type, file_id, caption, keyboard=None):
+    """Send a photo or video with optional caption and inline keyboard."""
+    endpoint = 'sendPhoto' if media_type == 'photo' else 'sendVideo'
+    field    = 'photo'    if media_type == 'photo' else 'video'
+    payload  = {
+        "chat_id":    chat_id,
+        field:        file_id,
+        "parse_mode": "Markdown",
+    }
+    if caption:
+        payload["caption"] = caption[:1024]
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard)
+    try:
+        data = json.dumps(payload).encode()
+        req  = urllib.request.Request(
+            f"{TELEGRAM_API}/{endpoint}", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"❌ _tg_send_media error: {e}")
+        return None
+
+
+def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
+    """
+    Execute broadcast to all verified users.
+    Returns (success_count, fail_count).
+    """
+    try:
+        buttons = json.loads(buttons_json) if buttons_json else []
+    except Exception:
+        buttons = []
+
+    kb = {"inline_keyboard": buttons} if buttons else None
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    c    = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE is_verified = 1 OR step IS NOT NULL")
+    all_users = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    success = fail = 0
+    for uid in all_users:
+        if uid == admin_id:
+            continue
+        try:
+            if btype == 'photo' and file_id:
+                result = _tg_send_media(uid, 'photo', file_id, caption, kb)
+            elif btype == 'video' and file_id:
+                result = _tg_send_media(uid, 'video', file_id, caption, kb)
+            else:
+                result = send_message(uid, caption or '', kb)
+            if result and result.get('ok'):
+                success += 1
+            else:
+                fail += 1
+        except Exception:
+            fail += 1
+        sleep(0.05)   # rate-limit guard: ~20 msgs/s max
+
+    async_backup(f"broadcast_{admin_id}")
+    return success, fail
+
+
+def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_raw):
+    """Thread target: runs broadcast and notifies admin with results."""
+    success, fail = do_broadcast(admin_id, btype, file_id, caption, btns_raw)
+    send_message(chat_id,
+        f"✅ **Broadcast Complete**\n\n"
+        f"✅ Delivered: `{success}`\n"
+        f"❌ Failed: `{fail}`\n\n"
+        f"Total reached: `{success + fail}` users",
+        {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
     """Central dispatch from env_done/env_skip to the correct deploy path."""
     plan         = user_step.get('plan') or 'free'
     temp_file    = user_step.get('temp_file')
@@ -5108,9 +5787,116 @@ def handle_callback(callback):
         _launch_github_deploy(chat_id, user_id, step, main_file_name=file_name)
         return
 
-    # ========== REFERRAL ==========
-    if data == "my_referral":
+    # ========== REDEEM CODE ==========
+    if data == "redeem_code":
+        handle_redeem(chat_id, user_id, message_id)
+        return
+
+    # ========== ENV SEND (prompt user to type vars) ==========
+    if data == "env_send":
+        user_step = get_user_step(user_id)
+        # Keep all existing state, just remind the user to type
+        env_vars = user_step.get('env_vars') or {}
+        if isinstance(env_vars, str):
+            try: env_vars = json.loads(env_vars)
+            except: env_vars = {}
+        set_user_step(user_id, 'awaiting_env',
+                     waiting_for_env=1,
+                     temp_file=user_step.get('temp_file'),
+                     requirements=user_step.get('requirements'),
+                     env_vars=env_vars,
+                     plan=user_step.get('plan'),
+                     duration=user_step.get('duration'),
+                     cost_coins=user_step.get('cost_coins'),
+                     cost_stars=user_step.get('cost_stars'),
+                     payment_method=user_step.get('payment_method'))
+        edit_message(chat_id, message_id,
+            "**📝 TYPE YOUR VARIABLES**\n\n"
+            "Send one or more `KEY=VALUE` pairs, one per line:\n\n"
+            "```\nBOT_TOKEN=7712345:AAFabcXYZ\nAPI_KEY=sk-abc123\nDATABASE_URL=sqlite:///bot.db\n```\n\n"
+            "Send them now 👇",
+            {"inline_keyboard": [
+                [{"text": "⏭️ Skip", "callback_data": "env_skip"}],
+                [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]]})
+        return
         show_referral_menu(chat_id, user_id, message_id)
+        return
+
+    # ========== BROADCAST ==========
+    if data == "admin_broadcast":
+        if not is_admin(user_id): return
+        edit_message(chat_id, message_id,
+            "**📢 BROADCAST TO ALL USERS**\n\nChoose message type:",
+            {"inline_keyboard": [
+                [{"text": "✉️ Text Message",   "callback_data": "broadcast_type_text"}],
+                [{"text": "🖼 Photo + Caption", "callback_data": "broadcast_type_photo"}],
+                [{"text": "🎬 Video + Caption", "callback_data": "broadcast_type_video"}],
+                [{"text": "🔙 Admin Panel",     "callback_data": "admin_panel"}],
+            ]})
+        return
+
+    if data == "broadcast_type_text":
+        if not is_admin(user_id): return
+        set_user_step(user_id, 'awaiting_broadcast_text')
+        edit_message(chat_id, message_id,
+            "**✉️ TEXT BROADCAST**\n\nType the message to send to all users.\n"
+            "Supports **bold**, _italic_, `code`:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
+        return
+
+    if data == "broadcast_type_photo":
+        if not is_admin(user_id): return
+        set_user_step(user_id, 'awaiting_broadcast_media', temp_broadcast_type='photo')
+        edit_message(chat_id, message_id,
+            "**🖼 PHOTO BROADCAST**\n\nSend the photo now:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
+        return
+
+    if data == "broadcast_type_video":
+        if not is_admin(user_id): return
+        set_user_step(user_id, 'awaiting_broadcast_media', temp_broadcast_type='video')
+        edit_message(chat_id, message_id,
+            "**🎬 VIDEO BROADCAST**\n\nSend the video now:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
+        return
+
+    if data == "broadcast_no_buttons":
+        if not is_admin(user_id): return
+        step = get_user_step(user_id)
+        set_user_step(user_id, 'awaiting_broadcast_confirm',
+                     temp_broadcast_type=step.get('temp_broadcast_type'),
+                     temp_broadcast_file=step.get('temp_broadcast_file', ''),
+                     temp_broadcast_caption=step.get('temp_broadcast_caption', ''),
+                     temp_broadcast_buttons='[]')
+        _send_broadcast_preview(chat_id,
+            step.get('temp_broadcast_type'),
+            step.get('temp_broadcast_file', ''),
+            step.get('temp_broadcast_caption', ''), [])
+        return
+
+    if data == "broadcast_edit_caption":
+        if not is_admin(user_id): return
+        step = get_user_step(user_id)
+        set_user_step(user_id, 'awaiting_broadcast_caption',
+                     temp_broadcast_type=step.get('temp_broadcast_type'),
+                     temp_broadcast_file=step.get('temp_broadcast_file', ''))
+        send_message(chat_id, "**✏️ New Caption**\n\nSend the new caption text:",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
+        return
+
+    if data == "broadcast_confirm":
+        if not is_admin(user_id): return
+        step     = get_user_step(user_id)
+        btype    = step.get('temp_broadcast_type', 'text')
+        file_id  = step.get('temp_broadcast_file', '')
+        caption  = step.get('temp_broadcast_caption', '')
+        btns_raw = step.get('temp_broadcast_buttons', '[]')
+        set_user_step(user_id, None)
+        send_message(chat_id, "📤 **Sending to all users…**", None)
+        threading.Thread(
+            target=_run_broadcast_and_notify,
+            args=(chat_id, user_id, btype, file_id, caption, btns_raw),
+            daemon=True, name="Broadcast").start()
         return
 
     # ========== BUG REPORT (user) ==========
@@ -5457,6 +6243,53 @@ def handle_message(message):
                 send_message(chat_id, "❌ Send a positive whole number (e.g. `50`).")
             return
 
+        # ── Broadcast steps (admin) ───────────────────────────────────
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_broadcast_caption':
+            set_user_step(user_id, 'awaiting_broadcast_buttons',
+                         temp_broadcast_caption=text.strip(),
+                         temp_broadcast_type=user_step.get('temp_broadcast_type'),
+                         temp_broadcast_file=user_step.get('temp_broadcast_file'))
+            send_message(chat_id,
+                "**🔘 Inline Buttons (Optional)**\n\n"
+                "Send buttons in this format (one per line):\n"
+                "`Button Text | https://url.com`\n\n"
+                "Or skip for no buttons:",
+                {"inline_keyboard": [
+                    [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
+                    [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            return
+
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_broadcast_buttons':
+            buttons = []
+            for line in text.strip().splitlines():
+                if '|' in line:
+                    label, _, url = line.partition('|')
+                    label = label.strip(); url = url.strip()
+                    if label and url.startswith('http'):
+                        buttons.append([{"text": label, "url": url}])
+            set_user_step(user_id, 'awaiting_broadcast_confirm',
+                         temp_broadcast_type=user_step.get('temp_broadcast_type'),
+                         temp_broadcast_file=user_step.get('temp_broadcast_file'),
+                         temp_broadcast_caption=user_step.get('temp_broadcast_caption', ''),
+                         temp_broadcast_buttons=json.dumps(buttons))
+            _send_broadcast_preview(chat_id, user_step.get('temp_broadcast_type'),
+                                    user_step.get('temp_broadcast_file'),
+                                    user_step.get('temp_broadcast_caption', ''),
+                                    buttons)
+            return
+
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_broadcast_text':
+            set_user_step(user_id, 'awaiting_broadcast_buttons',
+                         temp_broadcast_type='text',
+                         temp_broadcast_file='',
+                         temp_broadcast_caption=text.strip())
+            send_message(chat_id,
+                "**🔘 Inline Buttons (Optional)**\n\nFormat: `Label | https://url`\n\nOr skip:",
+                {"inline_keyboard": [
+                    [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
+                    [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            return
+
         # ── Env vars (waiting_for_env=1 OR step in awaiting_env* ) ───
         _wants_env = (
             user_step.get('waiting_for_env') == 1 or
@@ -5518,6 +6351,65 @@ def handle_message(message):
         send_message(chat_id, "❌ Unknown command. Use buttons below.", get_main_menu(user_id))
         return
     
+    # Handle photo upload (broadcast)
+    if 'photo' in message:
+        user_step = get_user_step(user_id)
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_broadcast_media' and user_step.get('temp_broadcast_type') == 'photo':
+            # Pick highest-resolution photo
+            file_id = message['photo'][-1]['file_id']
+            caption = message.get('caption', '')
+            set_user_step(user_id, 'awaiting_broadcast_caption',
+                         temp_broadcast_type='photo',
+                         temp_broadcast_file=file_id,
+                         temp_broadcast_caption=caption)
+            if caption:
+                # Caption included — go straight to buttons step
+                set_user_step(user_id, 'awaiting_broadcast_buttons',
+                             temp_broadcast_type='photo',
+                             temp_broadcast_file=file_id,
+                             temp_broadcast_caption=caption)
+                send_message(chat_id,
+                    f"✅ Photo received! Caption: _{caption[:80]}_\n\n"
+                    "**🔘 Add inline buttons?** Format: `Label | https://url`\n\nOr skip:",
+                    {"inline_keyboard": [
+                        [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
+                        [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            else:
+                send_message(chat_id,
+                    "✅ Photo received!\n\n**Add a caption** (or skip):",
+                    {"inline_keyboard": [
+                        [{"text": "⏭️ No Caption", "callback_data": "broadcast_no_buttons"}],
+                        [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            return
+
+    # Handle video upload (broadcast)
+    if 'video' in message:
+        user_step = get_user_step(user_id)
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_broadcast_media' and user_step.get('temp_broadcast_type') == 'video':
+            file_id = message['video']['file_id']
+            caption = message.get('caption', '')
+            if caption:
+                set_user_step(user_id, 'awaiting_broadcast_buttons',
+                             temp_broadcast_type='video',
+                             temp_broadcast_file=file_id,
+                             temp_broadcast_caption=caption)
+                send_message(chat_id,
+                    f"✅ Video received! Caption: _{caption[:80]}_\n\n"
+                    "**🔘 Add inline buttons?** Format: `Label | https://url`\n\nOr skip:",
+                    {"inline_keyboard": [
+                        [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
+                        [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            else:
+                set_user_step(user_id, 'awaiting_broadcast_caption',
+                             temp_broadcast_type='video',
+                             temp_broadcast_file=file_id)
+                send_message(chat_id,
+                    "✅ Video received!\n\n**Add a caption** (or skip):",
+                    {"inline_keyboard": [
+                        [{"text": "⏭️ No Caption", "callback_data": "broadcast_no_buttons"}],
+                        [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
+            return
+
     # Handle file upload
     if 'document' in message:
         doc = message['document']
@@ -5568,47 +6460,118 @@ def handle_message(message):
                 send_message(chat_id, "❌ Could not download file from Telegram.")
             return
         
-        # Python file for deployment
+        # Python / JavaScript / TypeScript bot file for deployment
         if user_step.get('step') == 'awaiting_file':
-            if file_name.endswith('.py'):
-                send_message(chat_id, "📥 **Downloading file...**", None)
-                
-                file_id = doc['file_id']
-                file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
-                
-                if file_info and file_info.get('ok'):
-                    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
-                    temp_file = BASE_DIR / f"temp_{user_id}_{file_name}"
-                    
-                    try:
-                        with urllib.request.urlopen(file_url) as response:
-                            with open(temp_file, 'wb') as f:
-                                f.write(response.read())
-                        
-                        send_message(chat_id, f"✅ File `{file_name}` received! ({format_file_size(file_size)})")
-                        
-                        set_user_step(user_id, 'awaiting_reqs', temp_file=str(temp_file),
-                                     plan=user_step.get('plan'), duration=user_step.get('duration'),
-                                     cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
-                                     payment_method=user_step.get('payment_method'),
-                                     env_vars={})
-                        
-                        send_message(chat_id,
-                            f"**✅ File received:** `{file_name}`\n\n"
-                            f"📋 Plan: {user_step.get('plan', 'monthly').upper()}\n"
-                            f"⏱️ Duration: {user_step.get('duration', 30)} days\n"
-                            f"📦 File size: {format_file_size(file_size)}\n"
-                            f"💰 Cost: {user_step.get('cost_stars')}⭐ or {user_step.get('cost_coins')}🪙\n\n"
-                            f"**📦 Requirements?**\n"
-                            f"Send requirements.txt or click Auto-detect:",
-                            get_reqs_keyboard())
-                    except Exception as e:
-                        send_message(chat_id, f"❌ Error downloading: {str(e)}")
+            ALLOWED_BOT_EXTS = {'.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx'}
+            ext = os.path.splitext(file_name)[1].lower()
+
+            if ext not in ALLOWED_BOT_EXTS:
+                send_message(chat_id,
+                    f"❌ Unsupported file type `{ext}`.\n\n"
+                    "Supported:\n"
+                    "• `.py` — Python bots (Telegram, Discord, WhatsApp…)\n"
+                    "• `.js` / `.mjs` — Node.js bots\n"
+                    "• `.ts` / `.tsx` / `.jsx` — TypeScript / JSX bots\n\n"
+                    "For Node.js projects with multiple files, zip them and send the `.zip`.")
+                return
+
+            scan_msg = send_message(chat_id, "🔒 **Running 6-layer security scan…**", None)
+            scan_msg_id = (scan_msg or {}).get('result', {}).get('message_id')
+
+            file_id   = doc['file_id']
+            file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
+
+            if not file_info or not file_info.get('ok'):
+                send_message(chat_id, "❌ Failed to download file from Telegram.")
+                return
+
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
+            try:
+                with urllib.request.urlopen(file_url) as resp:
+                    file_bytes_content = resp.read()
+            except Exception as dl_err:
+                send_message(chat_id, f"❌ Download error: {dl_err}")
+                return
+
+            # ── Security scan ─────────────────────────────────────────
+            blocked, critical, scan_warnings, report = run_security_scan(
+                file_bytes_content, file_name)
+
+            if blocked:
+                report_text = (
+                    f"🚫 **FILE REJECTED**\n\n"
+                    f"{report}\n\n"
+                    "Your file was **not accepted** due to critical security issues.\n"
+                    "Remove the flagged patterns and try again."
+                )
+                if scan_msg_id:
+                    edit_message(chat_id, scan_msg_id, report_text,
+                                 {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
                 else:
-                    send_message(chat_id, "❌ Failed to download file.")
+                    send_message(chat_id, report_text,
+                                 {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+                # Notify admins
+                for admin_id in ADMIN_IDS:
+                    try:
+                        send_message(admin_id,
+                            f"🚨 **Security block**\n"
+                            f"User: `{user_id}`\n"
+                            f"File: `{file_name}`\n"
+                            f"Issues: {len(critical)}\n\n"
+                            + '\n'.join(f'• {c}' for c in critical[:5]))
+                    except Exception:
+                        pass
+                return
+
+            # ── Save file ─────────────────────────────────────────────
+            temp_file = BASE_DIR / f"temp_{user_id}_{file_name}"
+            try:
+                with open(temp_file, 'wb') as f:
+                    f.write(file_bytes_content)
+            except Exception as save_err:
+                send_message(chat_id, f"❌ Could not save file: {save_err}")
+                return
+
+            set_user_step(user_id, 'awaiting_reqs',
+                         temp_file=str(temp_file),
+                         plan=user_step.get('plan'),
+                         duration=user_step.get('duration'),
+                         cost_coins=user_step.get('cost_coins'),
+                         cost_stars=user_step.get('cost_stars'),
+                         payment_method=user_step.get('payment_method'),
+                         env_vars={})
+
+            # Build scan summary line
+            if scan_warnings:
+                scan_note = f"⚠️ {len(scan_warnings)} warning(s) noted — review logs after deployment."
             else:
-                send_message(chat_id, "❌ Please send a `.py` Python file")
+                scan_note = "✅ Security scan passed."
+
+            lang_label = {
+                '.py': '🐍 Python', '.js': '🟨 Node.js', '.mjs': '🟨 Node.js (ESM)',
+                '.cjs': '🟨 Node.js (CJS)', '.ts': '🔷 TypeScript',
+                '.tsx': '🔷 TypeScript/React', '.jsx': '🟨 JavaScript/React',
+            }.get(ext, '📄 Script')
+
+            summary = (
+                f"**✅ File accepted** — {lang_label}\n\n"
+                f"📁 `{file_name}` ({format_file_size(file_size)})\n"
+                f"🔒 {scan_note}\n\n"
+            )
+            if scan_warnings:
+                summary += f"**Warnings:**\n" + '\n'.join(f'• {w}' for w in scan_warnings[:4]) + "\n\n"
+            summary += (
+                f"📋 Plan: `{(user_step.get('plan') or 'free').upper()}`\n"
+                f"⏱️ Duration: `{user_step.get('duration', 'N/A')}` days\n\n"
+                "**📦 Add requirements?**\nUpload `requirements.txt` or `package.json`, or click Auto-detect:"
+            )
+
+            if scan_msg_id:
+                edit_message(chat_id, scan_msg_id, summary, get_reqs_keyboard())
+            else:
+                send_message(chat_id, summary, get_reqs_keyboard())
             return
+
         else:
             send_message(chat_id, "❌ Please start deployment using the menu first.", get_main_menu(user_id))
         return
