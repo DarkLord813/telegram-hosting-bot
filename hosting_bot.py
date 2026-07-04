@@ -5262,6 +5262,9 @@ def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_r
         f"❌ Failed: `{fail}`\n\n"
         f"Total reached: `{success + fail}` users",
         {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+
+
+def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
     """Central dispatch from env_done/env_skip to the correct deploy path."""
     plan         = user_step.get('plan') or 'free'
     temp_file    = user_step.get('temp_file')
