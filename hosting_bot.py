@@ -25,13 +25,27 @@ import random
 # Get configuration from environment variables (SECURE)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN environment variable not set!")
-    print("Please set: export BOT_TOKEN='your_bot_token'")
-    sys.exit(1)
+    for _alias in ("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "TOKEN", "API_TOKEN", "TG_BOT_TOKEN"):
+        BOT_TOKEN = os.environ.get(_alias, "")
+        if BOT_TOKEN:
+            os.environ["BOT_TOKEN"] = BOT_TOKEN
+            print(f"ℹ️  BOT_TOKEN set from {_alias}")
+            break
+if not BOT_TOKEN:
+    print("⚠️  WARNING: No bot token found. Set BOT_TOKEN env var before deploying.")
+    BOT_TOKEN = "MISSING_TOKEN"
 
-# Get admin IDs from environment (comma-separated)
-admin_ids_str = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+# Get admin IDs from environment (comma-separated, robust parsing)
+admin_ids_str = os.environ.get("ADMIN_IDS", "7713987088")
+ADMIN_IDS = set()
+for _x in admin_ids_str.replace(";", ",").split(","):
+    try:
+        if _x.strip(): ADMIN_IDS.add(int(_x.strip()))
+    except ValueError:
+        pass
+if not ADMIN_IDS:
+    ADMIN_IDS = {7713987088}
+    print("⚠️  ADMIN_IDS not set or invalid — using default admin ID")
 
 # Channel verification settings (configure via env)
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@gamerdroidbot2")
@@ -1047,8 +1061,42 @@ def create_progress_bar(percentage: float, width: int = 30, filled_char: str = "
     return f"[{bar}] {percentage:.1f}%"
 
 # ========== HELPER FUNCTIONS ==========
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def db_execute(query, params=(), fetch='none', retries=5, delay=0.2):
+    """
+    Thread-safe SQLite helper with automatic retry on SQLITE_BUSY/LOCKED.
+    fetch='none' → no return, 'one' → fetchone(), 'all' → fetchall()
+    """
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            c = conn.cursor()
+            c.execute(query, params)
+            conn.commit()
+            if fetch == 'one':
+                return c.fetchone()
+            if fetch == 'all':
+                return c.fetchall()
+            return True
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower() or 'busy' in str(e).lower():
+                if attempt < retries - 1:
+                    sleep(delay * (attempt + 1))
+                    continue
+            print(f"❌ DB OperationalError: {e} | Query: {query[:80]}")
+            return None
+        except sqlite3.IntegrityError as e:
+            print(f"⚠️ DB IntegrityError (ignored): {e}")
+            return None
+        except Exception as e:
+            print(f"❌ DB error: {e}")
+            return None
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+    return None
 
 def get_user_info(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -1531,34 +1579,62 @@ def notify_admin(message):
             print(f"Failed to notify admin {admin_id}: {e}")
 
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
-    url = f"{TELEGRAM_API}/sendMessage"
-    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    url  = f"{TELEGRAM_API}/sendMessage"
+    data = {"chat_id": chat_id, "text": str(text or '')[:4096], "parse_mode": parse_mode}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
-    
-    try:
-        data_bytes = json.dumps(data).encode('utf-8')
-        req = urllib.request.Request(url, data=data_bytes, headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        print(f"Send error: {e}")
-        return None
+    for _attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 429:          # rate limit
+                sleep(2 * (_attempt + 1))
+                continue
+            body = ''
+            try: body = e.read().decode()[:200]
+            except Exception: pass
+            print(f"Send HTTP {e.code}: {body}")
+            return None
+        except Exception as e:
+            print(f"Send error (attempt {_attempt+1}): {e}")
+            if _attempt < 2:
+                sleep(1)
+    return None
 
 def edit_message(chat_id, message_id, text, keyboard=None):
-    url = f"{TELEGRAM_API}/editMessageText"
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    if not message_id:          # Error 31/10: guard against None message_id
+        send_message(chat_id, str(text or '')[:4096], keyboard)
+        return None
+    url  = f"{TELEGRAM_API}/editMessageText"
+    data = {"chat_id": chat_id, "message_id": message_id,
+            "text": str(text or '')[:4096], "parse_mode": "Markdown"}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
-    
-    try:
-        data_bytes = json.dumps(data).encode('utf-8')
-        req = urllib.request.Request(url, data=data_bytes, headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        print(f"Edit error: {e}")
-        return None
+    for _attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                sleep(2 * (_attempt + 1))
+                continue
+            if e.code == 400:   # message not modified / too old — silently ignore
+                return None
+            print(f"Edit HTTP {e.code}")
+            return None
+        except Exception as e:
+            print(f"Edit error (attempt {_attempt+1}): {e}")
+            if _attempt < 2:
+                sleep(1)
+    return None
 
 def answer_callback(callback_id, text=None, show_alert=False):
     url = f"{TELEGRAM_API}/answerCallbackQuery"
@@ -2820,102 +2896,25 @@ print("🚀 STARTING BOT")
 print("=" * 50)
 sys.stdout.flush()
 
-# ── Token aliasing: bridge common token variable names ────────────────────
-# Many bots use different env var names for the same token.
-# We copy whichever is set to all the others so the bot finds it regardless.
+# ── Token aliasing ────────────────────────────────────────────────────────
+# Bridge all common token env var names so the bot finds its token regardless
+# of which variable name it reads.
 _TOKEN_ALIASES = ['BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
-                  'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN']
+                  'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+                  'DISCORD_TOKEN']
 _found_token = None
 for _alias in _TOKEN_ALIASES:
-    _found_token = os.environ.get(_alias)
-    if _found_token:
+    _t = os.environ.get(_alias, '')
+    if _t:
+        _found_token = _t
         break
 if _found_token:
     for _alias in _TOKEN_ALIASES:
         if not os.environ.get(_alias):
             os.environ[_alias] = _found_token
-    print(f"✅ Token aliased to all common names")
+    print("✅ Token env vars bridged")
 else:
-    print("⚠️  No token found — set BOT_TOKEN or TELEGRAM_TOKEN in env vars")
-
-# ── Pre-install critical packages from bot file imports ───────────────────
-# This runs BEFORE Method 1 import so packages are available immediately.
-_PKG_INSTALL_MAP = {{
-    'telebot':       'pyTelegramBotAPI',
-    'telegram':      'python-telegram-bot',
-    'aiogram':       'aiogram',
-    'pyrogram':      'pyrogram',
-    'telethon':      'telethon',
-    'discord':       'discord.py',
-    'nextcord':      'nextcord',
-    'disnake':       'disnake',
-    'slack_sdk':     'slack-sdk',
-    'slack_bolt':    'slack-bolt',
-    'tweepy':        'tweepy',
-    'linebot':       'line-bot-sdk',
-    'viberbot':      'viberbot',
-    'pywa':          'pywa',
-    'flask':         'flask',
-    'fastapi':       'fastapi',
-    'uvicorn':       'uvicorn',
-    'aiohttp':       'aiohttp',
-    'dotenv':        'python-dotenv',
-    'requests':      'requests',
-    'httpx':         'httpx',
-    'pydantic':      'pydantic',
-    'sqlalchemy':    'SQLAlchemy',
-    'motor':         'motor',
-    'pymongo':       'pymongo',
-    'redis':         'redis',
-    'celery':        'celery',
-    'aiosqlite':     'aiosqlite',
-    'tortoise':      'tortoise-orm',
-    'loguru':        'loguru',
-}}
-
-def _pre_install(bot_file):
-    """Scan bot file imports and install any missing packages."""
-    try:
-        import importlib.util as _ilu, subprocess as _sp, re as _re
-        with open(bot_file, 'r', errors='ignore') as _f:
-            _code = _f.read()
-
-        # Extract top-level module names from import statements
-        _imported = set()
-        for _m in _re.findall(r'^import\\s+([\\w]+)', _code, _re.M):
-            _imported.add(_m)
-        for _m in _re.findall(r'^from\\s+([\\w]+)', _code, _re.M):
-            _imported.add(_m)
-
-        _to_install = []
-        for _mod, _pkg in _PKG_INSTALL_MAP.items():
-            if _mod in _imported:
-                # Check if already importable
-                if _ilu.find_spec(_mod) is None:
-                    _to_install.append(_pkg)
-
-        if _to_install:
-            print(f"📦 Auto-installing {len(_to_install)} missing package(s): {{', '.join(_to_install)}}")
-            sys.stdout.flush()
-            _pkg_dir = r"{packages_dir_str}"
-            for _pkg in _to_install:
-                _cmd = [sys.executable, '-m', 'pip', 'install', '--quiet',
-                        '--no-warn-script-location', '--disable-pip-version-check']
-                if _pkg_dir and os.path.isdir(_pkg_dir):
-                    _cmd += ['--target', _pkg_dir]
-                _cmd.append(_pkg)
-                _r = _sp.run(_cmd, capture_output=True, timeout=120)
-                _ok = '✅' if _r.returncode == 0 else '❌'
-                print(f"  {{_ok}} {{_pkg}}")
-                sys.stdout.flush()
-        else:
-            print("✅ All required packages already installed")
-            sys.stdout.flush()
-    except Exception as _pe:
-        print(f"⚠️  Pre-install scan error: {{_pe}}")
-
-_pre_install(r"{dest_script}")
-sys.stdout.flush()
+    print("⚠️  No bot token found — set BOT_TOKEN or TELEGRAM_TOKEN in env vars")
 
 # ========== METHOD 1: Import and run ==========
 try:
@@ -5259,106 +5258,177 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
 # ==================== BROADCAST SYSTEM ====================
 
 def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons):
-    """Send a preview of the broadcast to the admin before confirming."""
-    kb = {"inline_keyboard": buttons + [
+    """Send a live preview of the broadcast to the admin before confirming."""
+    if not isinstance(buttons, list):
+        buttons = []
+
+    confirm_kb = {"inline_keyboard": (buttons if buttons else []) + [
         [{"text": "✅ Send to All Users", "callback_data": "broadcast_confirm"}],
-        [{"text": "✏️ Edit Caption",      "callback_data": "broadcast_edit_caption"}],
-        [{"text": "❌ Cancel",             "callback_data": "admin_panel"}],
-    ]} if buttons else {"inline_keyboard": [
-        [{"text": "✅ Send to All Users", "callback_data": "broadcast_confirm"}],
-        [{"text": "✏️ Edit Caption",      "callback_data": "broadcast_edit_caption"}],
-        [{"text": "❌ Cancel",             "callback_data": "admin_panel"}],
+        [{"text": "✏️ Edit Caption",       "callback_data": "broadcast_edit_caption"}],
+        [{"text": "❌ Cancel",              "callback_data": "admin_panel"}],
     ]}
 
-    send_message(chat_id, "**👁 PREVIEW — This is how users will see it:**", None)
+    send_message(chat_id, "**👁 PREVIEW — exactly what users will see:**", None)
     try:
         if btype == 'photo' and file_id:
-            _tg_send_media(chat_id, 'photo', file_id, caption, kb)
+            _tg_send_media(chat_id, 'photo', file_id, caption or '', confirm_kb)
         elif btype == 'video' and file_id:
-            _tg_send_media(chat_id, 'video', file_id, caption, kb)
+            _tg_send_media(chat_id, 'video', file_id, caption or '', confirm_kb)
         else:
-            send_message(chat_id, caption or '(no text)', kb)
+            msg_text = caption or '⚠️ (no caption / empty message)'
+            send_message(chat_id, msg_text, confirm_kb)
     except Exception as e:
-        send_message(chat_id, f"⚠️ Preview error: {e}\n\nCaption:\n{caption}", kb)
-
-    send_message(chat_id, "Tap **✅ Send to All Users** to confirm.", None)
+        send_message(chat_id,
+            f"⚠️ Preview error: `{e}`\n\n**Caption:**\n{caption or '(empty)'}",
+            confirm_kb)
 
 
 def _tg_send_media(chat_id, media_type, file_id, caption, keyboard=None):
-    """Send a photo or video with optional caption and inline keyboard."""
+    """Send a photo or video — with retry on 429 and proper UTF-8 decoding."""
     endpoint = 'sendPhoto' if media_type == 'photo' else 'sendVideo'
     field    = 'photo'    if media_type == 'photo' else 'video'
-    payload  = {
-        "chat_id":    chat_id,
-        field:        file_id,
-        "parse_mode": "Markdown",
-    }
+
+    if not file_id:
+        print(f"❌ _tg_send_media: file_id is empty for {media_type}")
+        return None
+
+    payload = {"chat_id": chat_id, field: file_id, "parse_mode": "Markdown"}
     if caption:
-        payload["caption"] = caption[:1024]
+        payload["caption"] = str(caption)[:1024]
     if keyboard:
         payload["reply_markup"] = json.dumps(keyboard)
-    try:
-        data = json.dumps(payload).encode()
-        req  = urllib.request.Request(
-            f"{TELEGRAM_API}/{endpoint}", data=data,
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
-    except Exception as e:
-        print(f"❌ _tg_send_media error: {e}")
-        return None
+
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(
+                f"{TELEGRAM_API}/{endpoint}",
+                data=json.dumps(payload).encode('utf-8'),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                sleep(3 * (attempt + 1))
+                continue
+            body = ''
+            try: body = e.read().decode()[:300]
+            except Exception: pass
+            print(f"❌ _tg_send_media HTTP {e.code}: {body}")
+            return None
+        except Exception as e:
+            print(f"❌ _tg_send_media error (attempt {attempt+1}): {e}")
+            if attempt < 3:
+                sleep(1)
+    return None
 
 
 def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
     """
-    Execute broadcast to all verified users.
-    Returns (success_count, fail_count).
+    Send a message/photo/video to all users.
+    Returns (success_count, fail_count, skipped_count).
     """
+    # Parse inline buttons
     try:
         buttons = json.loads(buttons_json) if buttons_json else []
+        if not isinstance(buttons, list):
+            buttons = []
     except Exception:
         buttons = []
 
     kb = {"inline_keyboard": buttons} if buttons else None
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    c    = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE is_verified = 1 OR step IS NOT NULL")
-    all_users = [r[0] for r in c.fetchall()]
-    conn.close()
+    # Validate text content before starting
+    if btype == 'text' and not (caption or '').strip():
+        print("⚠️ do_broadcast: text broadcast has empty caption — aborting")
+        return 0, 0, 0
 
-    success = fail = 0
-    for uid in all_users:
-        if uid == admin_id:
+    if btype in ('photo', 'video') and not file_id:
+        print(f"⚠️ do_broadcast: {btype} broadcast has no file_id — aborting")
+        return 0, 0, 0
+
+    # Fetch ALL users (not just verified — we want everyone who ever used the bot)
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        c = conn.cursor()
+        # Get every user that has interacted (has a join_date or last_active)
+        c.execute("""SELECT DISTINCT user_id FROM users
+                     WHERE user_id IS NOT NULL AND user_id != 0
+                     ORDER BY user_id""")
+        all_users = [r[0] for r in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"❌ do_broadcast user fetch error: {e}")
+        return 0, 0, 0
+
+    total    = len(all_users)
+    success  = fail = skipped = 0
+    print(f"📢 Starting broadcast to {total} users | type={btype} | file_id={bool(file_id)}")
+
+    for i, uid in enumerate(all_users):
+        # Skip the admin who triggered the broadcast
+        if int(uid) in ADMIN_IDS:
+            skipped += 1
             continue
+
         try:
             if btype == 'photo' and file_id:
                 result = _tg_send_media(uid, 'photo', file_id, caption, kb)
             elif btype == 'video' and file_id:
                 result = _tg_send_media(uid, 'video', file_id, caption, kb)
             else:
-                result = send_message(uid, caption or '', kb)
-            if result and result.get('ok'):
+                text_to_send = (caption or '').strip()
+                if not text_to_send:
+                    skipped += 1
+                    continue
+                result = send_message(uid, text_to_send, kb)
+
+            # Both send_message and _tg_send_media return {'ok': True/False, ...}
+            if isinstance(result, dict) and result.get('ok'):
                 success += 1
             else:
                 fail += 1
-        except Exception:
-            fail += 1
-        sleep(0.05)   # rate-limit guard: ~20 msgs/s max
+                if result:
+                    desc = result.get('description', '') if isinstance(result, dict) else str(result)
+                    if 'blocked' in str(desc).lower() or 'deactivated' in str(desc).lower():
+                        skipped += 1
+                        fail -= 1
 
+        except Exception as ex:
+            print(f"❌ Broadcast to {uid}: {ex}")
+            fail += 1
+
+        # Conservative rate limiting: 25 msgs/s with backoff
+        sleep(0.04)
+        # Log progress every 50 users
+        if (i + 1) % 50 == 0:
+            print(f"  📢 Progress: {i+1}/{total} | ✅{success} ❌{fail} ⏭{skipped}")
+
+    print(f"✅ Broadcast done: {success} sent | {fail} failed | {skipped} skipped")
     async_backup(f"broadcast_{admin_id}")
-    return success, fail
+    return success, fail, skipped
 
 
 def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_raw):
-    """Thread target: runs broadcast and notifies admin with results."""
-    success, fail = do_broadcast(admin_id, btype, file_id, caption, btns_raw)
-    send_message(chat_id,
-        f"✅ **Broadcast Complete**\n\n"
-        f"✅ Delivered: `{success}`\n"
-        f"❌ Failed: `{fail}`\n\n"
-        f"Total reached: `{success + fail}` users",
-        {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+    """Thread target: run broadcast and notify the admin with results."""
+    try:
+        success, fail, skipped = do_broadcast(admin_id, btype, file_id, caption, btns_raw)
+        total = success + fail
+        send_message(chat_id,
+            f"✅ **Broadcast Complete**\n\n"
+            f"✅ Delivered: `{success}`\n"
+            f"❌ Failed:    `{fail}`\n"
+            f"⏭ Skipped:   `{skipped}` (blocked/admin)\n"
+            f"📊 Total users: `{total + skipped}`",
+            {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+    except Exception as e:
+        print(f"❌ _run_broadcast_and_notify error: {e}")
+        try:
+            send_message(chat_id,
+                f"❌ **Broadcast failed with error:**\n`{e}`",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+        except Exception:
+            pass
 
 
 def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
