@@ -2291,8 +2291,597 @@ class UniversalDependencyInstaller:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
         return result.returncode == 0, result.stderr[:200] if result.stderr else ""
 
-# ========== AUTO-DEPENDENCY DETECTION ==========
-class AutoDependencyDetector:
+# ==================== VPS DEPENDENCY ENGINE ====================
+# Supports every package manager a real hosting server would handle.
+
+import shutil as _shutil
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _run(cmd, cwd=None, timeout=300, env_extra=None):
+    """Run a shell command, return (ok, stdout+stderr text)."""
+    import os as _os
+    env = _os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd, env=env)
+        out = (r.stdout or '') + (r.stderr or '')
+        return r.returncode == 0, out.strip()
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout after {timeout}s"
+    except FileNotFoundError:
+        return False, f"Command not found: {cmd[0]}"
+    except Exception as e:
+        return False, str(e)
+
+def _cmd_exists(name):
+    return _shutil.which(name) is not None
+
+def _pip_base(packages_dir=None):
+    cmd = [sys.executable, '-m', 'pip', 'install',
+           '--quiet', '--no-warn-script-location',
+           '--disable-pip-version-check', '--no-color']
+    if packages_dir:
+        cmd += ['--target', str(packages_dir)]
+    return cmd
+
+def _log(update_logs, msg):
+    if update_logs:
+        update_logs(msg)
+    else:
+        print(msg)
+
+
+# ── per-package-manager installers ───────────────────────────────────────────
+
+def _install_pip(packages_dir, deploy_folder, update_logs):
+    """Install Python packages from every requirements variant."""
+    installed = 0
+
+    # Upgrade pip first (once, silently)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'pip',
+                    '--disable-pip-version-check'], capture_output=True, timeout=60)
+
+    # All requirements file variants, in priority order
+    req_variants = [
+        'requirements.txt', 'requirements-dev.txt', 'requirements-prod.txt',
+        'requirements_dev.txt', 'requirements_prod.txt',
+        'requirements/base.txt', 'requirements/main.txt',
+        'requirements/prod.txt',  'requirements/dev.txt',
+    ]
+
+    for fname in req_variants:
+        rp = deploy_folder / fname
+        if not rp.exists():
+            continue
+        _log(update_logs, f"   📄 {fname}")
+        raw = rp.read_text(errors='ignore').strip()
+        pkgs = [ln.split(';')[0].strip() for ln in raw.splitlines()
+                if ln.strip() and not ln.startswith(('#', '-r ', '-c ', '--'))]
+        if not pkgs:
+            continue
+
+        _log(update_logs, f"   📦 {len(pkgs)} package(s) from {fname}")
+        for i, pkg in enumerate(pkgs):
+            _log(update_logs, f"   ⬇️  [{i+1}/{len(pkgs)}] {pkg[:70]}")
+            # Try with --upgrade first, then plain install on conflict
+            ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=180)
+            if not ok:
+                ok, out = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+            if ok:
+                installed += 1
+            else:
+                last = out.strip().split('\n')[-1][:100]
+                _log(update_logs, f"   ⚠️  {pkg[:50]} → {last}")
+        _log(update_logs, f"   ✅ {fname} done")
+
+    # pyproject.toml
+    pp = deploy_folder / 'pyproject.toml'
+    if pp.exists():
+        _log(update_logs, "   📄 pyproject.toml")
+        # Try pip install . first (works for PEP 517 projects)
+        ok, out = _run(_pip_base(packages_dir) + ['.'], cwd=str(deploy_folder), timeout=300)
+        if ok:
+            _log(update_logs, "   ✅ pyproject.toml (pip install .)")
+            installed += 1
+        else:
+            # Manual parse as fallback
+            text = pp.read_text(errors='ignore')
+            deps = re.findall(r'"([A-Za-z0-9_\-]+)(?:[>=<!\[^~][^"]*)?"\s*,', text)
+            deps += re.findall(r"^([A-Za-z0-9_\-]+)\s*=\s*['\"\^~]", text, re.M)
+            skip = {'python','pip','setuptools','wheel','flit','hatchling','poetry'}
+            deps = list(dict.fromkeys(d for d in deps if d.lower() not in skip))
+            if deps:
+                _log(update_logs, f"   📦 {len(deps)} deps parsed from pyproject.toml")
+                for pkg in deps:
+                    ok2, _ = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+                    if ok2:
+                        installed += 1
+
+    # Pipfile
+    pf = deploy_folder / 'Pipfile'
+    if pf.exists():
+        _log(update_logs, "   📄 Pipfile")
+        text = pf.read_text(errors='ignore')
+        in_pkgs = False
+        pkgs = []
+        for line in text.splitlines():
+            if line.strip() in ('[packages]', '[dev-packages]'):
+                in_pkgs = True
+            elif line.startswith('['):
+                in_pkgs = False
+            elif in_pkgs:
+                m = re.match(r'^([A-Za-z0-9_\-]+)\s*=', line)
+                if m and m.group(1) not in ('python',):
+                    pkgs.append(m.group(1))
+        if pkgs:
+            _log(update_logs, f"   📦 {len(pkgs)} packages from Pipfile")
+            for pkg in pkgs:
+                ok, _ = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+                if ok:
+                    installed += 1
+
+    # conda environment.yml
+    for env_file in ['environment.yml', 'environment.yaml', 'conda.yml']:
+        ef = deploy_folder / env_file
+        if not ef.exists():
+            continue
+        if _cmd_exists('conda'):
+            _log(update_logs, f"   📄 {env_file} (conda)")
+            ok, out = _run(['conda', 'env', 'update', '--file', str(ef),
+                            '--prune', '-q'], timeout=300)
+            _log(update_logs, f"   {'✅' if ok else '⚠️'} conda env update: {out[-100:]}")
+            installed += int(ok)
+        else:
+            # Parse pip dependencies from environment.yml and install them
+            _log(update_logs, f"   📄 {env_file} (conda not found — installing pip deps)")
+            text = ef.read_text(errors='ignore')
+            in_pip = False
+            pip_pkgs = []
+            for line in text.splitlines():
+                if '- pip:' in line:
+                    in_pip = True
+                    continue
+                if line.startswith('  - ') and in_pip:
+                    pkg = line.strip().lstrip('- ').strip()
+                    if pkg and not pkg.startswith('#'):
+                        pip_pkgs.append(pkg)
+                elif not line.startswith(' ') and line.strip():
+                    in_pip = False
+            for pkg in pip_pkgs:
+                ok2, _ = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+                if ok2:
+                    installed += 1
+
+    # setup.py / setup.cfg
+    for sf in ['setup.py', 'setup.cfg']:
+        if (deploy_folder / sf).exists():
+            _log(update_logs, f"   📄 {sf}")
+            ok, _ = _run(_pip_base(packages_dir) + ['-e', '.'],
+                         cwd=str(deploy_folder), timeout=300)
+            _log(update_logs, f"   {'✅' if ok else '⚠️'} {sf}")
+            installed += int(ok)
+            break
+
+    return installed
+
+
+def _install_npm(deploy_folder, update_logs):
+    """Install Node.js dependencies from package.json using npm/yarn/pnpm/bun."""
+    pkg_json = deploy_folder / 'package.json'
+    if not pkg_json.exists():
+        return 0
+
+    # Detect which lock file / manager to use
+    if (deploy_folder / 'bun.lockb').exists() and _cmd_exists('bun'):
+        mgr = 'bun'
+        cmd = ['bun', 'install', '--frozen-lockfile']
+    elif (deploy_folder / 'pnpm-lock.yaml').exists() and _cmd_exists('pnpm'):
+        mgr = 'pnpm'
+        cmd = ['pnpm', 'install', '--frozen-lockfile', '--prefer-offline']
+    elif (deploy_folder / 'yarn.lock').exists() and _cmd_exists('yarn'):
+        mgr = 'yarn'
+        cmd = ['yarn', 'install', '--frozen-lockfile', '--non-interactive']
+    elif _cmd_exists('npm'):
+        mgr = 'npm'
+        # Use ci if lock file exists, else install
+        lockfile = deploy_folder / 'package-lock.json'
+        cmd = ['npm', 'ci'] if lockfile.exists() else ['npm', 'install', '--no-audit', '--no-fund']
+    else:
+        _log(update_logs, "   ⚠️ No Node.js package manager found (npm/yarn/pnpm/bun)")
+        return 0
+
+    _log(update_logs, f"   📦 npm install via {mgr}...")
+    ok, out = _run(cmd, cwd=str(deploy_folder), timeout=300)
+    if ok:
+        _log(update_logs, f"   ✅ {mgr} install complete")
+    else:
+        _log(update_logs, f"   ⚠️ {mgr} install failed — {out[-200:]}")
+    return int(ok)
+
+
+def _install_cargo(deploy_folder, update_logs):
+    """Build Rust project from Cargo.toml."""
+    if not (deploy_folder / 'Cargo.toml').exists():
+        return 0
+    if not _cmd_exists('cargo'):
+        _log(update_logs, "   ⚠️ Cargo not installed — skipping Rust build")
+        return 0
+    _log(update_logs, "   🦀 Building Rust project (cargo build --release)...")
+    ok, out = _run(['cargo', 'build', '--release', '--quiet'],
+                   cwd=str(deploy_folder), timeout=600)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} cargo build: {out[-150:]}")
+    return int(ok)
+
+
+def _install_go(deploy_folder, update_logs):
+    """Download Go modules and build."""
+    if not (deploy_folder / 'go.mod').exists():
+        return 0
+    if not _cmd_exists('go'):
+        _log(update_logs, "   ⚠️ Go not installed — skipping Go modules")
+        return 0
+    _log(update_logs, "   🐹 Downloading Go modules...")
+    ok, out = _run(['go', 'mod', 'download'], cwd=str(deploy_folder), timeout=300)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} go mod download: {out[-100:]}")
+    if ok:
+        ok2, _ = _run(['go', 'build', './...'], cwd=str(deploy_folder), timeout=300)
+        _log(update_logs, f"   {'✅' if ok2 else '⚠️'} go build")
+    return int(ok)
+
+
+def _install_gem(deploy_folder, update_logs):
+    """Install Ruby gems from Gemfile."""
+    if not (deploy_folder / 'Gemfile').exists():
+        return 0
+    if not _cmd_exists('bundle'):
+        if _cmd_exists('gem'):
+            _log(update_logs, "   💎 Installing bundler...")
+            _run(['gem', 'install', 'bundler', '--no-document'], timeout=120)
+        else:
+            _log(update_logs, "   ⚠️ Ruby/gem not installed — skipping Gemfile")
+            return 0
+    _log(update_logs, "   💎 Bundle install (Ruby gems)...")
+    ok, out = _run(['bundle', 'install', '--jobs', '4', '--retry', '3'],
+                   cwd=str(deploy_folder), timeout=300)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} bundle install: {out[-120:]}")
+    return int(ok)
+
+
+def _install_composer(deploy_folder, update_logs):
+    """Install PHP packages from composer.json."""
+    if not (deploy_folder / 'composer.json').exists():
+        return 0
+    composer = _cmd_exists('composer') and 'composer' or _cmd_exists('composer.phar') and 'composer.phar'
+    if not composer:
+        _log(update_logs, "   ⚠️ Composer not installed — skipping PHP deps")
+        return 0
+    _log(update_logs, "   🐘 Composer install (PHP packages)...")
+    ok, out = _run([composer, 'install', '--no-dev', '--optimize-autoloader', '--no-interaction'],
+                   cwd=str(deploy_folder), timeout=300)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} composer install: {out[-120:]}")
+    return int(ok)
+
+
+def _install_gradle(deploy_folder, update_logs):
+    """Build Java project with Gradle or Maven."""
+    # Gradle
+    if (deploy_folder / 'build.gradle').exists() or (deploy_folder / 'build.gradle.kts').exists():
+        gw = str(deploy_folder / 'gradlew')
+        gradle = gw if Path(gw).exists() else ('gradle' if _cmd_exists('gradle') else None)
+        if gradle:
+            _log(update_logs, "   ☕ Gradle build (Java)...")
+            ok, out = _run([gradle, 'dependencies', '--no-daemon', '-q'],
+                           cwd=str(deploy_folder), timeout=600)
+            _log(update_logs, f"   {'✅' if ok else '⚠️'} gradle deps: {out[-100:]}")
+            return int(ok)
+        else:
+            _log(update_logs, "   ⚠️ Gradle not installed — skipping")
+
+    # Maven
+    if (deploy_folder / 'pom.xml').exists():
+        mvn = 'mvn' if _cmd_exists('mvn') else ('mvnw' if (deploy_folder / 'mvnw').exists() else None)
+        if mvn:
+            _log(update_logs, "   ☕ Maven dependency:resolve (Java)...")
+            ok, out = _run([mvn, 'dependency:resolve', '-q', '--no-transfer-progress'],
+                           cwd=str(deploy_folder), timeout=600)
+            _log(update_logs, f"   {'✅' if ok else '⚠️'} mvn resolve: {out[-100:]}")
+            return int(ok)
+        else:
+            _log(update_logs, "   ⚠️ Maven not installed — skipping")
+    return 0
+
+
+def _install_mix(deploy_folder, update_logs):
+    """Install Elixir dependencies."""
+    if not (deploy_folder / 'mix.exs').exists():
+        return 0
+    if not _cmd_exists('mix'):
+        _log(update_logs, "   ⚠️ Elixir/mix not installed — skipping")
+        return 0
+    _log(update_logs, "   💜 Mix deps.get (Elixir)...")
+    ok, out = _run(['mix', 'deps.get'], cwd=str(deploy_folder), timeout=300)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} mix deps.get: {out[-100:]}")
+    return int(ok)
+
+
+def _install_pub(deploy_folder, update_logs):
+    """Install Dart/Flutter dependencies."""
+    pubspec = deploy_folder / 'pubspec.yaml'
+    if not pubspec.exists():
+        return 0
+    runner = 'flutter' if _cmd_exists('flutter') else ('dart' if _cmd_exists('dart') else None)
+    if not runner:
+        _log(update_logs, "   ⚠️ Dart/Flutter not installed — skipping pubspec.yaml")
+        return 0
+    cmd = [runner, 'pub', 'get'] if runner == 'dart' else [runner, 'pub', 'get']
+    _log(update_logs, f"   🎯 {runner} pub get (Dart/Flutter)...")
+    ok, out = _run(cmd, cwd=str(deploy_folder), timeout=300)
+    _log(update_logs, f"   {'✅' if ok else '⚠️'} pub get: {out[-100:]}")
+    return int(ok)
+
+
+def _auto_detect_and_install_pip(code_file, packages_dir, update_logs):
+    """
+    Scan a Python/JS file for imports and auto-install any missing packages.
+    Only installs what isn't already importable — avoids redundant reinstalls.
+    """
+    IMPORT_MAP = {
+        'telebot':     'pyTelegramBotAPI',
+        'telegram':    'python-telegram-bot',
+        'aiogram':     'aiogram',
+        'pyrogram':    'pyrogram',
+        'telethon':    'telethon',
+        'discord':     'discord.py',
+        'nextcord':    'nextcord',
+        'disnake':     'disnake',
+        'flask':       'flask',
+        'fastapi':     'fastapi',
+        'uvicorn':     'uvicorn',
+        'aiohttp':     'aiohttp',
+        'requests':    'requests',
+        'httpx':       'httpx',
+        'dotenv':      'python-dotenv',
+        'sqlalchemy':  'SQLAlchemy',
+        'pymongo':     'pymongo',
+        'motor':       'motor',
+        'redis':       'redis',
+        'celery':      'celery',
+        'bs4':         'beautifulsoup4',
+        'PIL':         'Pillow',
+        'cv2':         'opencv-python',
+        'sklearn':     'scikit-learn',
+        'tweepy':      'tweepy',
+        'slack_sdk':   'slack-sdk',
+        'slack_bolt':  'slack-bolt',
+        'linebot':     'line-bot-sdk',
+        'yaml':        'pyyaml',
+        'toml':        'toml',
+        'boto3':       'boto3',
+        'psutil':      'psutil',
+        'loguru':      'loguru',
+        'rich':        'rich',
+        'pydantic':    'pydantic',
+        'cryptography':'cryptography',
+        'jwt':         'pyjwt',
+        'aiosqlite':   'aiosqlite',
+        'tortoise':    'tortoise-orm',
+        'pywa':        'pywa',
+        'viberbot':    'viberbot',
+        'nio':         'matrix-nio',
+        'pytz':        'pytz',
+        'arrow':       'arrow',
+        'pendulum':    'pendulum',
+        'click':       'click',
+        'typer':       'typer',
+        'tqdm':        'tqdm',
+        'matplotlib':  'matplotlib',
+        'numpy':       'numpy',
+        'pandas':      'pandas',
+        'scipy':       'scipy',
+        'openai':      'openai',
+        'anthropic':   'anthropic',
+        'transformers':'transformers',
+        'torch':       'torch',
+        'tensorflow':  'tensorflow',
+        'paramiko':    'paramiko',
+        'fabric':      'fabric',
+        'invoke':      'invoke',
+        'pyserial':    'pyserial',
+        'serial':      'pyserial',
+    }
+
+    try:
+        code = Path(code_file).read_text(errors='ignore') if isinstance(code_file, (str, Path)) else ''
+    except Exception:
+        code = ''
+
+    if not code:
+        return 0
+
+    # Extract top-level module names
+    imported = set()
+    for m in re.findall(r'^import\s+([\w]+)', code, re.M):
+        imported.add(m)
+    for m in re.findall(r'^from\s+([\w]+)', code, re.M):
+        imported.add(m)
+
+    to_install = []
+    for mod in imported:
+        pkg = IMPORT_MAP.get(mod)
+        if pkg:
+            # Check if already importable (skip install if yes)
+            try:
+                import importlib.util as _ilu
+                if _ilu.find_spec(mod) is None:
+                    to_install.append(pkg)
+            except Exception:
+                to_install.append(pkg)
+
+    installed = 0
+    if to_install:
+        _log(update_logs, f"   🔍 Auto-detected {len(to_install)} missing package(s)")
+        for pkg in to_install:
+            _log(update_logs, f"   ⬇️  {pkg}")
+            ok, _ = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+            if ok:
+                installed += 1
+                _log(update_logs, f"   ✅ {pkg}")
+            else:
+                _log(update_logs, f"   ⚠️ {pkg} failed")
+    return installed
+
+
+# ── main entry point ──────────────────────────────────────────────────────────
+
+def install_all_dependencies(deploy_folder: Path, update_logs=None,
+                              packages_dir=None, code_file=None) -> dict:
+    """
+    VPS-grade universal dependency installer.
+    Scans the deploy folder for ALL known dependency manifests and installs them.
+    Returns a summary dict: {manager: count_installed}
+    """
+    deploy_folder = Path(deploy_folder)
+    if packages_dir:
+        packages_dir = Path(packages_dir)
+        packages_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {}
+    _log(update_logs, "═" * 50)
+    _log(update_logs, "📦 VPS DEPENDENCY ENGINE — STARTING")
+    _log(update_logs, "═" * 50)
+
+    # ── Python ────────────────────────────────────────────────────────
+    has_python = any([
+        (deploy_folder / f).exists()
+        for f in ['requirements.txt', 'pyproject.toml', 'Pipfile', 'setup.py',
+                  'setup.cfg', 'environment.yml', 'environment.yaml']
+    ])
+    if has_python or code_file:
+        _log(update_logs, "🐍 Python packages:")
+        n = _install_pip(packages_dir, deploy_folder, update_logs)
+        if code_file:
+            n += _auto_detect_and_install_pip(code_file, packages_dir, update_logs)
+        summary['pip'] = n
+        _log(update_logs, f"   → {n} Python package(s) installed")
+
+    # ── Node.js ───────────────────────────────────────────────────────
+    if (deploy_folder / 'package.json').exists():
+        _log(update_logs, "🟨 Node.js packages:")
+        n = _install_npm(deploy_folder, update_logs)
+        summary['npm'] = n
+
+    # ── Rust ──────────────────────────────────────────────────────────
+    if (deploy_folder / 'Cargo.toml').exists():
+        _log(update_logs, "🦀 Rust (cargo):")
+        n = _install_cargo(deploy_folder, update_logs)
+        summary['cargo'] = n
+
+    # ── Go ────────────────────────────────────────────────────────────
+    if (deploy_folder / 'go.mod').exists():
+        _log(update_logs, "🐹 Go modules:")
+        n = _install_go(deploy_folder, update_logs)
+        summary['go'] = n
+
+    # ── Ruby ──────────────────────────────────────────────────────────
+    if (deploy_folder / 'Gemfile').exists():
+        _log(update_logs, "💎 Ruby gems:")
+        n = _install_gem(deploy_folder, update_logs)
+        summary['gem'] = n
+
+    # ── PHP ───────────────────────────────────────────────────────────
+    if (deploy_folder / 'composer.json').exists():
+        _log(update_logs, "🐘 PHP (composer):")
+        n = _install_composer(deploy_folder, update_logs)
+        summary['composer'] = n
+
+    # ── Java ──────────────────────────────────────────────────────────
+    has_java = any((deploy_folder / f).exists()
+                   for f in ['build.gradle', 'build.gradle.kts', 'pom.xml'])
+    if has_java:
+        _log(update_logs, "☕ Java (gradle/maven):")
+        n = _install_gradle(deploy_folder, update_logs)
+        summary['java'] = n
+
+    # ── Elixir ───────────────────────────────────────────────────────
+    if (deploy_folder / 'mix.exs').exists():
+        _log(update_logs, "💜 Elixir (mix):")
+        n = _install_mix(deploy_folder, update_logs)
+        summary['mix'] = n
+
+    # ── Dart / Flutter ────────────────────────────────────────────────
+    if (deploy_folder / 'pubspec.yaml').exists():
+        _log(update_logs, "🎯 Dart/Flutter (pub):")
+        n = _install_pub(deploy_folder, update_logs)
+        summary['pub'] = n
+
+    total = sum(summary.values())
+    _log(update_logs, "═" * 50)
+    parts = ', '.join(f"{k}: {v}" for k, v in summary.items() if v)
+    _log(update_logs, f"✅ DEPENDENCIES DONE — {total} item(s) installed ({parts or 'none detected'})")
+    _log(update_logs, "═" * 50)
+    return summary
+
+
+# ── backwards-compatible wrappers for existing callers ────────────────────────
+
+def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
+    """Backwards-compat: install a single requirements.txt file."""
+    reqs_file = Path(reqs_file)
+    if not reqs_file.exists():
+        _log(update_logs, "✅ No requirements file found")
+        return True, []
+    if not reqs_file.stat().st_size:
+        _log(update_logs, "⚠️ Requirements file is empty")
+        return True, []
+
+    deploy_folder = reqs_file.parent
+    if packages_dir:
+        packages_dir = Path(packages_dir)
+        packages_dir.mkdir(parents=True, exist_ok=True)
+
+    # Upgrade pip once
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'pip',
+                    '--disable-pip-version-check'], capture_output=True, timeout=60)
+
+    raw = reqs_file.read_text(errors='ignore').strip()
+    pkgs = [ln.split(';')[0].strip() for ln in raw.splitlines()
+            if ln.strip() and not ln.startswith(('#', '-r ', '-c ', '--'))]
+    _log(update_logs, f"📦 {len(pkgs)} package(s)")
+
+    success, failed = 0, []
+    for i, pkg in enumerate(pkgs):
+        pct = int(i / len(pkgs) * 100) if pkgs else 100
+        _log(update_logs, create_progress_bar(pct, 25))
+        _log(update_logs, f"   ⬇️  {pkg[:70]}")
+        ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=180)
+        if not ok:
+            ok, out = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+        if ok:
+            success += 1
+            _log(update_logs, f"   ✅ {pkg[:60]}")
+        else:
+            failed.append(pkg)
+            _log(update_logs, f"   ❌ {pkg[:50]}: {(out or '').strip().split(chr(10))[-1][:80]}")
+
+    _log(update_logs, create_progress_bar(100, 25))
+    _log(update_logs, f"✅ {success}/{len(pkgs)} installed" +
+         (f" | ⚠️ {len(failed)} failed" if failed else ""))
+    rate = success / len(pkgs) if pkgs else 1.0
+    return rate >= 0.7, failed
+
+
+def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
+    """Backwards-compat: install all dependency sources in a cloned repo."""
+    deploy_folder = Path(deploy_folder)
+    packages_dir = deploy_folder / 'packages'
+    packages_dir.mkdir(exist_ok=True)
+    summary = install_all_dependencies(deploy_folder, update_logs,
+                                       packages_dir=packages_dir)
+    return list(summary.keys())
     """Automatically detect required dependencies by scanning code"""
     
     IMPORT_MAPPING = {
