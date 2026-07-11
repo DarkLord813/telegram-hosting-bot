@@ -1580,7 +1580,8 @@ def notify_admin(message):
 
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
     url  = f"{TELEGRAM_API}/sendMessage"
-    data = {"chat_id": chat_id, "text": str(text or '')[:4096], "parse_mode": parse_mode}
+    text = str(text or '')[:4096]
+    data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
     for _attempt in range(3):
@@ -1599,6 +1600,22 @@ def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
             try: body = e.read().decode()[:200]
             except Exception: pass
             print(f"Send HTTP {e.code}: {body}")
+            # ── Fallback: bad/unbalanced Markdown must never mean "no reply" ──
+            # Telegram rejects the WHOLE message if entity parsing fails (e.g. a
+            # stray "_" or "*" in a username/first_name breaks bold/italic
+            # pairing). Retry once as plain text so the user always gets a
+            # response instead of silence.
+            if parse_mode and "can't parse entities" in body.lower():
+                data_plain = {k: v for k, v in data.items() if k != "parse_mode"}
+                try:
+                    req2 = urllib.request.Request(
+                        url, data=json.dumps(data_plain).encode('utf-8'),
+                        headers={'Content-Type': 'application/json'})
+                    with urllib.request.urlopen(req2, timeout=30) as resp2:
+                        print("⚠️  Sent as plain text after Markdown parse failure")
+                        return json.loads(resp2.read().decode('utf-8'))
+                except Exception as e2:
+                    print(f"Plain-text fallback also failed: {e2}")
             return None
         except Exception as e:
             print(f"Send error (attempt {_attempt+1}): {e}")
@@ -1626,7 +1643,25 @@ def edit_message(chat_id, message_id, text, keyboard=None):
             if e.code == 429:
                 sleep(2 * (_attempt + 1))
                 continue
-            if e.code == 400:   # message not modified / too old — silently ignore
+            if e.code == 400:
+                body = ''
+                try: body = e.read().decode()[:200]
+                except Exception: pass
+                # "can't parse entities" = broken Markdown (e.g. special chars
+                # in user-supplied text). Retry as plain text instead of
+                # silently dropping the edit. Other 400s (message not
+                # modified / too old) are still ignored.
+                if "can't parse entities" in body.lower():
+                    data_plain = {k: v for k, v in data.items() if k != "parse_mode"}
+                    try:
+                        req2 = urllib.request.Request(
+                            url, data=json.dumps(data_plain).encode('utf-8'),
+                            headers={'Content-Type': 'application/json'})
+                        with urllib.request.urlopen(req2, timeout=30) as resp2:
+                            print("⚠️  Edited as plain text after Markdown parse failure")
+                            return json.loads(resp2.read().decode('utf-8'))
+                    except Exception as e2:
+                        print(f"Plain-text edit fallback also failed: {e2}")
                 return None
             print(f"Edit HTTP {e.code}")
             return None
@@ -1652,9 +1687,16 @@ def answer_callback(callback_id, text=None, show_alert=False):
 
 def http_get(url, params=None):
     try:
+        # The socket timeout must be longer than any long-poll "timeout"
+        # param we send Telegram, or the connection can time out right as
+        # Telegram's response arrives at the edge of its own wait window,
+        # silently dropping that poll (getUpdates uses timeout=30).
+        socket_timeout = 30
+        if params and 'timeout' in params:
+            socket_timeout = int(params['timeout']) + 10
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-        with urllib.request.urlopen(url, timeout=30) as response:
+        with urllib.request.urlopen(url, timeout=socket_timeout) as response:
             return json.loads(response.read().decode('utf-8'))
     except Exception as e:
         print(f"HTTP error: {e}")
@@ -7671,16 +7713,37 @@ def main():
             if data and data.get('ok'):
                 for update in data['result']:
                     LAST_UPDATE_ID = update['update_id']
-                    if 'callback_query' in update:
-                        handle_callback(update['callback_query'])
-                    elif 'pre_checkout_query' in update:
-                        handle_pre_checkout_query(update['pre_checkout_query'])
-                    elif 'message' in update:
-                        msg = update['message']
-                        if 'successful_payment' in msg:
-                            handle_successful_payment(msg)
-                        else:
-                            handle_message(msg)
+                    # Each update is isolated: if handling one throws, we log
+                    # it and move on instead of silently dropping that
+                    # user's message with no reply and no trace, and instead
+                    # of losing the rest of the batch.
+                    try:
+                        if 'callback_query' in update:
+                            handle_callback(update['callback_query'])
+                        elif 'pre_checkout_query' in update:
+                            handle_pre_checkout_query(update['pre_checkout_query'])
+                        elif 'message' in update:
+                            msg = update['message']
+                            if 'successful_payment' in msg:
+                                handle_successful_payment(msg)
+                            else:
+                                handle_message(msg)
+                    except Exception as ue:
+                        print(f"❌ Error handling update {update['update_id']}: {ue}")
+                        traceback.print_exc()
+                        # Best-effort: let the user know something broke instead
+                        # of leaving them with total silence.
+                        try:
+                            fail_chat_id = None
+                            if 'message' in update:
+                                fail_chat_id = update['message']['chat']['id']
+                            elif 'callback_query' in update:
+                                fail_chat_id = update['callback_query']['message']['chat']['id']
+                            if fail_chat_id:
+                                send_message(fail_chat_id,
+                                    "⚠️ Something went wrong processing that. Please try again.")
+                        except Exception:
+                            pass
             sleep(0.5)
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped")
