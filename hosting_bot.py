@@ -47,6 +47,13 @@ if not ADMIN_IDS:
     ADMIN_IDS = {7713987088}
     print("⚠️  ADMIN_IDS not set or invalid — using default admin ID")
 
+def is_admin(user_id) -> bool:
+    """Return True if user_id is a configured admin. Tolerant of str/int input."""
+    try:
+        return int(user_id) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
+
 # Channel verification settings (configure via env)
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@gamerdroidbot2")
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/gamerdroidbot2")
