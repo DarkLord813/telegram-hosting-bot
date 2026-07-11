@@ -1687,56 +1687,120 @@ def format_uptime(seconds):
     else:
         return f"{secs}s"
 
-# ========== CHANNEL VERIFICATION ==========
-def check_channel_membership(user_id):
-    try:
-        url = f"{TELEGRAM_API}/getChatMember"
-        data = {"chat_id": REQUIRED_CHANNEL, "user_id": user_id}
-        data_bytes = urllib.parse.urlencode(data).encode('utf-8')
-        req = urllib.request.Request(url, data=data_bytes, method='POST')
-        
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('ok'):
-                status = result['result']['status']
-                return status in ['member', 'administrator', 'creator', 'restricted']
-    except Exception as e:
-        print(f"❌ Channel check error: {e}")
-    return False
+# ==================== CHANNEL VERIFICATION ====================
+
+def check_channel_membership(user_id) -> bool:
+    """
+    Permanent fix: check whether user_id is a member of REQUIRED_CHANNEL.
+
+    Rules:
+    - If REQUIRED_CHANNEL is not configured → always pass (no gate)
+    - Uses GET with query-string params (works regardless of Content-Type)
+    - Retries up to 3 times on network errors
+    - If Telegram returns a bot-permission error (bot not admin), auto-pass
+      so a misconfigured channel never permanently blocks users
+    """
+    channel = (REQUIRED_CHANNEL or '').strip()
+    if not channel or channel in ('', 'None', 'false', '0'):
+        return True          # no channel gate configured — everyone passes
+
+    # Ensure channel starts with @ or is a numeric id
+    if not channel.startswith('@') and not channel.lstrip('-').isdigit():
+        channel = '@' + channel
+
+    url = (f"{TELEGRAM_API}/getChatMember"
+           f"?chat_id={urllib.parse.quote(channel)}&user_id={user_id}")
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode('utf-8'))
+                if data.get('ok'):
+                    status = (data.get('result') or {}).get('status', '')
+                    return status in ('member', 'administrator', 'creator', 'restricted')
+                # Telegram error — check if it's a permission issue
+                desc = (data.get('description') or '').lower()
+                if any(kw in desc for kw in ('bot is not', 'not a member',
+                                              'need admin', 'rights', 'forbidden')):
+                    print(f"⚠️  getChatMember: {data.get('description')} — auto-passing")
+                    return True     # bot isn't admin → don't punish users
+                return False        # user genuinely not in channel
+        except urllib.error.HTTPError as e:
+            body = ''
+            try: body = e.read().decode()[:200]
+            except Exception: pass
+            print(f"⚠️  getChatMember HTTP {e.code}: {body}")
+            if e.code in (400, 403):
+                # Bad request or forbidden — likely config issue, don't block users
+                return True
+            if attempt < 2:
+                sleep(1)
+        except Exception as e:
+            print(f"⚠️  getChatMember attempt {attempt+1}: {e}")
+            if attempt < 2:
+                sleep(1)
+
+    # All 3 attempts failed (network issue) → let user through
+    # Better to let a user in than to permanently lock them out
+    print(f"⚠️  getChatMember failed after 3 attempts for {user_id} — auto-passing")
+    return True
+
 
 def mark_channel_joined(user_id):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
         c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         c.execute('UPDATE users SET joined_channel = 1 WHERE user_id = ?', (user_id,))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        print(f"❌ Error marking channel: {e}")
+        print(f"❌ mark_channel_joined: {e}")
         return False
 
-def is_user_verified(user_id):
+
+def is_user_verified(user_id) -> bool:
+    """
+    Returns True if user has verified (or no channel is required).
+    Admins are always considered verified.
+    """
+    if is_admin(user_id):
+        return True
+    channel = (REQUIRED_CHANNEL or '').strip()
+    if not channel or channel in ('', 'None', 'false', '0'):
+        return True
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
         c = conn.cursor()
         c.execute('SELECT joined_channel FROM users WHERE user_id = ?', (user_id,))
-        result = c.fetchone()
+        row = c.fetchone()
         conn.close()
-        return result and result[0] == 1
+        return bool(row and row[0])
     except Exception:
         return False
 
+
 def send_verification_required(chat_id, user_id, first_name, message_id=None):
-    text = f"**🔐 CHANNEL VERIFICATION REQUIRED**\n\n━━━━━━━━━━━━━━━━━━━━━━\n👋 Welcome {first_name}!\n\n⚠️ **You must join our official channel to use this bot!**\n━━━━━━━━━━━━━━━━━━━━━━\n\n📢 **Channel:** {REQUIRED_CHANNEL}\n\n━━━━━━━━━━━━━━━━━━━━━━\n**How to verify:**\n1️⃣ Click the JOIN CHANNEL button below\n2️⃣ Join {REQUIRED_CHANNEL}\n3️⃣ Come back and click VERIFY JOIN"
-    
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📢 JOIN CHANNEL", "url": CHANNEL_LINK},
-             {"text": "✅ VERIFY JOIN", "callback_data": "verify_channel"}]
-        ]
-    }
-    
+    channel = (REQUIRED_CHANNEL or '').strip() or 'our channel'
+    link    = (CHANNEL_LINK or '').strip()
+
+    text = (
+        f"**🔐 VERIFICATION REQUIRED**\n\n"
+        f"👋 Hi {first_name or 'there'}!\n\n"
+        f"To use this hosting platform you must join our channel:\n"
+        f"📢 **{channel}**\n\n"
+        f"**Steps:**\n"
+        f"1️⃣ Click **JOIN CHANNEL** below\n"
+        f"2️⃣ Join the channel\n"
+        f"3️⃣ Come back and click **✅ VERIFY**"
+    )
+    buttons = [{"text": "✅ VERIFY", "callback_data": "verify_channel"}]
+    if link:
+        buttons.insert(0, {"text": "📢 JOIN CHANNEL", "url": link})
+
+    keyboard = {"inline_keyboard": [buttons]}
     if message_id:
         edit_message(chat_id, message_id, text, keyboard)
     else:
