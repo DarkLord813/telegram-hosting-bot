@@ -65,7 +65,18 @@ IS_CHOREO = os.environ.get("CHOREO") == "true"
 IS_ANDROID = 'pydroid' in sys.executable.lower() or 'termux' in sys.executable.lower()
 
 # Set base directory based on platform
-if IS_RENDER:
+# ── Persistent disk override ──────────────────────────────────────────
+# The paths below (e.g. /opt/render/project/src/...) live INSIDE the app's
+# own source checkout. On Render (and most PaaS), that directory is rebuilt
+# from git on every deploy and is not guaranteed to survive even a plain
+# restart — only an explicitly attached persistent Disk, mounted at a fixed
+# path, actually survives redeploys. If PERSISTENT_DISK_PATH is set (point
+# it at your Render Disk's mount path, e.g. /var/data), we use that instead
+# so deployment files, packages and the database genuinely persist.
+_persistent_override = os.environ.get("PERSISTENT_DISK_PATH", "").strip()
+if _persistent_override:
+    BASE_DIR = Path(_persistent_override) / "bot_hosting_data"
+elif IS_RENDER:
     BASE_DIR = Path("/opt/render/project/src/bot_hosting_data")
 elif IS_HEROKU:
     BASE_DIR = Path("/app/bot_hosting_data")
@@ -75,6 +86,15 @@ elif IS_ANDROID:
     BASE_DIR = Path("/storage/emulated/0/bot_hosting_data")
 else:
     BASE_DIR = Path("./bot_hosting_data")
+
+USING_PERSISTENT_DISK = bool(_persistent_override)
+
+# Always make this absolute. A relative BASE_DIR (the "./bot_hosting_data"
+# local/default case) breaks subprocess.run([str(script)], cwd=str(folder)):
+# POSIX resolves a *relative* executable path against the CHILD's new cwd,
+# not the parent's, so the same relative path ends up looked up twice-nested
+# and every deploy/restart launch fails with a misleading FileNotFoundError.
+BASE_DIR = BASE_DIR.resolve()
 
 DEPLOYMENTS_DIR = BASE_DIR / "deployments"
 DATABASE_FILE = BASE_DIR / "hosting_bot.db"
@@ -379,7 +399,9 @@ def init_db():
 
     for _col, _type in [("source_type","TEXT DEFAULT 'upload'"),
                         ("github_repo", "TEXT"),
-                        ("github_branch","TEXT DEFAULT 'main'")]:
+                        ("github_branch","TEXT DEFAULT 'main'"),
+                        ("crash_restart_count", "INTEGER DEFAULT 0"),
+                        ("last_crash_restart", "TEXT")]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}")
         except Exception:
@@ -3016,63 +3038,6 @@ def install_all_dependencies(deploy_folder: Path, update_logs=None,
     _log(update_logs, "═" * 50)
     return summary
 
-
-# ── backwards-compatible wrappers for existing callers ────────────────────────
-
-def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
-    """Backwards-compat: install a single requirements.txt file."""
-    reqs_file = Path(reqs_file)
-    if not reqs_file.exists():
-        _log(update_logs, "✅ No requirements file found")
-        return True, []
-    if not reqs_file.stat().st_size:
-        _log(update_logs, "⚠️ Requirements file is empty")
-        return True, []
-
-    deploy_folder = reqs_file.parent
-    if packages_dir:
-        packages_dir = Path(packages_dir)
-        packages_dir.mkdir(parents=True, exist_ok=True)
-
-    # Upgrade pip once
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'pip',
-                    '--disable-pip-version-check'], capture_output=True, timeout=60)
-
-    raw = reqs_file.read_text(errors='ignore').strip()
-    pkgs = [ln.split(';')[0].strip() for ln in raw.splitlines()
-            if ln.strip() and not ln.startswith(('#', '-r ', '-c ', '--'))]
-    _log(update_logs, f"📦 {len(pkgs)} package(s)")
-
-    success, failed = 0, []
-    for i, pkg in enumerate(pkgs):
-        pct = int(i / len(pkgs) * 100) if pkgs else 100
-        _log(update_logs, create_progress_bar(pct, 25))
-        _log(update_logs, f"   ⬇️  {pkg[:70]}")
-        ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=180)
-        if not ok:
-            ok, out = _run(_pip_base(packages_dir) + [pkg], timeout=180)
-        if ok:
-            success += 1
-            _log(update_logs, f"   ✅ {pkg[:60]}")
-        else:
-            failed.append(pkg)
-            _log(update_logs, f"   ❌ {pkg[:50]}: {(out or '').strip().split(chr(10))[-1][:80]}")
-
-    _log(update_logs, create_progress_bar(100, 25))
-    _log(update_logs, f"✅ {success}/{len(pkgs)} installed" +
-         (f" | ⚠️ {len(failed)} failed" if failed else ""))
-    rate = success / len(pkgs) if pkgs else 1.0
-    return rate >= 0.7, failed
-
-
-def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
-    """Backwards-compat: install all dependency sources in a cloned repo."""
-    deploy_folder = Path(deploy_folder)
-    packages_dir = deploy_folder / 'packages'
-    packages_dir.mkdir(exist_ok=True)
-    summary = install_all_dependencies(deploy_folder, update_logs,
-                                       packages_dir=packages_dir)
-    return list(summary.keys())
 
 # ========== ENHANCED DEPENDENCY INSTALLATION ==========
 def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
@@ -6777,6 +6742,9 @@ def handle_callback(callback):
                 [{"text": "⏭️ Skip", "callback_data": "env_skip"}],
                 [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]]})
         return
+
+    # ========== REFERRALS ==========
+    if data == "my_referral":
         show_referral_menu(chat_id, user_id, message_id)
         return
 
@@ -6924,6 +6892,8 @@ def handle_callback(callback):
         else:
             send_message(chat_id, "❌ Permission denied")
         return
+
+    if data.startswith("bug_reply_"):
         if is_admin(user_id):
             report_id = int(data.split("_")[2])
             set_user_step(user_id, f'awaiting_bug_reply_{report_id}')
@@ -7195,7 +7165,7 @@ def handle_message(message):
                 send_message(chat_id,
                     f"Confirm: add **{amount}🪙** to `{target}`?",
                     {"inline_keyboard": [
-                        [{"text": "✅ Confirm", "callback_data": "confirm_add_coins"},
+                        [{"text": "✅ Confirm", "callback_data": "coin_confirm"},
                          {"text": "❌ Cancel",  "callback_data": "admin_panel"}]]})
             except (ValueError, TypeError):
                 send_message(chat_id, "❌ Send a positive whole number (e.g. `50`).")
@@ -7691,11 +7661,161 @@ def deployment_expiry_monitor():
         sleep(60)
 
 
+# Crash-loop protection: cap automatic restarts within a rolling window so a
+# permanently-broken script can't burn CPU restarting forever.
+_AUTO_RESTART_MAX_ATTEMPTS  = 5
+_AUTO_RESTART_WINDOW_SECONDS = 3600  # 1 hour
+
+
+def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
+    """
+    System-initiated relaunch — no chat_id/ownership check, used by the
+    health monitor (crash recovery) and startup reconciliation (host process
+    restart). Unlike the user-facing restart_deployment(), this NEVER extends
+    expire_time — it keeps exactly the expiry the deployment already had, and
+    an already-expired deployment is left alone rather than resurrected.
+
+    Returns a status string: 'restarted', 'expired', 'paused_premium',
+    'files_missing', 'cap_exceeded', 'launch_failed', 'not_found'.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("""SELECT user_id, file_name, is_paused, env_vars, status,
+                        start_time, expire_time, is_free, plan,
+                        crash_restart_count, last_crash_restart
+                 FROM deployments WHERE deployment_id=?""", (deployment_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return "not_found"
+
+    (owner_id, file_name, is_paused, env_vars_json, status,
+     start_time_str, expire_time_str, is_free, plan,
+     crash_count, last_crash_str) = row
+    crash_count = crash_count or 0
+
+    # Never resurrect a deployment whose time is genuinely up.
+    if expire_time_str:
+        try:
+            if datetime.fromisoformat(expire_time_str) < datetime.now():
+                conn.close()
+                return "expired"
+        except Exception:
+            pass
+
+    if is_paused and not is_free and plan != "lifetime":
+        conn.close()
+        return "paused_premium"
+
+    now = datetime.now()
+    if not bypass_cap:
+        if last_crash_str:
+            try:
+                if (now - datetime.fromisoformat(last_crash_str)).total_seconds() > _AUTO_RESTART_WINDOW_SECONDS:
+                    crash_count = 0  # rolling window expired — reset the budget
+            except Exception:
+                crash_count = 0
+        if crash_count >= _AUTO_RESTART_MAX_ATTEMPTS:
+            conn.close()
+            return "cap_exceeded"
+
+    deploy_folder = get_deploy_folder(owner_id, deployment_id)
+    dest_script   = deploy_folder / file_name
+
+    if not deploy_folder.exists() or not dest_script.exists():
+        # Files are gone — almost always means the host's disk was wiped on a
+        # redeploy (see PERSISTENT_DISK_PATH). Nothing to relaunch from.
+        c.execute("UPDATE deployments SET status='stopped', proc_pid=NULL WHERE deployment_id=?",
+                  (deployment_id,))
+        conn.commit()
+        conn.close()
+        try:
+            send_message(owner_id,
+                f"⚠️ **Bot #{deployment_id} could not be restarted**\n\n"
+                f"Its files are missing on disk (most likely lost during a host "
+                f"restart/redeploy). Please redeploy this bot — your account "
+                f"data and coin balance are unaffected.",
+                {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+        except Exception:
+            pass
+        return "files_missing"
+
+    env_vars = json.loads(env_vars_json) if env_vars_json else {}
+    try:
+        code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        code_content = ""
+
+    launcher_script, _ = create_enhanced_launcher_script(
+        deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+
+    env_file = deploy_folder / ".env"
+    env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+
+    start_script = deploy_folder / "start.sh"
+    start_script.write_text(
+        f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+        f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+    start_script.chmod(0o755)
+
+    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+    sleep(4)
+
+    pid_file = deploy_folder / "pid.txt"
+    new_pid = None
+    if pid_file.exists():
+        try:
+            new_pid = int(pid_file.read_text().strip())
+        except Exception:
+            pass
+
+    is_running = False
+    if new_pid:
+        try:
+            os.kill(new_pid, 0)
+            is_running = True
+        except Exception:
+            pass
+
+    if is_running:
+        c.execute("""UPDATE deployments
+                     SET proc_pid=?, status='active', is_paused=0,
+                         crash_restart_count=?, last_crash_restart=?
+                     WHERE deployment_id=?""",
+                  (new_pid, crash_count + 1, now.isoformat(), deployment_id))
+        conn.commit()
+        conn.close()
+        with deployment_lock:
+            active_deployments[deployment_id] = new_pid
+        print(f"🔄 Auto-restarted deployment {deployment_id} ({reason})")
+        try:
+            send_message(owner_id,
+                f"🔄 **Bot #{deployment_id} auto-restarted**\n\n"
+                f"It stopped unexpectedly and has been brought back online automatically.\n"
+                f"Your database and settings are untouched.",
+                {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]})
+        except Exception:
+            pass
+        return "restarted"
+    else:
+        c.execute("""UPDATE deployments
+                     SET status='stopped', proc_pid=NULL,
+                         crash_restart_count=?, last_crash_restart=?
+                     WHERE deployment_id=?""",
+                  (crash_count + 1, now.isoformat(), deployment_id))
+        conn.commit()
+        conn.close()
+        print(f"❌ Auto-restart launch failed for deployment {deployment_id}")
+        return "launch_failed"
+
+
 def process_health_monitor():
     """
-    Runs every 120 s. Checks whether PIDs recorded as 'active' are still alive.
-    If a process has died, the deployment is marked 'stopped' so the user sees
-    the correct status and the slot is freed.
+    Runs every 120 s. Checks whether PIDs recorded as 'active' are still
+    alive. If a process has died, it is automatically relaunched (unless the
+    deployment has expired, is paused pending premium renewal, its files are
+    missing, or it has hit the crash-loop cap) so bots stay up on their own
+    instead of requiring the owner to notice and click Restart.
     """
     print("✅ Process health monitor started")
     while True:
@@ -7704,6 +7824,7 @@ def process_health_monitor():
             c = conn.cursor()
             c.execute("SELECT deployment_id, user_id, proc_pid FROM deployments WHERE status = 'active' AND proc_pid IS NOT NULL")
             active = c.fetchall()
+            conn.close()
 
             for dep_id, uid, proc_pid in active:
                 alive = False
@@ -7715,32 +7836,36 @@ def process_health_monitor():
                 except Exception:
                     alive = True  # unknown error → assume alive
 
-                if not alive:
-                    c.execute("""UPDATE deployments
-                                 SET status='stopped', proc_pid=NULL
-                                 WHERE deployment_id=?""", (dep_id,))
-                    with deployment_lock:
-                        active_deployments.pop(dep_id, None)
-                    print(f"💀 Dead process for deployment {dep_id} (user {uid}) — marked stopped")
+                if alive:
+                    continue
 
-                    # Notify user
-                    try:
-                        c.execute("SELECT is_free FROM deployments WHERE deployment_id=?", (dep_id,))
-                        r2 = c.fetchone()
-                        is_free = r2[0] if r2 else 1
-                        send_message(uid,
-                            f"⚠️ **Bot #{dep_id} Crashed**\n\n"
-                            f"Your bot process stopped unexpectedly.\n"
-                            f"Your database is safe — click Restart to bring it back.",
-                            {"inline_keyboard": [
-                                [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
-                                [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}],
-                            ]})
-                    except Exception:
-                        pass
+                with deployment_lock:
+                    active_deployments.pop(dep_id, None)
+                print(f"💀 Dead process for deployment {dep_id} (user {uid}) — attempting auto-restart")
 
-            conn.commit()
-            conn.close()
+                result = _auto_relaunch_deployment(dep_id, reason="crash")
+
+                if result in ("restarted", "expired", "files_missing", "paused_premium"):
+                    # Each of these already left the deployment in a correct,
+                    # user-visible state (running again, or clearly stopped
+                    # with an explanation) — nothing further to do.
+                    continue
+
+                # cap_exceeded / launch_failed / not_found: auto-restart
+                # couldn't bring it back — fall back to a manual prompt so
+                # the owner isn't left in the dark.
+                try:
+                    send_message(uid,
+                        f"⚠️ **Bot #{dep_id} Crashed**\n\n"
+                        f"Automatic restart didn't succeed. Your database is safe — "
+                        f"click Restart to try again manually.",
+                        {"inline_keyboard": [
+                            [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
+                            [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}],
+                        ]})
+                except Exception:
+                    pass
+
         except Exception as e:
             print(f"❌ Health monitor error: {e}")
 
@@ -7767,9 +7892,55 @@ def start_health_server():
         print(f"⚠️ Health server: {e}")
 
 # ==================== MAIN ====================
+def reconcile_deployments_on_startup():
+    """
+    Runs once at boot, after the (possibly GitHub-restored) database is
+    loaded. Any deployment marked 'active' in the DB has a proc_pid from the
+    PREVIOUS process — meaningless here, since this is a fresh interpreter
+    (whether from a crash, a manual restart, or a redeploy). Without this,
+    those bots would just sit in the DB as "active" while nothing is actually
+    running, until someone happens to notice and click Restart. Non-expired
+    ones are relaunched; ones whose files didn't survive (see
+    PERSISTENT_DISK_PATH) are marked stopped with a clear explanation.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT deployment_id FROM deployments WHERE status IN ('active', 'paused')")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    print(f"🔄 Reconciling {len(rows)} deployment(s) from previous run...")
+    counts = {}
+    for (dep_id,) in rows:
+        result = _auto_relaunch_deployment(dep_id, reason="startup", bypass_cap=True)
+        counts[result] = counts.get(result, 0) + 1
+        sleep(0.5)  # avoid hammering disk/CPU relaunching many bots at once
+
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items())
+    print(f"✅ Reconciliation complete: {summary}")
+
+    if counts.get("files_missing"):
+        print(f"⚠️  {counts['files_missing']} deployment(s) lost their files on this restart. "
+              f"This means BASE_DIR is not on a real persistent disk — set the "
+              f"PERSISTENT_DISK_PATH env var to a mounted Render Disk to fix this permanently.")
+
+
 def main():
     global LAST_UPDATE_ID
     
+    if (IS_RENDER or IS_HEROKU or IS_CHOREO) and not USING_PERSISTENT_DISK:
+        print("=" * 70)
+        print("⚠️  WARNING: no persistent disk configured (PERSISTENT_DISK_PATH unset).")
+        print("   Deployment files live inside the app's own source checkout, which")
+        print("   most cloud platforms rebuild from git on every redeploy. Deployed")
+        print("   bots' code/packages will NOT survive a redeploy unless you attach")
+        print("   a real persistent disk and point PERSISTENT_DISK_PATH at its mount.")
+        print("   (The database itself is separately backed up to GitHub if configured.)")
+        print("=" * 70)
+
     # ── Restore database from GitHub BEFORE init_db() ──────────────
     # This must happen first so we never overwrite existing data with
     # a fresh empty schema.
@@ -7777,6 +7948,10 @@ def main():
     # ───────────────────────────────────────────────────────────────
     
     init_db()
+
+    # ── Bring back whatever was running before this process started ──
+    reconcile_deployments_on_startup()
+    # ───────────────────────────────────────────────────────────────
     
     # Start health check server for cloud platforms
     if IS_RENDER or IS_HEROKU or IS_CHOREO:
