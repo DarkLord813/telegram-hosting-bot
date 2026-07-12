@@ -2404,6 +2404,84 @@ class UniversalDependencyInstaller:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_INSTALL_TIMEOUT)
         return result.returncode == 0, result.stderr[:200] if result.stderr else ""
 
+    IMPORT_MAPPING = {
+        'flask': 'flask', 'django': 'django', 'fastapi': 'fastapi',
+        'aiohttp': 'aiohttp', 'tornado': 'tornado', 'sanic': 'sanic',
+        'telegram': 'python-telegram-bot', 'aiogram': 'aiogram',
+        'pyrogram': 'pyrogram', 'telethon': 'telethon',
+        'discord': 'discord.py', 'nextcord': 'nextcord',
+        'sqlalchemy': 'sqlalchemy', 'psycopg2': 'psycopg2-binary',
+        'pymysql': 'pymysql', 'pymongo': 'pymongo', 'redis': 'redis',
+        'requests': 'requests', 'httpx': 'httpx',
+        'numpy': 'numpy', 'pandas': 'pandas', 'scipy': 'scipy',
+        'PIL': 'Pillow', 'cv2': 'opencv-python',
+        'bs4': 'beautifulsoup4', 'selenium': 'selenium',
+        'dotenv': 'python-dotenv', 'click': 'click',
+        'cryptography': 'cryptography', 'jwt': 'pyjwt',
+        'yaml': 'pyyaml', 'toml': 'toml',
+        'boto3': 'boto3', 'psutil': 'psutil', 'loguru': 'loguru',
+        'rich': 'rich', 'tqdm': 'tqdm', 'uvicorn': 'uvicorn',
+        'gunicorn': 'gunicorn', 'celery': 'celery',
+    }
+
+    @classmethod
+    def scan_imports(cls, code_content: str, update_logs: callable) -> list:
+        """Automatically detect required dependencies by scanning code"""
+        detected = set()
+        lines = code_content.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            match = re.match(r'^(?:from|import)\s+([a-zA-Z0-9_\.]+)', line)
+            if match:
+                module = match.group(1).split('.')[0]
+                if module in cls.IMPORT_MAPPING:
+                    package = cls.IMPORT_MAPPING[module]
+                    if package and package not in detected:
+                        detected.add(package)
+                        update_logs(f"   🔍 Detected: {module} → {package}")
+                elif module not in ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 
+                                     'string', 'collections', 'itertools', 'functools', 'typing', 'pathlib',
+                                     'tempfile', 'subprocess', 'threading', 'multiprocessing', 'socket',
+                                     'ssl', 'hashlib', 'base64', 'zipfile', 'tarfile', 'shutil', 'glob',
+                                     'io', 'abc', 'copy', 'enum', 'struct', 'queue', 'weakref',
+                                     'contextlib', 'dataclasses', 'inspect', 'logging', 'warnings',
+                                     'argparse', 'configparser', 'csv', 'html', 'http', 'urllib',
+                                     'uuid', 'decimal', 'fractions', 'statistics', 'operator',
+                                     'concurrent', 'asyncio', 'signal', 'platform', 'traceback',
+                                     'pprint', 'textwrap', 'binascii', 'hmac', 'secrets']:
+                    # Only add if it looks like a real installable package (not a relative import or internal module)
+                    if module and not module.startswith('_') and len(module) > 1:
+                        guessed = module.replace('_', '-')
+                        if module == 'bs4':
+                            guessed = 'beautifulsoup4'
+                        elif module == 'cv2':
+                            guessed = 'opencv-python'
+                        elif module == 'PIL':
+                            guessed = 'Pillow'
+                        elif module == 'sklearn':
+                            guessed = 'scikit-learn'
+                        elif module == 'wx':
+                            guessed = 'wxPython'
+                        # Only guess if it's plausibly a PyPI package name
+                        if guessed and re.match(r'^[a-zA-Z][a-zA-Z0-9\-\.]+$', guessed):
+                            detected.add(guessed)
+                            update_logs(f"   🔍 Guessed: {module} → {guessed}")
+        
+        return list(detected)
+
+    @classmethod
+    def scan_requirements_file(cls, content: str, update_logs: callable) -> list:
+        requirements = []
+        for line in content.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('-r'):
+                if ';' in line:
+                    line = line.split(';')[0].strip()
+                requirements.append(line)
+                update_logs(f"   📄 From requirements: {line[:60]}")
+        return requirements
+
 # ==================== VPS DEPENDENCY ENGINE ====================
 # Supports every package manager a real hosting server would handle.
 
@@ -2995,84 +3073,6 @@ def install_from_repo_requirements(deploy_folder: Path, update_logs) -> list:
     summary = install_all_dependencies(deploy_folder, update_logs,
                                        packages_dir=packages_dir)
     return list(summary.keys())
-    """Automatically detect required dependencies by scanning code"""
-    
-    IMPORT_MAPPING = {
-        'flask': 'flask', 'django': 'django', 'fastapi': 'fastapi',
-        'aiohttp': 'aiohttp', 'tornado': 'tornado', 'sanic': 'sanic',
-        'telegram': 'python-telegram-bot', 'aiogram': 'aiogram',
-        'pyrogram': 'pyrogram', 'telethon': 'telethon',
-        'discord': 'discord.py', 'nextcord': 'nextcord',
-        'sqlalchemy': 'sqlalchemy', 'psycopg2': 'psycopg2-binary',
-        'pymysql': 'pymysql', 'pymongo': 'pymongo', 'redis': 'redis',
-        'requests': 'requests', 'httpx': 'httpx',
-        'numpy': 'numpy', 'pandas': 'pandas', 'scipy': 'scipy',
-        'PIL': 'Pillow', 'cv2': 'opencv-python',
-        'bs4': 'beautifulsoup4', 'selenium': 'selenium',
-        'dotenv': 'python-dotenv', 'click': 'click',
-        'cryptography': 'cryptography', 'jwt': 'pyjwt',
-        'yaml': 'pyyaml', 'toml': 'toml',
-        'boto3': 'boto3', 'psutil': 'psutil', 'loguru': 'loguru',
-        'rich': 'rich', 'tqdm': 'tqdm', 'uvicorn': 'uvicorn',
-        'gunicorn': 'gunicorn', 'celery': 'celery',
-    }
-    
-    @classmethod
-    def scan_imports(cls, code_content: str, update_logs: callable) -> list:
-        detected = set()
-        lines = code_content.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            match = re.match(r'^(?:from|import)\s+([a-zA-Z0-9_\.]+)', line)
-            if match:
-                module = match.group(1).split('.')[0]
-                if module in cls.IMPORT_MAPPING:
-                    package = cls.IMPORT_MAPPING[module]
-                    if package and package not in detected:
-                        detected.add(package)
-                        update_logs(f"   🔍 Detected: {module} → {package}")
-                elif module not in ['os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 
-                                     'string', 'collections', 'itertools', 'functools', 'typing', 'pathlib',
-                                     'tempfile', 'subprocess', 'threading', 'multiprocessing', 'socket',
-                                     'ssl', 'hashlib', 'base64', 'zipfile', 'tarfile', 'shutil', 'glob',
-                                     'io', 'abc', 'copy', 'enum', 'struct', 'queue', 'weakref',
-                                     'contextlib', 'dataclasses', 'inspect', 'logging', 'warnings',
-                                     'argparse', 'configparser', 'csv', 'html', 'http', 'urllib',
-                                     'uuid', 'decimal', 'fractions', 'statistics', 'operator',
-                                     'concurrent', 'asyncio', 'signal', 'platform', 'traceback',
-                                     'pprint', 'textwrap', 'binascii', 'hmac', 'secrets']:
-                    # Only add if it looks like a real installable package (not a relative import or internal module)
-                    if module and not module.startswith('_') and len(module) > 1:
-                        guessed = module.replace('_', '-')
-                        if module == 'bs4':
-                            guessed = 'beautifulsoup4'
-                        elif module == 'cv2':
-                            guessed = 'opencv-python'
-                        elif module == 'PIL':
-                            guessed = 'Pillow'
-                        elif module == 'sklearn':
-                            guessed = 'scikit-learn'
-                        elif module == 'wx':
-                            guessed = 'wxPython'
-                        # Only guess if it's plausibly a PyPI package name
-                        if guessed and re.match(r'^[a-zA-Z][a-zA-Z0-9\-\.]+$', guessed):
-                            detected.add(guessed)
-                            update_logs(f"   🔍 Guessed: {module} → {guessed}")
-        
-        return list(detected)
-    
-    @classmethod
-    def scan_requirements_file(cls, content: str, update_logs: callable) -> list:
-        requirements = []
-        for line in content.split('\n'):
-            line = line.strip()
-            if line and not line.startswith('#') and not line.startswith('-r'):
-                if ';' in line:
-                    line = line.split(';')[0].strip()
-                requirements.append(line)
-                update_logs(f"   📄 From requirements: {line[:60]}")
-        return requirements
 
 # ========== ENHANCED DEPENDENCY INSTALLATION ==========
 def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
