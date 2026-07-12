@@ -981,14 +981,15 @@ def github_restore_db():
         print(f"❌ GitHub restore error: {e}")
         return False
 
-def github_backup_db(reason: str = "auto"):
+def github_backup_db(reason: str = "auto", force: bool = False):
     """
     Upload DATABASE_FILE to GitHub.  Thread-safe via push lock.
     Silently skips when:
       • GitHub is not configured
       • The database is empty / has no real rows
-      • Another backup is already in flight
+      • Another backup is already in flight (force=True waits briefly instead)
       • The previous backup was less than _MIN_BACKUP_INTERVAL seconds ago
+        (force=True bypasses this — for explicit manual/admin-triggered backups)
     """
     global _last_backup_time
 
@@ -999,10 +1000,14 @@ def github_backup_db(reason: str = "auto"):
         return False
 
     now = datetime.now().timestamp()
-    if now - _last_backup_time < _MIN_BACKUP_INTERVAL:
+    if not force and now - _last_backup_time < _MIN_BACKUP_INTERVAL:
         return False   # too soon — silent
 
-    if not _github_push_lock.acquire(blocking=False):
+    if force:
+        acquired = _github_push_lock.acquire(blocking=True, timeout=15)
+    else:
+        acquired = _github_push_lock.acquire(blocking=False)
+    if not acquired:
         return False   # another backup already running
 
     try:
@@ -1713,6 +1718,58 @@ def answer_callback(callback_id, text=None, show_alert=False):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"Answer callback error: {e}")
+
+def send_document(chat_id, file_path, caption=None, filename=None):
+    """
+    Upload a local file to Telegram via sendDocument. Pure urllib multipart
+    encoding — no extra dependencies (mirrors send_message's style).
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        print(f"❌ send_document: file not found: {file_path}")
+        return None
+
+    filename = filename or file_path.name
+    boundary = f"----HostingBotBoundary{secrets.token_hex(16)}"
+
+    def _field(name, value):
+        return (f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f'{value}\r\n').encode('utf-8')
+
+    body = b""
+    body += _field("chat_id", chat_id)
+    if caption:
+        body += _field("caption", str(caption)[:1024])
+        body += _field("parse_mode", "Markdown")
+
+    body += (f'--{boundary}\r\n'
+             f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+             f'Content-Type: application/octet-stream\r\n\r\n').encode('utf-8')
+    body += file_path.read_bytes()
+    body += f'\r\n--{boundary}--\r\n'.encode('utf-8')
+
+    url = f"{TELEGRAM_API}/sendDocument"
+    for _attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                sleep(2 * (_attempt + 1))
+                continue
+            try: err_body = e.read().decode()[:300]
+            except Exception: err_body = ''
+            print(f"❌ send_document HTTP {e.code}: {err_body}")
+            return None
+        except Exception as e:
+            print(f"❌ send_document error (attempt {_attempt+1}): {e}")
+            if _attempt < 2:
+                sleep(1)
+    return None
 
 def http_get(url, params=None):
     try:
@@ -5521,6 +5578,177 @@ def get_env_keyboard(env_count):
     }
 
 # ==================== ADMIN PANEL ====================
+def admin_database_menu(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    try:
+        size_kb = DATABASE_FILE.stat().st_size / 1024 if DATABASE_FILE.exists() else 0
+    except Exception:
+        size_kb = 0
+    gh_status = "✅ Configured" if GITHUB_ENABLED else "❌ Not configured"
+    last_backup = (f"{int(datetime.now().timestamp() - _last_backup_time)}s ago"
+                   if _last_backup_time else "never (this run)")
+    text = (
+        f"**💾 DATABASE BACKUP**\n\n"
+        f"📦 Current size: `{size_kb:.1f} KB`\n"
+        f"☁️ GitHub backup: {gh_status}\n"
+        f"🕐 Last GitHub push: `{last_backup}`\n\n"
+        f"• **Backup Now** — pushes the current database to GitHub immediately.\n"
+        f"• **Download** — sends you the raw `.db` file here in chat.\n"
+        f"• **Restore** — replaces the live database with a `.db` file you "
+        f"upload. A safety copy of the current database is made first."
+    )
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔄 Backup to GitHub Now", "callback_data": "admin_db_backup_now"}],
+        [{"text": "⬇️ Download DB File",      "callback_data": "admin_db_download"}],
+        [{"text": "⬆️ Restore from File",     "callback_data": "admin_db_restore_start"}],
+        [{"text": "🔙 Back to Admin Panel",   "callback_data": "admin_panel"}],
+    ]}
+    edit_message(chat_id, message_id, text, keyboard)
+
+
+def admin_db_backup_now(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    if not GITHUB_ENABLED:
+        edit_message(chat_id, message_id,
+            "❌ GitHub backup isn't configured.\n\n"
+            "Set `GITHUB_TOKEN`, `GITHUB_REPO_OWNER`, and `GITHUB_REPO_NAME` to enable it.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+        return
+    edit_message(chat_id, message_id, "🔄 Backing up to GitHub...")
+    ok = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
+    if ok:
+        edit_message(chat_id, message_id,
+            "✅ **Backup complete!**\n\nThe database was pushed to GitHub successfully.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+    else:
+        edit_message(chat_id, message_id,
+            "❌ **Backup failed.**\n\nCheck the server logs (invalid token, repo not "
+            "found, or the database has no data yet are the usual causes).",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+
+
+def admin_db_download(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    if not DATABASE_FILE.exists():
+        edit_message(chat_id, message_id, "❌ No database file found.",
+                     {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+        return
+    edit_message(chat_id, message_id, "⬇️ Preparing your database file...")
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    result = send_document(chat_id, DATABASE_FILE,
+                            caption=f"💾 Database backup — {ts}",
+                            filename=f"hosting_bot_backup_{ts}.db")
+    if result and result.get('ok'):
+        edit_message(chat_id, message_id, "✅ Database file sent above.",
+                     {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+    else:
+        edit_message(chat_id, message_id, "❌ Failed to send the database file. Check server logs.",
+                     {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+
+
+def admin_db_restore_start(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    set_user_step(user_id, 'awaiting_db_restore')
+    edit_message(chat_id, message_id,
+        "**⬆️ RESTORE DATABASE**\n\n"
+        "Send the `.db` file to restore.\n\n"
+        "⚠️ This replaces ALL current data (users, deployments, coins, "
+        "everything) with the contents of the file you send. A safety copy "
+        "of the current database is made automatically before the swap.\n\n"
+        "Send the file now, or cancel below.",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_database"}]]})
+
+
+def handle_db_restore_upload(message, user_id, chat_id):
+    """Admin uploaded a .db file in response to admin_db_restore_start."""
+    if not is_admin(user_id):
+        return
+
+    doc = message['document']
+    file_size = doc.get('file_size', 0)
+    if file_size > 200 * 1024 * 1024:  # sanity cap — a real DB shouldn't be this big
+        send_message(chat_id, "❌ File too large to be a plausible database restore (>200MB).")
+        return
+
+    file_id = doc['file_id']
+    file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
+    if not (file_info and file_info.get('ok')):
+        send_message(chat_id, "❌ Could not download the file from Telegram.")
+        return
+
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
+    try:
+        with urllib.request.urlopen(file_url, timeout=60) as resp:
+            new_db_bytes = resp.read()
+    except Exception as e:
+        send_message(chat_id, f"❌ Download failed: {e}")
+        return
+
+    # Validate it's actually a SQLite database before touching anything live.
+    if not new_db_bytes.startswith(b"SQLite format 3\x00"):
+        send_message(chat_id,
+            "❌ That file doesn't look like a valid SQLite database (missing "
+            "the SQLite file header). Restore aborted — nothing was changed.")
+        return
+    if len(new_db_bytes) < 1024:
+        send_message(chat_id, "❌ That file is suspiciously small to be a real database. Restore aborted.")
+        return
+
+    set_user_step(user_id, None)
+
+    # Safety net: snapshot the CURRENT database before overwriting it — both
+    # locally and (if configured) to GitHub — so a bad restore is recoverable
+    # and no in-flight information gets lost without a way back.
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    safety_path = DATABASE_FILE.parent / f"pre_restore_backup_{ts}.db"
+    try:
+        if DATABASE_FILE.exists():
+            shutil.copy2(DATABASE_FILE, safety_path)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Could not create a local safety copy ({e}) — continuing anyway.")
+
+    if GITHUB_ENABLED:
+        github_backup_db(reason=f"pre_restore_safety_{user_id}", force=True)
+
+    try:
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DATABASE_FILE, "wb") as f:
+            f.write(new_db_bytes)
+    except Exception as e:
+        send_message(chat_id, f"❌ Restore failed while writing the file: {e}")
+        return
+
+    # Re-run migrations in case the uploaded DB predates newer columns.
+    try:
+        init_db()
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Database restored, but schema migration hit an error: {e}")
+
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        users_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        deploys_count = conn.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
+        conn.close()
+        send_message(chat_id,
+            f"✅ **Database restored successfully!**\n\n"
+            f"👥 Users: `{users_count}`\n"
+            f"📦 Deployments: `{deploys_count}`\n\n"
+            f"A safety copy of the previous database was kept as "
+            f"`{safety_path.name}` on disk"
+            + (" and pushed to GitHub." if GITHUB_ENABLED else "."),
+            {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+    except Exception as e:
+        send_message(chat_id,
+            f"⚠️ Database file was replaced, but it doesn't look like a valid "
+            f"hosting-bot database (schema check failed: {e}). "
+            f"Your previous database is saved at `{safety_path.name}`.",
+            {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+
+
 def show_admin_panel(chat_id, message_id):
     stats = get_system_stats()
 
@@ -5565,6 +5793,7 @@ def show_admin_panel(chat_id, message_id):
             [{"text": "📋 List Redeem Codes",        "callback_data": "admin_list_codes"}],
             [{"text": "👥 List Users",               "callback_data": "admin_list_users"}],
             [{"text": "📊 View Subscriptions",       "callback_data": "admin_subscriptions"}],
+            [{"text": "💾 Database Backup",          "callback_data": "admin_database"}],
             [{"text": "🔙 Back to Main Menu",        "callback_data": "main_menu"}]
         ]
     }
@@ -6248,6 +6477,29 @@ def handle_callback(callback):
     if data == "admin_subscriptions":
         if is_admin(user_id):
             admin_subscriptions(chat_id, message_id)
+        return
+
+    # ========== ADMIN DATABASE BACKUP/RESTORE ==========
+    if data == "admin_database":
+        if is_admin(user_id):
+            admin_database_menu(chat_id, message_id, user_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+
+    if data == "admin_db_backup_now":
+        if is_admin(user_id):
+            admin_db_backup_now(chat_id, message_id, user_id)
+        return
+
+    if data == "admin_db_download":
+        if is_admin(user_id):
+            admin_db_download(chat_id, message_id, user_id)
+        return
+
+    if data == "admin_db_restore_start":
+        if is_admin(user_id):
+            admin_db_restore_start(chat_id, message_id, user_id)
         return
     
     if data == "admin_create_code":
@@ -7344,6 +7596,12 @@ def handle_message(message):
         file_name = doc.get('file_name', 'unknown')
         file_size = doc.get('file_size', 0)
         print(f"📁 File: {file_name} ({format_file_size(file_size)})")
+
+        # ── Admin database restore — checked first, before the normal bot-file
+        # size/type gates, since a .db backup isn't subject to those limits ──
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_db_restore':
+            handle_db_restore_upload(message, user_id, chat_id)
+            return
         
         if file_size > MAX_FILE_SIZE_BYTES:
             send_message(chat_id, f"❌ File too large! Max {MAX_FILE_SIZE_MB}MB")
