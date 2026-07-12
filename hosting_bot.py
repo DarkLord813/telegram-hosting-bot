@@ -3945,7 +3945,16 @@ sys.stdout.flush()
 import subprocess
 
 try:
-    result = subprocess.run([sys.executable, r"{dest_script}"], env=os.environ.copy())
+    _child_env = os.environ.copy()
+    # sys.path.insert(0, _pkg_dir) above only affected THIS process's import
+    # path — a subprocess gets a fresh interpreter with its own default
+    # sys.path, so packages installed into the per-deployment packages/ dir
+    # (via `pip install --target`) would otherwise be invisible to it.
+    # Propagate via PYTHONPATH so the child can find them too.
+    if os.path.isdir(_pkg_dir):
+        _existing_pp = _child_env.get('PYTHONPATH', '')
+        _child_env['PYTHONPATH'] = _pkg_dir + (os.pathsep + _existing_pp if _existing_pp else '')
+    result = subprocess.run([sys.executable, r"{dest_script}"], env=_child_env)
     sys.exit(result.returncode)
 except KeyboardInterrupt:
     print("\\n🛑 Stopped by user")
