@@ -4155,6 +4155,10 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
     Full deployment flow for a GitHub repo:
     download → detect requirements → install → launch.
     """
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return False
+
     status_msg = send_message(chat_id, "```\n🐙 GITHUB DEPLOYMENT STARTING\n```", None)
     status_message_id = status_msg.get('result', {}).get('message_id') if status_msg else None
     logs = []
@@ -4303,7 +4307,13 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
         if is_running:
             start_time  = datetime.now()
-            expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS if is_free else duration * 24)
+            is_lifetime = (plan == "lifetime")
+            if is_lifetime:
+                expire_time = None
+            elif is_free:
+                expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            else:
+                expire_time = start_time + timedelta(hours=duration * 24)
 
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
@@ -4315,7 +4325,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (user_id, dest_script.name, file_size, "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
-                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 start_time.isoformat(), expire_time.isoformat() if expire_time else None, "active", proc_pid,
                  "\n".join(logs[-100:]), "GitHub bot running",
                  1 if is_free else 0, 0, ', '.join(frameworks),
                  json.dumps([]), str(deploy_id),
@@ -4328,7 +4338,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             with deployment_lock:
                 active_deployments[deployment_db_id] = proc_pid
 
-            expire_str = expire_time.strftime('%Y-%m-%d %H:%M')
+            expire_str = "Never (lifetime)" if is_lifetime else expire_time.strftime('%Y-%m-%d %H:%M')
             edit_message(chat_id, status_message_id,
                 f"**🎉 GITHUB DEPLOYMENT SUCCESSFUL!**\n\n"
                 f"🐙 **Repo:** `{owner}/{repo}`\n"
@@ -4371,6 +4381,12 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
 def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars, 
                      plan, duration, cost_coins, cost_stars, payment_method, is_free=False):
+    # Defense in depth: lifetime deployments are admin-only no matter how this
+    # function got called — never trust the caller alone for this check.
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return False
+
     status_msg = send_message(chat_id, "```\n🚀 STARTING DEPLOYMENT\n```", None)
     if not status_msg:
         return False
@@ -4429,9 +4445,9 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         requirements_list = []
         
         if requirements_text and requirements_text.strip():
-            requirements_list = AutoDependencyDetector.scan_requirements_file(requirements_text, update_logs)
+            requirements_list = UniversalDependencyInstaller.scan_requirements_file(requirements_text, update_logs)
         else:
-            auto_detected = AutoDependencyDetector.scan_imports(code_content, update_logs)
+            auto_detected = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
             if auto_detected:
                 requirements_list.extend(auto_detected)
                 update_logs(f"📦 Auto-detected {len(auto_detected)} package(s)")
@@ -4529,7 +4545,13 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         
         if is_running:
             start_time = datetime.now()
-            expire_time = start_time + timedelta(days=duration) if not is_free else start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            is_lifetime = (plan == "lifetime")
+            if is_lifetime:
+                expire_time = None
+            elif is_free:
+                expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+            else:
+                expire_time = start_time + timedelta(days=duration)
             
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
@@ -4539,7 +4561,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
-                 start_time.isoformat(), expire_time.isoformat(), "active", proc_pid,
+                 start_time.isoformat(), expire_time.isoformat() if expire_time else None, "active", proc_pid,
                  "\n".join(logs[-100:]), "Bot running", 1 if is_free else 0, 0,
                  ', '.join(frameworks), json.dumps(requirements_list), str(deploy_id)))
             deployment_db_id = c.lastrowid
@@ -4560,13 +4582,18 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 ]
             }
             
+            expiry_line = "📅 **Expires:** `Never (lifetime)`" if is_lifetime \
+                else f"📅 **Expires:** {expire_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            duration_line = "⏱️ **Duration:** Lifetime — never expires" if is_lifetime \
+                else f"⏱️ **Duration:** {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
+
             success_text = (
                 f"**🎉 DEPLOYMENT SUCCESSFUL!** 🎉\n\n"
                 f"📁 **File:** `{dest_script.name}`\n"
                 f"🤖 **Platform:** {get_platform_label(frameworks)}\n"
                 f"📋 **Plan:** {plan.upper()}\n"
-                f"⏱️ **Duration:** {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}\n"
-                f"📅 **Expires:** {expire_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{duration_line}\n"
+                f"{expiry_line}\n"
                 f"📦 **Dependencies:** {len(requirements_list)} package(s)\n"
                 f"🔧 **Env Vars:** {len(env_vars_dict)}\n"
                 f"🆔 **ID:** `{deployment_db_id}`"
@@ -4768,7 +4795,9 @@ def restart_deployment(deployment_id, user_id, chat_id):
             return False
 
         # Paused premium bots require premium renewal, not a simple restart
-        if is_paused and not is_free:
+        # (lifetime deployments never expire, so they never legitimately hit
+        # this state — but guard it anyway rather than trust that invariant)
+        if is_paused and not is_free and plan != "lifetime":
             send_message(chat_id,
                 "⏸️ This premium deployment is paused.\n\n"
                 "Purchase or renew premium to resume it — your database stays intact.",
@@ -4834,22 +4863,27 @@ def restart_deployment(deployment_id, user_id, chat_id):
                 pass
 
         if is_running:
-            # For stopped/expired bots: extend expiry from now
-            current_expire = datetime.fromisoformat(expire_time_str)
-            if status in ('stopped', 'failed') or current_expire < datetime.now():
-                if is_free:
-                    new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
-                else:
-                    # Premium restart: keep original duration window
-                    original_hours = max(1, (current_expire - datetime.fromisoformat(start_time_str)).total_seconds() / 3600)
-                    new_expire = datetime.now() + timedelta(hours=original_hours)
-                c.execute("""UPDATE deployments
-                             SET proc_pid=?, status='active', is_paused=0, expire_time=?, start_time=?
-                             WHERE deployment_id=?""",
-                          (new_pid, new_expire.isoformat(), datetime.now().isoformat(), deployment_id))
-            else:
+            if expire_time_str is None:
+                # Lifetime deployment — never had an expiry and never gets one.
                 c.execute("UPDATE deployments SET proc_pid=?, status='active', is_paused=0 WHERE deployment_id=?",
                           (new_pid, deployment_id))
+            else:
+                # For stopped/expired bots: extend expiry from now
+                current_expire = datetime.fromisoformat(expire_time_str)
+                if status in ('stopped', 'failed') or current_expire < datetime.now():
+                    if is_free:
+                        new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+                    else:
+                        # Premium restart: keep original duration window
+                        original_hours = max(1, (current_expire - datetime.fromisoformat(start_time_str)).total_seconds() / 3600)
+                        new_expire = datetime.now() + timedelta(hours=original_hours)
+                    c.execute("""UPDATE deployments
+                                 SET proc_pid=?, status='active', is_paused=0, expire_time=?, start_time=?
+                                 WHERE deployment_id=?""",
+                              (new_pid, new_expire.isoformat(), datetime.now().isoformat(), deployment_id))
+                else:
+                    c.execute("UPDATE deployments SET proc_pid=?, status='active', is_paused=0 WHERE deployment_id=?",
+                              (new_pid, deployment_id))
 
             conn.commit()
             conn.close()
@@ -5002,10 +5036,14 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     
     fname, fsize, plan, payment, cost_coins, cost_stars, start_str, expire_str, status, is_free, requirements, env_vars_json, error_log, is_paused, framework = row
     start_time = datetime.fromisoformat(start_str)
-    expire_time = datetime.fromisoformat(expire_str)
+    is_lifetime = (expire_str is None)
+    expire_time = datetime.fromisoformat(expire_str) if expire_str else None
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
     
-    if is_free:
+    if is_lifetime:
+        cost_text      = "FREE (Lifetime)"
+        remaining_text = "Never expires"
+    elif is_free:
         remaining_secs = max(0, (expire_time - datetime.now()).total_seconds())
         remaining_h    = int(remaining_secs / 3600)
         remaining_m    = int((remaining_secs % 3600) / 60)
@@ -5094,7 +5132,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         f"📋 Plan: `{plan.upper()}`\n"
         f"💰 Cost: {cost_text}\n"
         f"📅 Started: `{start_time.strftime('%Y-%m-%d %H:%M')}`\n"
-        f"⏰ Expires: `{expire_time.strftime('%Y-%m-%d %H:%M')}`\n"
+        f"⏰ Expires: `{'Never (lifetime)' if is_lifetime else expire_time.strftime('%Y-%m-%d %H:%M')}`\n"
         f"📊 Remaining: `{remaining_text}`\n"
         f"🔘 Status: {status_emoji}\n"
         f"📦 Requirements:\n`{reqs_text}`\n\n"
@@ -5292,11 +5330,27 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
     if not is_user_verified(user_id):
         send_verification_required(chat_id, user_id, "User", message_id)
         return
+
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return
     
     set_user_step(user_id, 'awaiting_file', plan=plan, duration=duration,
                   cost_coins=cost_coins, cost_stars=cost_stars, payment_method=None)
     
-    if is_user_premium(user_id) or is_admin(user_id):
+    if plan == "lifetime":
+        text = (
+            f"**♾️ LIFETIME DEPLOYMENT (ADMIN)**\n\n"
+            f"⏱️ Duration: `Never expires`\n"
+            f"💰 Cost: FREE\n\n"
+            f"📤 **Send your file (.py, .js, etc.)**\n"
+            f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
+            f"After sending the file, send:\n"
+            f"• requirements.txt / package.json (optional)\n"
+            f"• Environment variables (KEY=VALUE, one per line)\n\n"
+            f"**Note:** All environment variables will be available via os.environ.get('KEY')"
+        )
+    elif is_user_premium(user_id) or is_admin(user_id):
         text = (
             f"**✨ PREMIUM BENEFIT!**\n\n"
             f"Your {plan.upper()} deployment is **FREE** as a premium member!\n\n"
@@ -5352,13 +5406,16 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
     
     keyboard = {"inline_keyboard": []}
     for dep_id, fname, fsize, plan, exp_str, status, is_free, payment, is_paused, framework in rows:
-        exp_time = datetime.fromisoformat(exp_str)
-        if is_free:
-            remaining = (exp_time - datetime.now()).total_seconds() / 3600
-            remaining_text = f"{int(remaining)}h"
+        if exp_str is None:
+            remaining_text = "♾️"
         else:
-            remaining = (exp_time - datetime.now()).days
-            remaining_text = f"{remaining}d"
+            exp_time = datetime.fromisoformat(exp_str)
+            if is_free:
+                remaining = (exp_time - datetime.now()).total_seconds() / 3600
+                remaining_text = f"{int(remaining)}h"
+            else:
+                remaining = (exp_time - datetime.now()).days
+                remaining_text = f"{remaining}d"
         
         if status == "active":
             status_icon = "✅"
@@ -5461,6 +5518,12 @@ def get_deploy_menu(user_id):
                 [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
             ]
         }
+
+    # ── Lifetime deployment: admins only ────────────────────────────
+    if is_admin(user_id):
+        keyboard["inline_keyboard"].insert(
+            -1, [{"text": "♾️ Lifetime (never expires) — ADMIN", "callback_data": "plan_lifetime"}])
+
     return keyboard
 
 def get_reqs_keyboard():
@@ -5931,7 +5994,14 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
         env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token
 
     # Determine plan & cost from user's subscription status
-    if is_user_premium(user_id) or is_admin(user_id):
+    if is_admin(user_id):
+        plan           = 'lifetime'
+        duration       = 0
+        cost_coins     = 0
+        cost_stars     = 0
+        payment_method = 'premium_free'
+        is_free        = False
+    elif is_user_premium(user_id):
         plan           = 'monthly'
         duration       = 30
         cost_coins     = 0
@@ -6302,6 +6372,13 @@ def handle_callback(callback):
     
     if data == "plan_yearly":
         handle_paid_deployment(chat_id, user_id, message_id, "yearly", 365, PRICE_YEARLY_COINS, PRICE_YEARLY_STARS)
+        return
+
+    if data == "plan_lifetime":
+        if not is_admin(user_id):
+            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
+            return
+        handle_paid_deployment(chat_id, user_id, message_id, "lifetime", 0, 0, 0)
         return
     
     if data == "free_deployment":
@@ -7540,10 +7617,14 @@ def deployment_expiry_monitor():
             c = conn.cursor()
             now_iso = datetime.now().isoformat()
 
-            # Find all active/paused deployments that have expired
+            # Find all active/paused deployments that have expired.
+            # expire_time IS NULL means a lifetime (never-expiring) deployment —
+            # SQLite's NULL <= x is already NULL/false so these are naturally
+            # excluded, but the explicit check makes the intent unambiguous.
             c.execute("""SELECT deployment_id, user_id, proc_pid, is_free, plan, folder_name
                          FROM deployments
-                         WHERE status IN ('active', 'paused') AND expire_time <= ?""",
+                         WHERE status IN ('active', 'paused')
+                           AND expire_time IS NOT NULL AND expire_time <= ?""",
                       (now_iso,))
             expired = c.fetchall()
 
