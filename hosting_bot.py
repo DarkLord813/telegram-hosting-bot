@@ -2609,6 +2609,22 @@ class UniversalDependencyInstaller:
         
         return list(detected)
 
+    # Known cases where the PyPI package name doesn't match what people
+    # naturally write for `import X` — most critically "telegram", which is
+    # a real but completely unrelated PyPI package. Installing it alongside
+    # python-telegram-bot corrupts the telegram/ module (mixed files from
+    # two different packages) and produces cryptic __slots__/__dict__
+    # AttributeErrors deep inside PTB's Updater — a well-known trap for
+    # anyone who writes "telegram" in requirements.txt expecting PTB.
+    _WRONG_PACKAGE_FIXES = {
+        'telegram': 'python-telegram-bot',
+        'discord': 'discord.py',
+        'cv2': 'opencv-python',
+        'bs4': 'beautifulsoup4',
+        'PIL': 'Pillow',
+        'sklearn': 'scikit-learn',
+    }
+
     @classmethod
     def scan_requirements_file(cls, content: str, update_logs: callable) -> list:
         requirements = []
@@ -2617,6 +2633,15 @@ class UniversalDependencyInstaller:
             if line and not line.startswith('#') and not line.startswith('-r'):
                 if ';' in line:
                     line = line.split(';')[0].strip()
+
+                # Correct known wrong package names, preserving any version pin
+                _base = re.split(r'[=<>!~\[]', line, 1)[0].strip()
+                if _base in cls._WRONG_PACKAGE_FIXES:
+                    _correct = cls._WRONG_PACKAGE_FIXES[_base]
+                    update_logs(f"   ⚠️ '{_base}' is the wrong package for this import — "
+                                f"using '{_correct}' instead")
+                    line = _correct
+
                 requirements.append(line)
                 update_logs(f"   📄 From requirements: {line[:60]}")
         return requirements
