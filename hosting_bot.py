@@ -7999,22 +7999,32 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         return "files_missing"
 
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
-    try:
-        code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
-    except Exception:
-        code_content = ""
-
-    launcher_script, _ = create_enhanced_launcher_script(
-        deploy_folder, dest_script, env_vars, code_content, lambda x: None)
 
     env_file = deploy_folder / ".env"
     env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
 
-    start_script = deploy_folder / "start.sh"
-    start_script.write_text(
-        f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-        f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-    start_script.chmod(0o755)
+    # Branch on file type exactly like the original deploy path does — a
+    # Node.js deployment must NOT be regenerated through the Python launcher,
+    # or its start.sh gets silently overwritten with a script that tries to
+    # run a .js file via `python3`, which fails outright.
+    ext = dest_script.suffix.lower()
+    is_node = ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+
+    if is_node:
+        start_script, _ = create_node_launcher_script(
+            deploy_folder, dest_script, env_vars, lambda x: None)
+    else:
+        try:
+            code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            code_content = ""
+        launcher_script, _ = create_enhanced_launcher_script(
+            deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+        start_script = deploy_folder / "start.sh"
+        start_script.write_text(
+            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+            f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+        start_script.chmod(0o755)
 
     subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
     sleep(4)
