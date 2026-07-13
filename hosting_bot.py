@@ -397,6 +397,11 @@ def init_db():
         except Exception:
             pass
 
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN tos_accepted INTEGER DEFAULT 0")
+    except Exception:
+        pass
+
     for _col, _type in [("source_type","TEXT DEFAULT 'upload'"),
                         ("github_repo", "TEXT"),
                         ("github_branch","TEXT DEFAULT 'main'"),
@@ -1929,6 +1934,61 @@ def send_verification_required(chat_id, user_id, first_name, message_id=None):
         buttons.insert(0, {"text": "📢 JOIN CHANNEL", "url": link})
 
     keyboard = {"inline_keyboard": [buttons]}
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def has_accepted_tos(user_id) -> bool:
+    """Admins are exempt, same as channel verification."""
+    if is_admin(user_id):
+        return True
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT tos_accepted FROM users WHERE user_id = ?', (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def mark_tos_accepted(user_id):
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        c.execute('UPDATE users SET tos_accepted = 1 WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"❌ mark_tos_accepted: {e}")
+        return False
+
+
+def show_tos_prompt(chat_id, user_id, message_id=None):
+    text = (
+        f"**📜 TERMS OF SERVICE**\n\n"
+        f"Before you can use this hosting platform, please read and accept:\n\n"
+        f"1️⃣ This service provides infrastructure to run code you upload or "
+        f"link from GitHub — we do not review, monitor, or endorse the "
+        f"content or purpose of anything you host.\n\n"
+        f"2️⃣ **You are solely responsible for anything you deploy.** "
+        f"You confirm you have the right to host it and that it does not "
+        f"violate any applicable law.\n\n"
+        f"3️⃣ **We are not responsible for any illegal file, bot, or content "
+        f"hosted through this platform — responsibility lies entirely with "
+        f"the user who uploaded or deployed it.**\n\n"
+        f"4️⃣ We reserve the right to remove any deployment and suspend any "
+        f"account found to violate these terms, without notice.\n\n"
+        f"5️⃣ Continued use of this bot after clicking Agree constitutes "
+        f"acceptance of these terms.\n\n"
+        f"👇 You must agree to continue."
+    )
+    keyboard = {"inline_keyboard": [[{"text": "✅ I Agree", "callback_data": "tos_agree"}]]}
     if message_id:
         edit_message(chat_id, message_id, text, keyboard)
     else:
@@ -5210,6 +5270,10 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
     get_or_create_referral_code(user_id)   # eagerly create code so it's ready
 
     if is_user_verified(user_id):
+        if not has_accepted_tos(user_id):
+            show_tos_prompt(chat_id, user_id)
+            return
+
         balances = get_user_balances(user_id)
         is_premium = is_user_premium(user_id)
         used_free = get_free_deployment_used_count(user_id)
@@ -6877,6 +6941,9 @@ def handle_callback(callback):
     if data == "check_verification":
         if check_channel_membership(user_id):
             mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
             balances = get_user_balances(user_id)
             edit_message(chat_id, message_id,
                 f"✅ **VERIFIED!**\n\n"
@@ -6890,6 +6957,9 @@ def handle_callback(callback):
     if data == "verify_channel":
         if check_channel_membership(user_id):
             mark_channel_joined(user_id)
+            if not has_accepted_tos(user_id):
+                show_tos_prompt(chat_id, user_id, message_id)
+                return
             balances = get_user_balances(user_id)
             edit_message(chat_id, message_id,
                 f"✅ **VERIFIED!**\n\n"
@@ -6903,6 +6973,17 @@ def handle_callback(callback):
                     [{"text": "📢 JOIN", "url": CHANNEL_LINK},
                      {"text": "✅ VERIFY", "callback_data": "verify_channel"}]
                 ]})
+        return
+
+    # ========== TERMS OF SERVICE ==========
+    if data == "tos_agree":
+        mark_tos_accepted(user_id)
+        balances = get_user_balances(user_id)
+        edit_message(chat_id, message_id,
+            f"✅ **Thanks for confirming!**\n\n"
+            f"🪙 {balances['coins']} | ⭐ {balances['stars']}\n\n"
+            f"Welcome!",
+            get_main_menu(user_id))
         return
     
     # ========== MY BALANCE ==========
