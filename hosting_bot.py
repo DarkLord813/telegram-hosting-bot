@@ -3847,18 +3847,33 @@ try:
 
     # ----------------------------------------------------------------
     # Helper: True if the module contains any Telegram bot object
-    # (telebot, aiogram, PTB) — used to decide whether Flask should
-    # run as keep-alive thread rather than the main entry point.
+    # (telebot, aiogram, PTB, or anything else with a polling-style
+    # method) — used to decide whether Flask should run as a keep-alive
+    # thread rather than the main entry point. Scans ALL module-level
+    # objects rather than a fixed name list: a real bot object under an
+    # unexpected variable name (very common — "telegram_bot", "tb",
+    # anything not literally "bot"/"dp"/"application"/etc.) would
+    # otherwise go undetected, causing a co-located Flask app (used for
+    # keep-alive/health-checks) to be wrongly treated as the ONLY thing
+    # to run — the process looks healthy forever while never actually
+    # polling Telegram.
     # ----------------------------------------------------------------
     def _module_has_telegram_bot():
-        _tg_names = ['bot', 'dp', 'dispatcher', 'application', 'updater', 'client']
-        for _n in _tg_names:
-            _obj = getattr(module, _n, None)
-            if _obj is None:
+        _poll_methods = ('polling', 'run_polling', 'start_polling', 'infinity_polling')
+        try:
+            _names = list(vars(module).keys())
+        except Exception:
+            _names = []
+        for _n in _names:
+            if _n.startswith('__'):
                 continue
-            if (callable(getattr(_obj, 'polling', None)) or     # telebot
-                    callable(getattr(_obj, 'run_polling', None)) or  # aiogram / PTB
-                    callable(getattr(_obj, 'start_polling', None))):
+            try:
+                _obj = getattr(module, _n, None)
+            except Exception:
+                continue
+            if _obj is None or _obj is module:
+                continue
+            if any(callable(getattr(_obj, _m, None)) for _m in _poll_methods):
                 return True
         return False
 
@@ -3985,8 +4000,11 @@ try:
 
         # ── Flask / Quart ─────────────────────────────────────────────
         if _cls in ('flask', 'quart') or 'flask' in _cls_mod or 'quart' in _cls_mod:
-            _port = _free_port()
             if _module_has_telegram_bot():
+                # Pure keep-alive/health-check endpoint running alongside real
+                # polling — a random internal port is fine here since it's
+                # never meant to receive real external traffic.
+                _port = _free_port()
                 print(f"  🌐 {{name}} → Flask keep-alive thread (port {{_port}})")
                 def _flask_bg(_app=obj, _p=_port):
                     try:
@@ -3996,6 +4014,10 @@ try:
                 _thr.Thread(target=_flask_bg, daemon=True, name='FlaskKeepAlive').start()
                 return 'BACKGROUND'
             else:
+                # This Flask app IS the whole program (e.g. a real webhook
+                # receiver) — it must bind the platform-assigned PORT, or
+                # nothing external can ever reach it, random port or not.
+                _port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 0)) or _free_port())
                 print(f"  🌐 {{name}} → Flask/Quart → .run(port={{_port}})")
                 return lambda: obj.run(host='0.0.0.0', port=_port, debug=False, use_reloader=False)
 
