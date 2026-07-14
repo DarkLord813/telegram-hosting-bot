@@ -2675,6 +2675,67 @@ def _run(cmd, cwd=None, timeout=300, env_extra=None):
 def _cmd_exists(name):
     return _shutil.which(name) is not None
 
+def _log(update_logs, msg):
+    if update_logs:
+        update_logs(msg)
+    else:
+        print(msg)
+
+
+def _normalize_pkg_name(name):
+    return re.sub(r'[-_.]+', '-', name).strip().lower()
+
+
+def _clean_stale_package(packages_dir, pkg_spec):
+    """
+    Remove any existing installed files for a package before (re)installing it.
+
+    `pip install --target` does not properly clean up on upgrade the way a
+    normal site-packages install does — if a package's file layout changes
+    between versions, files removed in the new version can be left behind
+    from the old one, producing a package with files mixed across two
+    versions. This is a well-known, well-documented cause of cryptic
+    AttributeErrors deep inside libraries with __slots__-based classes (e.g.
+    python-telegram-bot's Updater) that have nothing to do with the user's
+    own code. Best-effort and silent — never blocks the actual install.
+    """
+    try:
+        packages_dir = Path(packages_dir)
+        if not packages_dir.exists():
+            return
+        base = re.split(r'[=<>!~\[\s]', pkg_spec.strip(), 1)[0].strip()
+        if not base or base.startswith(('git+', 'hg+', 'svn+', 'http://', 'https://', '.', '/')):
+            return  # not a simple named package spec — nothing to clean by name
+        target_norm = _normalize_pkg_name(base)
+
+        for item in list(packages_dir.iterdir()):
+            name = item.name
+            if not (name.endswith('.dist-info') or name.endswith('.egg-info')):
+                continue
+            dist_base = re.sub(r'-[^-]+\.(dist-info|egg-info)$', '', name)
+            if _normalize_pkg_name(dist_base) != target_norm:
+                continue
+
+            record = item / 'RECORD'
+            if record.exists():
+                try:
+                    for line in record.read_text(errors='ignore').splitlines():
+                        rel = line.split(',')[0].strip()
+                        if not rel or rel.startswith('..'):
+                            continue
+                        f = packages_dir / rel
+                        try:
+                            if f.is_file() or f.is_symlink():
+                                f.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            shutil.rmtree(item, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _pip_base(packages_dir=None):
     cmd = [sys.executable, '-m', 'pip', 'install',
            '--quiet', '--no-warn-script-location',
@@ -2682,12 +2743,6 @@ def _pip_base(packages_dir=None):
     if packages_dir:
         cmd += ['--target', str(packages_dir)]
     return cmd
-
-def _log(update_logs, msg):
-    if update_logs:
-        update_logs(msg)
-    else:
-        print(msg)
 
 
 # ── per-package-manager installers ───────────────────────────────────────────
@@ -2722,10 +2777,13 @@ def _install_pip(packages_dir, deploy_folder, update_logs):
         _log(update_logs, f"   📦 {len(pkgs)} package(s) from {fname}")
         for i, pkg in enumerate(pkgs):
             _log(update_logs, f"   ⬇️  [{i+1}/{len(pkgs)}] {pkg[:70]}")
-            # Try with --upgrade first, then plain install on conflict
+            _clean_stale_package(packages_dir, pkg)
+            # Try with --upgrade first, then a clean forced reinstall on failure
+            # (never trust partially-written files from a failed first attempt)
             ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=180)
             if not ok:
-                ok, out = _run(_pip_base(packages_dir) + [pkg], timeout=180)
+                _clean_stale_package(packages_dir, pkg)
+                ok, out = _run(_pip_base(packages_dir) + ['--upgrade', '--force-reinstall', pkg], timeout=180)
             if ok:
                 installed += 1
             else:
@@ -3229,6 +3287,9 @@ def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
             update_logs(create_progress_bar(pct, 25))
             update_logs(f"   ⬇️  {package[:60]}")
 
+            if packages_dir:
+                _clean_stale_package(packages_dir, package)
+
             # Determine install type
             pkg_lower = package.lower()
             if pkg_lower.startswith('git+') or pkg_lower.startswith('hg+') or pkg_lower.startswith('svn+'):
@@ -3245,9 +3306,15 @@ def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
                 success_count += 1
                 update_logs(f"   ✅ {package[:60]}")
             else:
-                # Retry without --upgrade in case of version conflict
+                # Never trust whatever partial files the failed attempt above
+                # may have left behind — clean before the forced retry, or a
+                # package can end up with files mixed across two versions
+                # (a well-known cause of cryptic __slots__ AttributeErrors
+                # deep inside libraries like python-telegram-bot).
+                if packages_dir:
+                    _clean_stale_package(packages_dir, package)
                 res2 = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--quiet",
+                    [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
                      *(["--target", str(packages_dir)] if packages_dir else []),
                      package],
                     capture_output=True, text=True, timeout=180)
