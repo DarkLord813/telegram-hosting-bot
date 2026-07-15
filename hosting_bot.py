@@ -1766,15 +1766,20 @@ def send_document(chat_id, file_path, caption=None, filename=None):
             if e.code == 429:
                 sleep(2 * (_attempt + 1))
                 continue
-            try: err_body = e.read().decode()[:300]
-            except Exception: err_body = ''
+            try:
+                err_body = e.read().decode()[:300]
+            except Exception:
+                err_body = ''
             print(f"❌ send_document HTTP {e.code}: {err_body}")
-            return None
+            try:
+                return json.loads(err_body)  # {"ok": False, "description": "..."}
+            except Exception:
+                return {"ok": False, "description": f"HTTP {e.code}"}
         except Exception as e:
             print(f"❌ send_document error (attempt {_attempt+1}): {e}")
             if _attempt < 2:
                 sleep(1)
-    return None
+    return {"ok": False, "description": "request failed after 3 attempts (see server logs)"}
 
 def http_get(url, params=None):
     try:
@@ -3873,8 +3878,21 @@ try:
                 continue
             if _obj is None or _obj is module:
                 continue
-            if any(callable(getattr(_obj, _m, None)) for _m in _poll_methods):
-                return True
+            # Flask's context-local proxies (request, g, session,
+            # current_app — near-universal in any Flask app's imports) raise
+            # RuntimeError, not AttributeError, when ANY attribute is
+            # touched outside an active request. getattr(..., default) only
+            # catches AttributeError, so probing these unconditionally
+            # crashes the whole scan. Skip them by type name, and wrap the
+            # actual probe too as a second layer of defense for anything
+            # else with similarly surprising __getattr__ behavior.
+            if type(_obj).__name__ == 'LocalProxy':
+                continue
+            try:
+                if any(callable(getattr(_obj, _m, None)) for _m in _poll_methods):
+                    return True
+            except Exception:
+                continue
         return False
 
     # ----------------------------------------------------------------
@@ -5834,6 +5852,21 @@ def admin_db_download(chat_id, message_id, user_id):
         edit_message(chat_id, message_id, "❌ No database file found.",
                      {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
         return
+
+    size_mb = DATABASE_FILE.stat().st_size / (1024 * 1024)
+    if size_mb > 50:
+        # Telegram's bot API hard-caps sendDocument at 50MB regardless of
+        # this platform's own MAX_FILE_SIZE_MB setting — without this check
+        # a too-large DB just fails silently with a generic error and no
+        # way to tell what actually went wrong.
+        edit_message(chat_id, message_id,
+            f"❌ **Database is too large to send via Telegram** ({size_mb:.1f} MB).\n\n"
+            f"Telegram's bot API caps file uploads at 50 MB. Use "
+            f"**🔄 Backup to GitHub Now** instead, or download it directly "
+            f"from the server's disk.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+        return
+
     edit_message(chat_id, message_id, "⬇️ Preparing your database file...")
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     result = send_document(chat_id, DATABASE_FILE,
@@ -5843,8 +5876,13 @@ def admin_db_download(chat_id, message_id, user_id):
         edit_message(chat_id, message_id, "✅ Database file sent above.",
                      {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
     else:
-        edit_message(chat_id, message_id, "❌ Failed to send the database file. Check server logs.",
-                     {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+        err_detail = ""
+        if isinstance(result, dict):
+            err_detail = f"\n\nTelegram said: `{result.get('description', 'unknown error')}`"
+        edit_message(chat_id, message_id,
+            f"❌ Failed to send the database file ({size_mb:.1f} MB).{err_detail}\n\n"
+            f"Check the server console for a `send_document` error line.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
 
 
 def admin_db_restore_start(chat_id, message_id, user_id):
