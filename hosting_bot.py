@@ -2551,7 +2551,12 @@ class UniversalDependencyInstaller:
     IMPORT_MAPPING = {
         'flask': 'flask', 'django': 'django', 'fastapi': 'fastapi',
         'aiohttp': 'aiohttp', 'tornado': 'tornado', 'sanic': 'sanic',
-        'telegram': 'python-telegram-bot', 'aiogram': 'aiogram',
+        # Pinned floor, not just a bare name: versions before 21.7 have a
+        # confirmed __slots__/__dict__ AttributeError on modern Python
+        # (github.com/python-telegram-bot/python-telegram-bot/issues/4127).
+        # Auto-detection has no way to know which version pip would
+        # otherwise pick, so pin a known-safe minimum explicitly.
+        'telegram': 'python-telegram-bot>=22.0', 'aiogram': 'aiogram',
         'pyrogram': 'pyrogram', 'telethon': 'telethon',
         'discord': 'discord.py', 'nextcord': 'nextcord',
         'sqlalchemy': 'sqlalchemy', 'psycopg2': 'psycopg2-binary',
@@ -2622,7 +2627,7 @@ class UniversalDependencyInstaller:
     # AttributeErrors deep inside PTB's Updater — a well-known trap for
     # anyone who writes "telegram" in requirements.txt expecting PTB.
     _WRONG_PACKAGE_FIXES = {
-        'telegram': 'python-telegram-bot',
+        'telegram': 'python-telegram-bot>=22.0',
         'discord': 'discord.py',
         'cv2': 'opencv-python',
         'bs4': 'beautifulsoup4',
