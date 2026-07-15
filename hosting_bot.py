@@ -3690,22 +3690,106 @@ if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
 # Change to deployment directory
 os.chdir(r"{deploy_folder}")
 
+# ========== ENVIRONMENT ISOLATION ==========
+# The process that started this launcher (the hosting bot) has its own
+# BOT_TOKEN, DATABASE_URL, ADMIN_IDS, etc. in os.environ.  We must clear
+# every sensitive key BEFORE we apply the user's variables, otherwise the
+# hosted bot ends up authenticating as the hosting bot and receives none of
+# its own updates.
+_HOSTING_BOT_KEYS = {
+    'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+    'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+    'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
+    'GITHUB_TOKEN', 'DATABASE_URL', 'DATABASE_FILE',
+    'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK',
+}
+for _hk in _HOSTING_BOT_KEYS:
+    os.environ.pop(_hk, None)
+
 # ========== SET ENVIRONMENT VARIABLES ==========
+# These are the values the user configured for their bot.
+# Applied after clearing inherited vars so they start from a clean slate.
 {env_set_str}
 
-# Try to load .env file
+# ── Token bridging ────────────────────────────────────────────────────────
+# Now that only the user's vars are set, bridge common token names so bots
+# that read BOT_TOKEN, TOKEN, TELEGRAM_TOKEN, etc. all find the same value.
+# We ONLY fill in names that are NOT already set — never overwrite.
+_TOKEN_ALIASES = [
+    'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+    'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+    'DISCORD_TOKEN',
+]
+_found_token = None
+_found_alias = None
+for _alias in _TOKEN_ALIASES:
+    _t = os.environ.get(_alias, '').strip()
+    if _t:
+        _found_token = _t
+        _found_alias = _alias
+        break
+
+if _found_token:
+    for _alias in _TOKEN_ALIASES:
+        if not os.environ.get(_alias, '').strip():   # only fill missing
+            os.environ[_alias] = _found_token
+    print(f"✅ Token found in {_found_alias!r} — bridged to all aliases")
+else:
+    print("⚠️  No bot token found — set BOT_TOKEN in env vars when deploying")
+
+# ── Load .env file (user-level, lowest priority) ─────────────────────────
 try:
     from dotenv import load_dotenv
-    env_file = Path(r"{deploy_folder}") / ".env"
-    if env_file.exists():
-        load_dotenv(env_file)
-        print("✅ Loaded .env file")
+    _env_file = Path(r"{deploy_folder}") / ".env"
+    if _env_file.exists():
+        # override=False means .env values never overwrite vars already set
+        load_dotenv(_env_file, override=False)
+        print("✅ .env file loaded (non-overriding)")
 except ImportError:
     pass
-except Exception as e:
-    print(f"⚠️ Could not load .env: {{e}}")
+except Exception as _e:
+    print(f"⚠️ Could not load .env: {{_e}}")
 
 # ========== HEARTBEAT THREAD ==========
+heartbeat_running = True
+
+def heartbeat():
+    heartbeat_file = Path(r"{deploy_folder}") / ".heartbeat"
+    while heartbeat_running:
+        try:
+            with open(heartbeat_file, 'w') as f:
+                f.write(str(time.time()))
+            time.sleep(30)
+        except Exception:
+            pass
+
+heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+heartbeat_thread.start()
+
+# ── Webhook clear via direct HTTP ─────────────────────────────────────────
+# Must happen BEFORE importing the bot module so polling can receive updates
+# immediately. Uses the clean token we just validated above.
+_wh_token = os.environ.get('BOT_TOKEN', '').strip()
+if _wh_token and 'telegram' in _wh_token.lower() or ':' in _wh_token:
+    pass   # looks like a telegram token
+if _wh_token and ':' in _wh_token:
+    try:
+        import urllib.request as _ur, json as _jr
+        _wh_info_url = f"https://api.telegram.org/bot{{_wh_token}}/getWebhookInfo"
+        with _ur.urlopen(_ur.Request(_wh_info_url), timeout=10) as _r:
+            _wh_data = _jr.loads(_r.read().decode('utf-8'))
+        _active_wh = (_wh_data.get('result') or {{}}).get('url', '')
+        if _active_wh:
+            print(f"⚠️  Active webhook detected: {{_active_wh[:60]}}")
+            _del_url = (f"https://api.telegram.org/bot{{_wh_token}}"
+                        f"/deleteWebhook?drop_pending_updates=true")
+            _ur.urlopen(_ur.Request(_del_url), timeout=10).read()
+            time.sleep(1)
+            print("✅ Webhook deleted — polling mode active")
+        else:
+            print("✅ No active webhook — polling ready")
+    except Exception as _we:
+        print(f"⚠️  Webhook pre-check skipped: {{_we}}")
 heartbeat_running = True
 
 def heartbeat():
