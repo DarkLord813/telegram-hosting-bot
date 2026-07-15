@@ -3885,15 +3885,35 @@ try:
     # ----------------------------------------------------------------
     def _clear_webhook(bot_obj, label='bot'):
         import time as _time
+        import asyncio as _aio
+        import inspect as _inspect
+
+        def _resolve(value):
+            # telebot's methods are plain sync calls — value is already the
+            # real result. PTB/aiogram methods are async — calling them
+            # without awaiting returns an unresolved coroutine object (which
+            # silently has no attributes at all, not an error), so any
+            # existing webhook would never actually be detected or removed.
+            # No event loop is running yet at this point (run_polling()
+            # creates its own later), so a fresh one here is safe.
+            if _inspect.iscoroutine(value):
+                return _aio.run(value)
+            return value
+
         try:
-            # telebot API
-            if callable(getattr(bot_obj, 'get_webhook_info', None)):
-                _wh = bot_obj.get_webhook_info()
+            get_info = getattr(bot_obj, 'get_webhook_info', None)
+            if callable(get_info):
+                _wh = _resolve(get_info())
                 _url = getattr(_wh, 'url', '') or ''
                 if _url:
                     print(f"  ⚠️ Active webhook on {{label}}: {{_url[:60]}}...")
                     print(f"  🔧 Removing webhook — switching to polling mode...")
-                    bot_obj.remove_webhook()
+                    # telebot names this remove_webhook(); PTB/aiogram use
+                    # delete_webhook() (matching the Bot API method name).
+                    remove_fn = (getattr(bot_obj, 'remove_webhook', None) or
+                                 getattr(bot_obj, 'delete_webhook', None))
+                    if callable(remove_fn):
+                        _resolve(remove_fn())
                     _time.sleep(1)   # give Telegram a moment to propagate
                     print(f"  ✅ Webhook removed — polling mode active")
                 else:
@@ -4406,7 +4426,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 "• For private repos: ensure the token has `repo` scope\n"
                 "• Check the repo URL and branch name",
                 {"inline_keyboard": [[{"text": "🔄 Try Again", "callback_data": "github_deploy"},
-                                      [{"text": "🏠 Menu",    "callback_data": "main_menu"}]]]})
+                                      {"text": "🏠 Menu",       "callback_data": "main_menu"}]]})
             return False
 
         # ── Install all requirement sources ──────────────────────────
@@ -4528,7 +4548,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                  install_log, deploy_log, is_free, is_paused, framework,
                  dependencies_installed, folder_name, source_type, github_repo, github_branch)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (user_id, dest_script.name, file_size, "", json.dumps(env_vars_dict),
+                (user_id, str(dest_script.relative_to(deploy_folder)), file_size, "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  start_time.isoformat(), expire_time.isoformat() if expire_time else None, "active", proc_pid,
                  "\n".join(logs[-100:]), "GitHub bot running",
