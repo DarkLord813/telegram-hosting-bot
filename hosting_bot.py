@@ -55,8 +55,8 @@ def is_admin(user_id) -> bool:
         return False
 
 # Channel verification settings (configure via env)
-REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@gamerdroidbot2")
-CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/gamerdroidbot2")
+REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@NCK_Dev")
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/NCK_Dev")
 
 # Platform detection
 IS_RENDER = os.environ.get("RENDER") == "true"
