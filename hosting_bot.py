@@ -3705,16 +3705,41 @@ if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
 # Change to deployment directory
 os.chdir(r"{deploy_folder}")
 
+# ========== ENVIRONMENT ISOLATION ==========
+# This process was spawned by the hosting bot itself and inherits its FULL
+# environment — including the hosting bot's OWN BOT_TOKEN, GITHUB_TOKEN,
+# ADMIN_IDS, DATABASE_FILE, etc. For any of these the deployment doesn't
+# explicitly configure itself, that leaked value would otherwise silently
+# persist into the deployed bot's process — at best confusing (a deployed
+# bot inheriting the hosting platform's admin list), at worst a real
+# credential leak (a deployed bot's code having access to the platform's
+# own GitHub backup token). Clear them all before applying the user's own
+# configured values, so an unset key is genuinely unset, not leaked.
+_HOSTING_BOT_KEYS = {{
+    'BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN',
+    'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
+    'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
+    'GITHUB_TOKEN', 'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME',
+    'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH',
+    'DATABASE_URL', 'DATABASE_FILE',
+    'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK',
+}}
+for _hk in _HOSTING_BOT_KEYS:
+    os.environ.pop(_hk, None)
+
 # ========== SET ENVIRONMENT VARIABLES ==========
+# The deployment's own configured values — applied after clearing inherited
+# ones above, so they start from a genuinely clean slate.
 {env_set_str}
 
-# Try to load .env file
+# Try to load .env file (lowest priority — never overrides an explicitly
+# configured deployment variable, only fills in what's still unset)
 try:
     from dotenv import load_dotenv
     env_file = Path(r"{deploy_folder}") / ".env"
     if env_file.exists():
-        load_dotenv(env_file)
-        print("✅ Loaded .env file")
+        load_dotenv(env_file, override=False)
+        print("✅ Loaded .env file (non-overriding)")
 except ImportError:
     pass
 except Exception as e:
@@ -3816,6 +3841,50 @@ if _found_token:
     print("✅ Token env vars bridged")
 else:
     print("⚠️  No bot token found — set BOT_TOKEN or TELEGRAM_TOKEN in env vars")
+
+# ── Heartbeat file ───────────────────────────────────────────────────────
+# Written every 30s by a background thread. A hung/deadlocked process still
+# passes a simple "is the PID alive" check — this gives the host a way to
+# eventually detect "alive but stuck" too, not just "dead", by checking
+# whether this file's mtime is stale.
+_heartbeat_running = True
+def _heartbeat():
+    _heartbeat_file = Path(r"{deploy_folder}") / ".heartbeat"
+    while _heartbeat_running:
+        try:
+            with open(_heartbeat_file, 'w') as _hf:
+                _hf.write(str(time.time()))
+        except Exception:
+            pass
+        time.sleep(30)
+threading.Thread(target=_heartbeat, daemon=True, name='Heartbeat').start()
+
+# ── Universal webhook pre-clear (raw HTTP, framework-agnostic) ───────────
+# Runs unconditionally before anything else, using only the raw bot token —
+# independent of which framework the bot uses or whether entry-point
+# detection below finds a recognizable bot object at all. A bot can't
+# receive updates via polling while Telegram still has a webhook registered
+# for it, so any bot that was ever previously run in webhook mode elsewhere
+# would otherwise silently receive nothing here, with no error anywhere.
+_wh_token = os.environ.get('BOT_TOKEN', '').strip()
+if _wh_token and ':' in _wh_token:
+    try:
+        import urllib.request as _ur, json as _jr
+        _wh_info_url = f"https://api.telegram.org/bot{{_wh_token}}/getWebhookInfo"
+        with _ur.urlopen(_ur.Request(_wh_info_url), timeout=10) as _r:
+            _wh_data = _jr.loads(_r.read().decode('utf-8'))
+        _active_wh = (_wh_data.get('result') or {{}}).get('url', '')
+        if _active_wh:
+            print(f"⚠️  Active webhook detected: {{_active_wh[:60]}}")
+            _del_url = (f"https://api.telegram.org/bot{{_wh_token}}"
+                        f"/deleteWebhook?drop_pending_updates=true")
+            _ur.urlopen(_ur.Request(_del_url), timeout=10).read()
+            time.sleep(1)
+            print("✅ Webhook deleted — polling mode active")
+        else:
+            print("✅ No active webhook — polling ready")
+    except Exception as _we:
+        print(f"⚠️  Webhook pre-check skipped: {{_we}}")
 
 # ========== METHOD 1: Import and run ==========
 try:
