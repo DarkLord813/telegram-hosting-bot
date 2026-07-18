@@ -1735,33 +1735,43 @@ def send_document(chat_id, file_path, caption=None, filename=None):
         return None
 
     filename = filename or file_path.name
-    boundary = f"----HostingBotBoundary{secrets.token_hex(16)}"
+    file_bytes = file_path.read_bytes()
 
-    def _field(name, value):
-        return (f'--{boundary}\r\n'
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-                f'{value}\r\n').encode('utf-8')
+    def _build_body(use_markdown):
+        boundary = f"----HostingBotBoundary{secrets.token_hex(16)}"
 
-    body = b""
-    body += _field("chat_id", chat_id)
-    if caption:
-        body += _field("caption", str(caption)[:1024])
-        body += _field("parse_mode", "Markdown")
+        def _field(name, value):
+            return (f'--{boundary}\r\n'
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f'{value}\r\n').encode('utf-8')
 
-    body += (f'--{boundary}\r\n'
-             f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-             f'Content-Type: application/octet-stream\r\n\r\n').encode('utf-8')
-    body += file_path.read_bytes()
-    body += f'\r\n--{boundary}--\r\n'.encode('utf-8')
+        body = b""
+        body += _field("chat_id", chat_id)
+        if caption:
+            body += _field("caption", str(caption)[:1024])
+            if use_markdown:
+                body += _field("parse_mode", "Markdown")
+
+        body += (f'--{boundary}\r\n'
+                 f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+                 f'Content-Type: application/octet-stream\r\n\r\n').encode('utf-8')
+        body += file_bytes
+        body += f'\r\n--{boundary}--\r\n'.encode('utf-8')
+        return boundary, body
 
     url = f"{TELEGRAM_API}/sendDocument"
+
+    def _attempt_send(use_markdown):
+        boundary, body = _build_body(use_markdown)
+        req = urllib.request.Request(
+            url, data=body,
+            headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+
     for _attempt in range(3):
         try:
-            req = urllib.request.Request(
-                url, data=body,
-                headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+            return _attempt_send(use_markdown=True)
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 sleep(2 * (_attempt + 1))
@@ -1771,6 +1781,14 @@ def send_document(chat_id, file_path, caption=None, filename=None):
             except Exception:
                 err_body = ''
             print(f"❌ send_document HTTP {e.code}: {err_body}")
+            # Bad/unbalanced caption Markdown must never mean total silence —
+            # retry once as plain text (same pattern as send_message).
+            if caption and "can't parse entities" in err_body.lower():
+                try:
+                    print("⚠️  Retrying send_document as plain-text caption")
+                    return _attempt_send(use_markdown=False)
+                except Exception as e2:
+                    print(f"❌ send_document plain-text retry also failed: {e2}")
             try:
                 return json.loads(err_body)  # {"ok": False, "description": "..."}
             except Exception:
@@ -2655,6 +2673,63 @@ class UniversalDependencyInstaller:
                 requirements.append(line)
                 update_logs(f"   📄 From requirements: {line[:60]}")
         return requirements
+
+# ==================== NODE.JS DEPENDENCY DETECTION ====================
+# Mirrors UniversalDependencyInstaller.scan_imports, but for JavaScript's
+# require()/import syntax instead of Python's import/from — the upload
+# deploy path previously had zero Node.js dependency support at all: no way
+# to submit a package.json, no detection of what a .js file actually needs,
+# and nothing ever wrote package.json to disk for npm to find.
+_JS_BUILTIN_MODULES = {
+    'fs', 'path', 'http', 'https', 'os', 'crypto', 'util', 'events',
+    'stream', 'url', 'querystring', 'child_process', 'assert', 'buffer',
+    'net', 'dns', 'tls', 'zlib', 'readline', 'process', 'timers',
+    'cluster', 'worker_threads', 'perf_hooks', 'v8', 'vm', 'module', 'dgram',
+}
+
+def scan_js_requires(code_content: str) -> list:
+    """Detect npm packages actually referenced by a Node.js script."""
+    found = set()
+    # require('pkg') / require("pkg")
+    for m in re.finditer(r'require\(\s*[\'"]([^\'"./][^\'"]*)[\'"]\s*\)', code_content):
+        found.add(m.group(1))
+    # ES module: import ... from 'pkg'
+    for m in re.finditer(r'''\bfrom\s+['"]([^'"./][^'"]*)['"]''', code_content):
+        found.add(m.group(1))
+    # import 'pkg'; (side-effect only import)
+    for m in re.finditer(r'''^\s*import\s+['"]([^'"./][^'"]*)['"]''', code_content, re.M):
+        found.add(m.group(1))
+
+    packages = set()
+    for name in found:
+        # Scoped packages (@org/pkg) or subpaths (pkg/sub) — keep only the
+        # installable package root, not the specific file within it.
+        if name.startswith('@'):
+            parts = name.split('/')
+            pkg = '/'.join(parts[:2]) if len(parts) >= 2 else name
+        else:
+            pkg = name.split('/')[0]
+        if pkg in _JS_BUILTIN_MODULES or pkg.startswith('node:'):
+            continue
+        packages.add(pkg)
+    return sorted(packages)
+
+
+def build_package_json(deploy_folder: Path, packages: list, main_file_name: str, update_logs=None) -> Path:
+    """Write a minimal package.json for auto-detected dependencies."""
+    pkg_json = {
+        "name": "hosted-bot",
+        "version": "1.0.0",
+        "private": True,
+        "main": main_file_name,
+        "dependencies": {pkg: "*" for pkg in packages}
+    }
+    path = deploy_folder / "package.json"
+    path.write_text(json.dumps(pkg_json, indent=2))
+    if update_logs:
+        update_logs(f"📦 Generated package.json with {len(packages)} package(s): {', '.join(packages)}")
+    return path
+
 
 # ==================== VPS DEPENDENCY ENGINE ====================
 # Supports every package manager a real hosting server would handle.
@@ -4538,7 +4613,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
         # ── Install all requirement sources ──────────────────────────
         update_logs("📦 Installing all dependencies (VPS mode)...")
-        install_from_repo_requirements(deploy_folder, update_logs)
+        _installed_from_manifests = install_from_repo_requirements(deploy_folder, update_logs)
 
         # ── Detect main file ─────────────────────────────────────────
         if main_file_name:
@@ -4577,6 +4652,31 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             code_content = dest_script.read_text(errors='ignore')
         except Exception:
             code_content = ""
+
+        # ── Fill any gaps between what's actually imported and what the
+        # repo's manifest files declared ──────────────────────────────
+        # A repo's requirements.txt (or lack of one) is very often
+        # incomplete — e.g. `from dotenv import load_dotenv` with no
+        # matching line anywhere, because it "just works" locally from
+        # whatever's already installed globally. install_from_repo_requirements
+        # only reads explicit manifest files; it has no equivalent of the
+        # upload path's import-scanning fallback. Add one here too.
+        try:
+            _gh_already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower()
+                           for r in (_installed_from_manifests or [])}
+            _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+            _gh_gap = [a for a in _gh_auto
+                       if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in _gh_already]
+            if _gh_gap:
+                update_logs(f"📦 Filling {len(_gh_gap)} import(s) missing from repo manifests: "
+                            f"{', '.join(_gh_gap)}")
+                _gh_packages_dir = deploy_folder / 'packages'
+                _gh_tmp_reqs = deploy_folder / '_autodetect_gap_reqs.txt'
+                _gh_tmp_reqs.write_text('\n'.join(_gh_gap))
+                install_dependencies_enhanced(_gh_tmp_reqs, update_logs, _gh_packages_dir)
+                _gh_tmp_reqs.unlink(missing_ok=True)
+        except Exception as _gh_gap_err:
+            update_logs(f"⚠️ Gap-fill dependency scan error: {_gh_gap_err}")
 
         file_size = dest_script.stat().st_size
 
@@ -4752,6 +4852,9 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         dest_script = deploy_folder / saved_filename
         shutil.copy2(saved_path, dest_script)
         update_logs(f"📄 File saved: {saved_filename} ({format_file_size(file_size)})")
+
+        _ext = dest_script.suffix.lower()
+        _is_node = _ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
         
         # Parse environment variables
         env_vars_dict = {}
@@ -4775,23 +4878,57 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         # Detect dependencies
         update_logs("🔍 Scanning for dependencies...")
         requirements_list = []
-        
-        if requirements_text and requirements_text.strip():
-            requirements_list = UniversalDependencyInstaller.scan_requirements_file(requirements_text, update_logs)
+
+        if _is_node:
+            # ── Node.js: package.json + npm, not requirements.txt/pip ──
+            if requirements_text and requirements_text.strip().startswith('{'):
+                # User uploaded an actual package.json
+                try:
+                    _pkg_data = json.loads(requirements_text)
+                    (deploy_folder / "package.json").write_text(json.dumps(_pkg_data, indent=2))
+                    _dep_count = len(_pkg_data.get('dependencies', {})) + len(_pkg_data.get('devDependencies', {}))
+                    update_logs(f"📦 Using uploaded package.json ({_dep_count} package(s))")
+                except Exception as _pje:
+                    update_logs(f"⚠️ Invalid package.json ({_pje}) — falling back to auto-detect")
+                    requirements_text = None
+            if not (requirements_text and requirements_text.strip().startswith('{')):
+                _js_packages = scan_js_requires(code_content)
+                if _js_packages:
+                    build_package_json(deploy_folder, _js_packages, dest_script.name, update_logs)
+                else:
+                    update_logs("ℹ️ No external npm packages detected")
+            deps_success, failed = True, []
         else:
-            auto_detected = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
-            if auto_detected:
-                requirements_list.extend(auto_detected)
-                update_logs(f"📦 Auto-detected {len(auto_detected)} package(s)")
-        
-        # Install dependencies
-        deps_success, failed = True, []
-        if requirements_list:
-            reqs_file = deploy_folder / "requirements.txt"
-            with open(reqs_file, 'w') as f:
-                f.write('\n'.join(requirements_list))
-            deps_success, failed = install_dependencies_enhanced(reqs_file, update_logs, packages_dir)
-        
+            if requirements_text and requirements_text.strip():
+                requirements_list = UniversalDependencyInstaller.scan_requirements_file(requirements_text, update_logs)
+                # A user-provided requirements.txt is very often incomplete —
+                # e.g. `from dotenv import load_dotenv` at the top of a script
+                # with no matching line in requirements.txt, because it "just
+                # works" locally from whatever's already installed globally.
+                # Auto-detect too and fill in anything actually imported but
+                # missing, without touching what the user explicitly listed.
+                _already = {re.split(r'[=<>!~\[\s]', r.strip(), 1)[0].lower() for r in requirements_list}
+                _auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+                _gap_filled = [a for a in _auto
+                               if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in _already]
+                if _gap_filled:
+                    requirements_list.extend(_gap_filled)
+                    update_logs(f"📦 Added {len(_gap_filled)} import(s) missing from requirements.txt: "
+                                f"{', '.join(_gap_filled)}")
+            else:
+                auto_detected = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+                if auto_detected:
+                    requirements_list.extend(auto_detected)
+                    update_logs(f"📦 Auto-detected {len(auto_detected)} package(s)")
+
+            # Install dependencies
+            deps_success, failed = True, []
+            if requirements_list:
+                reqs_file = deploy_folder / "requirements.txt"
+                with open(reqs_file, 'w') as f:
+                    f.write('\n'.join(requirements_list))
+                deps_success, failed = install_dependencies_enhanced(reqs_file, update_logs, packages_dir)
+
         if not deps_success and requirements_list:
             update_logs("⚠️ Some dependencies failed to install - continuing anyway")
         
@@ -4819,8 +4956,6 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         
         # Create launcher — Python or Node.js depending on file type
         update_logs("🚀 Creating launcher...")
-        _ext = dest_script.suffix.lower()
-        _is_node = _ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
 
         if _is_node:
             start_script, frameworks = create_node_launcher_script(
@@ -5958,8 +6093,9 @@ def admin_db_download(chat_id, message_id, user_id):
 
     edit_message(chat_id, message_id, "⬇️ Preparing your database file...")
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts_display = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # no underscores — safe for Markdown captions
     result = send_document(chat_id, DATABASE_FILE,
-                            caption=f"💾 Database backup — {ts}",
+                            caption=f"💾 Database backup — {ts_display}",
                             filename=f"hosting_bot_backup_{ts}.db")
     if result and result.get('ok'):
         edit_message(chat_id, message_id, "✅ Database file sent above.",
@@ -6209,17 +6345,82 @@ def admin_create_code(chat_id, message_id):
     }
     edit_message(chat_id, message_id, "**🎫 CREATE REDEEM CODE**\n\nSelect amount:", keyboard)
 
+def ask_code_max_uses(admin_id, amount, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_code_uses', temp_code_amount=amount)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1 use",   "callback_data": "code_uses_1"},
+             {"text": "5 uses",  "callback_data": "code_uses_5"}],
+            [{"text": "10 uses", "callback_data": "code_uses_10"},
+             {"text": "50 uses", "callback_data": "code_uses_50"}],
+            [{"text": "100 uses", "callback_data": "code_uses_100"},
+             {"text": "♾️ Unlimited", "callback_data": "code_uses_0"}],
+            [{"text": "✍️ Custom number", "callback_data": "code_uses_custom"}],
+            [{"text": "🔙 Back", "callback_data": "admin_create_code"}]
+        ]
+    }
+    text = f"**🎫 CREATE REDEEM CODE**\n\n💰 Amount: `{amount}🪙`\n\nHow many times can this code be used in total?"
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+def ask_code_expiry(admin_id, max_uses, chat_id, message_id):
+    set_user_step(admin_id, 'awaiting_code_expiry', temp_code_max_uses=max_uses)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "1 day",   "callback_data": "code_expiry_1"},
+             {"text": "7 days",  "callback_data": "code_expiry_7"}],
+            [{"text": "30 days", "callback_data": "code_expiry_30"},
+             {"text": "90 days", "callback_data": "code_expiry_90"}],
+            [{"text": "365 days", "callback_data": "code_expiry_365"},
+             {"text": "♾️ Never expires", "callback_data": "code_expiry_36500"}],
+            [{"text": "✍️ Custom days", "callback_data": "code_expiry_custom"}],
+            [{"text": "🔙 Back", "callback_data": "admin_create_code"}]
+        ]
+    }
+    uses_label = "Unlimited" if max_uses == 0 else str(max_uses)
+    text = f"**🎫 CREATE REDEEM CODE**\n\n🔢 Max uses: `{uses_label}`\n\nHow many days until this code expires?"
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+def finalize_create_code(admin_id, expiry_days, chat_id, message_id):
+    user_step = get_user_step(admin_id)
+    amount = user_step.get('temp_code_amount')
+    max_uses = user_step.get('temp_code_max_uses')
+
+    if not amount or max_uses is None:
+        err_text = "❌ Session expired. Please start over."
+        err_kb = {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_create_code"}]]}
+        if message_id:
+            edit_message(chat_id, message_id, err_text, err_kb)
+        else:
+            send_message(chat_id, err_text, err_kb)
+        return
+
+    set_user_step(admin_id, None)
+    code = create_redeem_code(admin_id, amount, 0, expiry_days, max_uses)
+
+    uses_label = "Unlimited" if max_uses == 0 else f"{max_uses} use(s)"
+    expiry_label = "Never expires" if expiry_days >= 36500 else f"{expiry_days} day(s)"
+
+    text = (f"✅ **CODE CREATED!**\n\n"
+            f"🎫 `{code}`\n"
+            f"💰 {amount}🪙\n"
+            f"📅 {expiry_label}\n"
+            f"🔢 {uses_label}\n\n"
+            f"Share with users!")
+    keyboard = {"inline_keyboard": [[{"text": "🎫 Create Another", "callback_data": "admin_create_code"},
+                                     {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]}
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
 def process_create_code(admin_id, amount, chat_id, message_id):
-    code = create_redeem_code(admin_id, amount, 0, 30, 1)
-    edit_message(chat_id, message_id,
-        f"✅ **CODE CREATED!**\n\n"
-        f"🎫 `{code}`\n"
-        f"💰 {amount}🪙\n"
-        f"📅 30 days\n"
-        f"🔢 1 use\n\n"
-        f"Share with users!",
-        {"inline_keyboard": [[{"text": "🎫 Create Another", "callback_data": "admin_create_code"},
-                              {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+    ask_code_max_uses(admin_id, amount, chat_id, message_id)
 
 # ==================== ADMIN ADD COINS ====================
 def admin_add_coins_start(admin_id, chat_id, message_id):
@@ -6342,13 +6543,20 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
                   temp_target_user=target_user_id, 
                   temp_coins_amount=new_amount)
     
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT first_name FROM users WHERE user_id = ?", (int(target_user_id),))
-    user = c.fetchone()
-    conn.close()
-    first_name = user[0] if user else "User"
-    
+    targets = _parse_coin_targets(target_user_id)
+    if len(targets) == 1:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT first_name FROM users WHERE user_id = ?", (targets[0],))
+        user = c.fetchone()
+        conn.close()
+        first_name = user[0] if user else "User"
+        target_line = f"Target user: `{target_user_id}` ({first_name})\n"
+        balance_line = f"Current balance: `{get_user_balances(targets[0])['coins']}🪙`\n\n"
+    else:
+        target_line = f"Target: **{len(targets)} users**\n"
+        balance_line = ""
+
     keyboard = {
         "inline_keyboard": [
             [{"text": "1", "callback_data": "coin_digit_1"}, {"text": "2", "callback_data": "coin_digit_2"}, {"text": "3", "callback_data": "coin_digit_3"}],
@@ -6364,11 +6572,32 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
     
     edit_message(chat_id, message_id,
         f"**🪙 ADD COINS**\n\n"
-        f"Target user: `{target_user_id}` ({first_name})\n"
-        f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
+        f"{target_line}"
+        f"{balance_line}"
         f"Enter the amount of coins to add using the number pad below:\n\n"
         f"**Amount: `{new_amount}` 🪙**",
         keyboard)
+
+def _parse_coin_targets(target_str):
+    """
+    temp_target_user holds either a single numeric ID (legacy/keypad flow)
+    or a JSON list of IDs (multi-user text flow). Returns a list of ints
+    either way, so every caller handles both formats identically instead
+    of each re-implementing (and risking a crash on) the distinction.
+    """
+    if not target_str:
+        return []
+    try:
+        parsed = json.loads(target_str)
+        if isinstance(parsed, list):
+            return [int(x) for x in parsed]
+        return [int(parsed)]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        try:
+            return [int(target_str)]
+        except (ValueError, TypeError):
+            return []
+
 
 def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
     user_step = get_user_step(admin_id)
@@ -6383,12 +6612,16 @@ def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
                   temp_target_user=target_user_id, 
                   temp_coins_amount=preset_amount)
     
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute("SELECT first_name FROM users WHERE user_id = ?", (int(target_user_id),))
-    user = c.fetchone()
-    conn.close()
-    first_name = user[0] if user else "User"
+    targets = _parse_coin_targets(target_user_id)
+    if len(targets) == 1:
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("SELECT first_name FROM users WHERE user_id = ?", (targets[0],))
+        user = c.fetchone()
+        conn.close()
+        first_name = user[0] if user else "User"
+    else:
+        first_name = f"{len(targets)} users"
     
     keyboard = {
         "inline_keyboard": [
@@ -6403,10 +6636,17 @@ def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
         ]
     }
     
+    if len(targets) == 1:
+        balance_line = f"Current balance: `{get_user_balances(targets[0])['coins']}🪙`\n\n"
+        target_line = f"Target user: `{target_user_id}` ({first_name})\n"
+    else:
+        balance_line = ""
+        target_line = f"Target: **{first_name}**\n"
+
     edit_message(chat_id, message_id,
         f"**🪙 ADD COINS**\n\n"
-        f"Target user: `{target_user_id}` ({first_name})\n"
-        f"Current balance: `{get_user_balances(int(target_user_id))['coins']}🪙`\n\n"
+        f"{target_line}"
+        f"{balance_line}"
         f"Amount preset: `{preset_amount}` 🪙\n\n"
         f"Click ✅ to confirm or continue entering digits:",
         keyboard)
@@ -6420,27 +6660,63 @@ def confirm_add_coins(admin_id, chat_id, message_id):
         edit_message(chat_id, message_id, "❌ Invalid amount. Please try again.",
                     {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_add_coins"}]]})
         return
-    
-    update_user_coins(int(target_user_id), amount, "admin_add", f"by_admin_{admin_id}")
-    
-    new_balance = get_user_balances(int(target_user_id))['coins']
-    async_backup(f"admin_coins_{target_user_id}")
-    
+
+    targets = _parse_coin_targets(target_user_id)
+    if not targets:
+        edit_message(chat_id, message_id, "❌ No valid target user(s). Please try again.",
+                    {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_add_coins"}]]})
+        return
+
     set_user_step(admin_id, None, temp_target_user=None, temp_coins_amount=None)
-    
-    edit_message(chat_id, message_id,
-        f"✅ **COINS ADDED SUCCESSFULLY!**\n\n"
-        f"User: `{target_user_id}`\n"
-        f"Added: `+{amount}🪙`\n"
-        f"New balance: `{new_balance}🪙`",
-        {"inline_keyboard": [[{"text": "➕ Add More", "callback_data": "admin_add_coins"},
-                              {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
-    
-    send_message(int(target_user_id),
-        f"🎉 **You received {amount} Coins!** 🎉\n\n"
-        f"Your new balance: `{new_balance}🪙`\n\n"
-        f"Use your coins to purchase premium subscription!",
-        {"inline_keyboard": [[{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]]})
+
+    succeeded, failed = [], []
+    for uid in targets:
+        try:
+            update_user_coins(uid, amount, "admin_add", f"by_admin_{admin_id}")
+            new_balance = get_user_balances(uid)['coins']
+            succeeded.append((uid, new_balance))
+        except Exception as e:
+            failed.append((uid, str(e)))
+            continue
+
+        # Best-effort notification — a user who blocked the bot shouldn't
+        # stop the rest of the batch from being credited.
+        try:
+            send_message(uid,
+                f"🎉 **You received {amount} Coins!** 🎉\n\n"
+                f"Your new balance: `{new_balance}🪙`\n\n"
+                f"Use your coins to purchase premium subscription!",
+                {"inline_keyboard": [[{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]]})
+        except Exception:
+            pass
+
+    async_backup(f"admin_coins_{admin_id}")
+
+    if len(targets) == 1:
+        if succeeded:
+            uid, new_balance = succeeded[0]
+            edit_message(chat_id, message_id,
+                f"✅ **COINS ADDED SUCCESSFULLY!**\n\n"
+                f"User: `{uid}`\n"
+                f"Added: `+{amount}🪙`\n"
+                f"New balance: `{new_balance}🪙`",
+                {"inline_keyboard": [[{"text": "➕ Add More", "callback_data": "admin_add_coins"},
+                                      {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+        else:
+            edit_message(chat_id, message_id,
+                f"❌ Failed to add coins to `{targets[0]}`: {failed[0][1]}",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+    else:
+        summary = f"✅ **COINS ADDED TO {len(succeeded)}/{len(targets)} USERS!**\n\n" \
+                  f"Amount each: `+{amount}🪙`\n\n"
+        summary += "\n".join(f"• `{uid}` → `{bal}🪙`" for uid, bal in succeeded[:20])
+        if len(succeeded) > 20:
+            summary += f"\n… and {len(succeeded) - 20} more"
+        if failed:
+            summary += f"\n\n⚠️ Failed: " + ", ".join(f"`{uid}`" for uid, _ in failed[:10])
+        edit_message(chat_id, message_id, summary,
+            {"inline_keyboard": [[{"text": "➕ Add More", "callback_data": "admin_add_coins"},
+                                  {"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
 
 # ==================== GITHUB DEPLOY HELPERS ====================
 
@@ -6836,6 +7112,40 @@ def handle_callback(callback):
         if is_admin(user_id):
             amount = int(data.split("_")[2])
             process_create_code(user_id, amount, chat_id, message_id)
+        return
+
+    if data == "code_uses_custom":
+        if is_admin(user_id):
+            set_user_step(user_id, 'awaiting_code_uses_custom',
+                          temp_code_amount=get_user_step(user_id).get('temp_code_amount'))
+            edit_message(chat_id, message_id,
+                "**🎫 CREATE REDEEM CODE**\n\nSend the max number of uses as a number "
+                "(send `0` for unlimited):")
+        return
+
+    if data.startswith("code_uses_"):
+        if is_admin(user_id):
+            max_uses = int(data.split("_")[2])
+            ask_code_expiry(user_id, max_uses, chat_id, message_id)
+        return
+
+    if data == "code_expiry_custom":
+        if is_admin(user_id):
+            us = get_user_step(user_id)
+            set_user_step(user_id, 'awaiting_code_expiry_custom',
+                          temp_code_amount=us.get('temp_code_amount'),
+                          temp_code_max_uses=us.get('temp_code_max_uses'))
+            edit_message(chat_id, message_id,
+                "**🎫 CREATE REDEEM CODE**\n\nSend the number of days until expiry "
+                "(send `0` for never expires):")
+        return
+
+    if data.startswith("code_expiry_"):
+        if is_admin(user_id):
+            expiry_days = int(data.split("_")[2])
+            if expiry_days <= 0:
+                expiry_days = 36500  # "never" — a century is a practical forever
+            finalize_create_code(user_id, expiry_days, chat_id, message_id)
         return
     
     # ========== ADMIN ADD COINS ==========
@@ -7731,20 +8041,60 @@ def handle_message(message):
             process_redeem(chat_id, user_id, text)
             return
 
-        # ── Admin coins: awaiting target user ────────────────────────
+        # ── Admin coins: awaiting target user(s) ─────────────────────
+        # Accepts one user ID per line, so an admin can add coins to many
+        # users in a single operation instead of repeating the flow.
         if is_admin(user_id) and user_step.get('step') == 'awaiting_coins_target':
-            target = text.strip().lstrip('@')
-            if target:
-                set_user_step(user_id, 'awaiting_coins_amount', temp_target_user=target)
+            lines = [ln.strip().lstrip('@') for ln in text.strip().split('\n')]
+            lines = [ln for ln in lines if ln]
+
+            valid_ids, invalid_lines = [], []
+            for ln in lines:
+                if ln.isdigit():
+                    valid_ids.append(int(ln))
+                else:
+                    invalid_lines.append(ln)
+
+            if not valid_ids:
                 send_message(chat_id,
-                    f"🪙 **Add coins to `{target}`**\n\nEnter amount or pick preset:",
-                    {"inline_keyboard": [
-                        [{"text": "50",   "callback_data": "coin_preset_50"},
-                         {"text": "100",  "callback_data": "coin_preset_100"},
-                         {"text": "500",  "callback_data": "coin_preset_500"}],
-                        [{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
-            else:
-                send_message(chat_id, "❌ Please send a username or user ID.")
+                    "❌ No valid numeric user ID found. Send one user ID per "
+                    "line (usernames aren't supported here — use the numeric "
+                    "Telegram user ID).")
+                return
+
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+            c.execute(f"SELECT user_id FROM users WHERE user_id IN ({','.join('?' * len(valid_ids))})",
+                      valid_ids)
+            found_ids = {row[0] for row in c.fetchall()}
+            conn.close()
+            not_found = [uid for uid in valid_ids if uid not in found_ids]
+            found = [uid for uid in valid_ids if uid in found_ids]
+
+            if not found:
+                send_message(chat_id,
+                    f"❌ None of those user ID(s) were found in the database:\n"
+                    f"`{', '.join(str(u) for u in valid_ids)}`\n\n"
+                    f"They need to have started the bot at least once. Try again.")
+                return
+
+            target_payload = json.dumps(found) if len(found) > 1 else str(found[0])
+            set_user_step(user_id, 'awaiting_coins_amount', temp_target_user=target_payload)
+
+            warn = ""
+            if not_found:
+                warn += f"\n⚠️ Not found, skipped: `{', '.join(str(u) for u in not_found)}`"
+            if invalid_lines:
+                warn += f"\n⚠️ Not numeric, skipped: `{', '.join(invalid_lines[:10])}`"
+
+            target_desc = f"`{found[0]}`" if len(found) == 1 else f"**{len(found)} users**"
+            send_message(chat_id,
+                f"🪙 **Add coins to {target_desc}**{warn}\n\nEnter amount or pick preset:",
+                {"inline_keyboard": [
+                    [{"text": "50",   "callback_data": "coin_preset_50"},
+                     {"text": "100",  "callback_data": "coin_preset_100"},
+                     {"text": "500",  "callback_data": "coin_preset_500"}],
+                    [{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
             return
 
         # ── Admin coins: awaiting amount ──────────────────────────────
@@ -7763,6 +8113,30 @@ def handle_message(message):
                          {"text": "❌ Cancel",  "callback_data": "admin_panel"}]]})
             except (ValueError, TypeError):
                 send_message(chat_id, "❌ Send a positive whole number (e.g. `50`).")
+            return
+
+        # ── Redeem code: custom max uses ──────────────────────────────
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_code_uses_custom':
+            try:
+                max_uses = int(text.strip())
+                if max_uses < 0:
+                    raise ValueError("negative")
+                ask_code_expiry(user_id, max_uses, chat_id, None)
+            except (ValueError, TypeError):
+                send_message(chat_id, "❌ Send a whole number (`0` for unlimited).")
+            return
+
+        # ── Redeem code: custom expiry ─────────────────────────────────
+        if is_admin(user_id) and user_step.get('step') == 'awaiting_code_expiry_custom':
+            try:
+                expiry_days = int(text.strip())
+                if expiry_days < 0:
+                    raise ValueError("negative")
+                if expiry_days == 0:
+                    expiry_days = 36500  # "never" — a century is a practical forever
+                finalize_create_code(user_id, expiry_days, chat_id, None)
+            except (ValueError, TypeError):
+                send_message(chat_id, "❌ Send a whole number of days (`0` for never expires).")
             return
 
         # ── Broadcast steps (admin) ───────────────────────────────────
@@ -7953,9 +8327,12 @@ def handle_message(message):
             send_verification_required(chat_id, user_id, first_name, None)
             return
         
-        # Requirements file — accept requirements.txt or any .txt upload when waiting
+        # Requirements file — accept requirements.txt/.txt (Python) or
+        # package.json/.json (Node.js) when waiting for a manifest upload
         if user_step.get('waiting_for_reqs') == 1 and (
                 file_name == 'requirements.txt' or
+                file_name == 'package.json' or
+                file_name.endswith('.json') or
                 (file_name.endswith('.txt') and 'req' in file_name.lower()) or
                 file_name.endswith('.txt')):
             file_id = doc['file_id']
@@ -7975,10 +8352,20 @@ def handle_message(message):
                                  cost_coins=user_step.get('cost_coins'),
                                  cost_stars=user_step.get('cost_stars'),
                                  payment_method=user_step.get('payment_method'))
-                    pkg_count = len([l for l in requirements_text.splitlines()
-                                     if l.strip() and not l.startswith('#')])
+                    is_json_manifest = requirements_text.strip().startswith('{')
+                    if is_json_manifest:
+                        try:
+                            _pkg_preview = json.loads(requirements_text)
+                            pkg_count = (len(_pkg_preview.get('dependencies', {})) +
+                                         len(_pkg_preview.get('devDependencies', {})))
+                        except Exception:
+                            pkg_count = 0
+                    else:
+                        pkg_count = len([l for l in requirements_text.splitlines()
+                                         if l.strip() and not l.startswith('#')])
                     send_message(chat_id,
-                        f"✅ **Requirements received!** ({pkg_count} packages)\n\n"
+                        f"✅ **{'package.json' if is_json_manifest else 'Requirements'} received!** "
+                        f"({pkg_count} package(s))\n\n"
                         f"```\n{requirements_text[:400]}\n```\n\n"
                         "Now set environment variables, or deploy directly:",
                         get_env_keyboard(0))
