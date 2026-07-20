@@ -880,15 +880,15 @@ def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, lis
         # Scanner itself crashed — log and let deployment proceed with a warning
         return False, [], [f"Scanner error: {e}"], f"⚠️ Security scan encountered an error: {e}"
 
-    lines = [f"🔒 **Security Scan — `{filename}`**\n"]
+    lines = [f"🔒 *Security Scan — `{filename}`*\n"]
     if critical:
-        lines.append(f"🔴 **{len(critical)} CRITICAL issue(s) — BLOCKED:**")
+        lines.append(f"🔴 *{len(critical)} CRITICAL issue(s) — BLOCKED:*")
         for i in critical[:10]:
             lines.append(f"  • {i}")
         if len(critical) > 10:
             lines.append(f"  … and {len(critical)-10} more")
     if warnings:
-        lines.append(f"\n🟡 **{len(warnings)} warning(s):**")
+        lines.append(f"\n🟡 *{len(warnings)} warning(s):*")
         for w in warnings[:8]:
             lines.append(f"  • {w}")
         if len(warnings) > 8:
@@ -1207,6 +1207,112 @@ def get_system_stats():
         print(f"❌ Get system stats error: {e}")
         return {}
 
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+
+def _read_proc_meminfo():
+    """Total/available RAM in MB, straight from /proc (no dependency needed)."""
+    try:
+        info = {}
+        with open('/proc/meminfo') as f:
+            for line in f:
+                key, val = line.split(':', 1)
+                info[key.strip()] = int(val.strip().split()[0])  # kB
+        total_mb = info.get('MemTotal', 0) / 1024
+        avail_mb = info.get('MemAvailable', info.get('MemFree', 0)) / 1024
+        used_mb = total_mb - avail_mb
+        return total_mb, used_mb, avail_mb
+    except Exception:
+        return 0, 0, 0
+
+
+def _read_proc_cpu_times():
+    """Cumulative CPU jiffies since boot, for computing a delta-based %."""
+    try:
+        with open('/proc/stat') as f:
+            parts = f.readline().split()
+        nums = [int(x) for x in parts[1:]]
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+        return total, idle
+    except Exception:
+        return None, None
+
+
+def get_system_resources(sample_seconds=0.3):
+    """
+    Host-wide RAM/CPU usage. Uses psutil if available (no blocking sample
+    needed for RAM; still samples briefly for an accurate CPU%), otherwise
+    falls back to reading /proc directly — pure stdlib, works on any Linux
+    container (Render included) with zero extra dependencies.
+    """
+    result = {'ram_total_mb': 0, 'ram_used_mb': 0, 'ram_percent': 0,
+              'cpu_percent': 0, 'cpu_count': os.cpu_count() or 1,
+              'load_avg': (0.0, 0.0, 0.0), 'source': 'proc'}
+
+    if _psutil:
+        try:
+            vm = _psutil.virtual_memory()
+            result['ram_total_mb'] = vm.total / (1024 * 1024)
+            result['ram_used_mb'] = (vm.total - vm.available) / (1024 * 1024)
+            result['ram_percent'] = vm.percent
+            result['cpu_percent'] = _psutil.cpu_percent(interval=sample_seconds)
+            result['cpu_count'] = _psutil.cpu_count() or result['cpu_count']
+            result['source'] = 'psutil'
+        except Exception:
+            pass
+
+    if result['source'] == 'proc':
+        total_mb, used_mb, _ = _read_proc_meminfo()
+        result['ram_total_mb'] = total_mb
+        result['ram_used_mb'] = used_mb
+        result['ram_percent'] = (used_mb / total_mb * 100) if total_mb else 0
+
+        t0, idle0 = _read_proc_cpu_times()
+        if t0 is not None:
+            sleep(sample_seconds)
+            t1, idle1 = _read_proc_cpu_times()
+            if t1 and t1 > t0:
+                busy_delta = (t1 - idle1) - (t0 - idle0)
+                total_delta = t1 - t0
+                result['cpu_percent'] = max(0, min(100, busy_delta / total_delta * 100)) if total_delta else 0
+
+    try:
+        result['load_avg'] = os.getloadavg()
+    except (OSError, AttributeError):
+        pass
+
+    return result
+
+
+def get_deployment_resource_usage(proc_pid):
+    """RAM (MB) and CPU% for one deployment's process, best-effort."""
+    if not proc_pid:
+        return None
+    if _psutil:
+        try:
+            p = _psutil.Process(proc_pid)
+            return {
+                'ram_mb': p.memory_info().rss / (1024 * 1024),
+                'cpu_percent': p.cpu_percent(interval=0.1),
+            }
+        except Exception:
+            return None
+    # /proc fallback: RSS from status, skip CPU% (needs sampling per-process,
+    # too slow to do for every deployment in a list — RAM alone is still useful)
+    try:
+        with open(f'/proc/{proc_pid}/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return {'ram_mb': int(line.split()[1]) / 1024, 'cpu_percent': None}
+    except Exception:
+        pass
+    return None
+
+
 def get_user_balances(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -1469,7 +1575,7 @@ def continue_deployment_as_free(deployment_id, user_id, chat_id):
 
         async_backup(f"continue_as_free_{deployment_id}")
         send_message(chat_id,
-            f"✅ **Bot Resumed (Free 24h)**\n\n"
+            f"✅ *Bot Resumed (Free 24h)*\n\n"
             f"Deployment `#{deployment_id}` is running again.\n"
             f"Your database and settings are intact.\n"
             f"Expires: `{new_expire.strftime('%Y-%m-%d %H:%M')}`",
@@ -1485,7 +1591,7 @@ def continue_deployment_as_free(deployment_id, user_id, chat_id):
         if lf.exists():
             log_tail = lf.read_text(errors='replace')[-800:].strip()
         send_message(chat_id,
-            f"❌ **Failed to resume bot**\n\n"
+            f"❌ *Failed to resume bot*\n\n"
             f"```\n{log_tail[-500:]}\n```\n\n"
             "The process exited immediately. Check your env vars.",
             {"inline_keyboard": [
@@ -1943,14 +2049,14 @@ def send_verification_required(chat_id, user_id, first_name, message_id=None):
     link    = (CHANNEL_LINK or '').strip()
 
     text = (
-        f"**🔐 VERIFICATION REQUIRED**\n\n"
+        f"*🔐 VERIFICATION REQUIRED*\n\n"
         f"👋 Hi {first_name or 'there'}!\n\n"
         f"To use this hosting platform you must join our channel:\n"
-        f"📢 **{channel}**\n\n"
-        f"**Steps:**\n"
-        f"1️⃣ Click **JOIN CHANNEL** below\n"
+        f"📢 *{channel}*\n\n"
+        f"*Steps:*\n"
+        f"1️⃣ Click *JOIN CHANNEL* below\n"
         f"2️⃣ Join the channel\n"
-        f"3️⃣ Come back and click **✅ VERIFY**"
+        f"3️⃣ Come back and click *✅ VERIFY*"
     )
     buttons = [{"text": "✅ VERIFY", "callback_data": "verify_channel"}]
     if link:
@@ -1994,17 +2100,17 @@ def mark_tos_accepted(user_id):
 
 def show_tos_prompt(chat_id, user_id, message_id=None):
     text = (
-        f"**📜 TERMS OF SERVICE**\n\n"
+        f"*📜 TERMS OF SERVICE*\n\n"
         f"Before you can use this hosting platform, please read and accept:\n\n"
         f"1️⃣ This service provides infrastructure to run code you upload or "
         f"link from GitHub — we do not review, monitor, or endorse the "
         f"content or purpose of anything you host.\n\n"
-        f"2️⃣ **You are solely responsible for anything you deploy.** "
+        f"2️⃣ *You are solely responsible for anything you deploy.* "
         f"You confirm you have the right to host it and that it does not "
         f"violate any applicable law.\n\n"
-        f"3️⃣ **We are not responsible for any illegal file, bot, or content "
+        f"3️⃣ *We are not responsible for any illegal file, bot, or content "
         f"hosted through this platform — responsibility lies entirely with "
-        f"the user who uploaded or deployed it.**\n\n"
+        f"the user who uploaded or deployed it.*\n\n"
         f"4️⃣ We reserve the right to remove any deployment and suspend any "
         f"account found to violate these terms, without notice.\n\n"
         f"5️⃣ Continued use of this bot after clicking Agree constitutes "
@@ -2170,14 +2276,14 @@ def show_referral_menu(chat_id, user_id, message_id=None):
         recent_text += f"  • User `{rid}` — {dt}\n"
 
     text = (
-        f"**👥 REFERRAL PROGRAMME**\n\n"
-        f"Invite friends and earn **{REFERRAL_REWARD_COINS} 🪙** for every person who joins!\n\n"
+        f"*👥 REFERRAL PROGRAMME*\n\n"
+        f"Invite friends and earn *{REFERRAL_REWARD_COINS} 🪙* for every person who joins!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 **Your referral link:**\n`{ref_link}`\n\n"
-        f"📊 **Your stats:**\n"
+        f"🔗 *Your referral link:*\n`{ref_link}`\n\n"
+        f"📊 *Your stats:*\n"
         f"  👥 Total referrals: `{total_refs}`\n"
         f"  🪙 Total earned:    `{total_earned}🪙`\n\n"
-        + (f"🕐 **Recent referrals:**\n{recent_text}\n" if recent_text else "")
+        + (f"🕐 *Recent referrals:*\n{recent_text}\n" if recent_text else "")
         + f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Share your link — every new user who starts the bot through it earns you coins!"
     )
@@ -2207,10 +2313,10 @@ def submit_bug_report(user_id, username, first_name, message_text):
     # Notify all admins
     user_link = f"@{username}" if username else f"User `{user_id}`"
     admin_text = (
-        f"**🐛 NEW BUG REPORT #{report_id}**\n\n"
+        f"*🐛 NEW BUG REPORT #{report_id}*\n\n"
         f"From: {user_link} (`{user_id}`)\n"
         f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n"
-        f"**Message:**\n{message_text}"
+        f"*Message:*\n{message_text}"
     )
     admin_kb = {"inline_keyboard": [
         [{"text": f"✉️ Reply to #{report_id}", "callback_data": f"bug_reply_{report_id}"}],
@@ -2241,7 +2347,7 @@ def reply_to_bug_report(report_id, admin_id, reply_text):
 
     # Notify the user
     send_message(target_user_id,
-        f"**✉️ REPLY TO YOUR BUG REPORT #{report_id}**\n\n"
+        f"*✉️ REPLY TO YOUR BUG REPORT #{report_id}*\n\n"
         f"An admin has replied to your report:\n\n"
         f"_{reply_text}_\n\n"
         f"Thank you for helping us improve the service! 🙏",
@@ -2260,20 +2366,20 @@ def show_admin_bug_reports(chat_id, admin_id, message_id=None):
     conn.close()
 
     if not reports:
-        text = "**📋 BUG REPORTS**\n\nNo reports yet."
+        text = "*📋 BUG REPORTS*\n\nNo reports yet."
         kb   = {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]}
         if message_id: edit_message(chat_id, message_id, text, kb)
         else:          send_message(chat_id, text, kb)
         return
 
-    text = f"**📋 BUG REPORTS** ({open_count} open)\n\n"
+    text = f"*📋 BUG REPORTS* ({open_count} open)\n\n"
     buttons = []
     for rep_id, uid, uname, fname, msg, status, created in reports:
         icon   = "🔴" if status == "open" else "✅" if status == "replied" else "⚫"
         who    = f"@{uname}" if uname else f"#{uid}"
         dt     = datetime.fromisoformat(created).strftime("%d/%m %H:%M")
         preview = msg[:40].replace("\n", " ") + ("…" if len(msg) > 40 else "")
-        text  += f"{icon} **#{rep_id}** {who} — {dt}\n   _{preview}_\n\n"
+        text  += f"{icon} *#{rep_id}* {who} — {dt}\n   _{preview}_\n\n"
         row_btns = [{"text": f"✉️ #{rep_id}", "callback_data": f"bug_reply_{rep_id}"},
                     {"text": f"✅ Close",      "callback_data": f"bug_close_{rep_id}"}]
         buttons.append(row_btns)
@@ -2350,13 +2456,13 @@ def show_premium_menu(chat_id, user_id, message_id=None):
         if expires:
             days_left = (expires - datetime.now()).days
             text = (
-                f"**⭐ PREMIUM MEMBER**\n\n"
+                f"*⭐ PREMIUM MEMBER*\n\n"
                 f"✅ Plan: `{plan.upper()}`\n"
                 f"📅 Expires: `{expires.strftime('%Y-%m-%d')}`\n"
                 f"⏰ Days left: `{days_left}`\n"
                 f"⏸️ Paused: `{paused_count}`\n\n"
                 f"✨ Benefits active!\n\n"
-                f"💰 Monthly/Yearly deployments are **FREE** for you!"
+                f"💰 Monthly/Yearly deployments are *FREE* for you!"
             )
             keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
         else:
@@ -2364,14 +2470,14 @@ def show_premium_menu(chat_id, user_id, message_id=None):
             keyboard = {"inline_keyboard": [[{"text": "💰 Renew Premium", "callback_data": "subscribe_premium"}]]}
     else:
         text = (
-            f"**⭐ PREMIUM SUBSCRIPTION**\n\n"
-            f"✨ **Benefits:**\n"
+            f"*⭐ PREMIUM SUBSCRIPTION*\n\n"
+            f"✨ *Benefits:*\n"
             f"• ✅ Unlimited free deployments (24h)\n"
             f"• ✅ FREE Monthly/Yearly deployments\n"
             f"• ✅ Priority support\n"
             f"• ✅ Auto-resume paused bots\n\n"
             f"⏸️ Paused: `{paused_count}`\n\n"
-            f"💰 **Pricing:**\n"
+            f"💰 *Pricing:*\n"
             f"📅 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
             f"🌟 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`\n\n"
             f"Choose payment method:"
@@ -2394,7 +2500,7 @@ def show_premium_menu(chat_id, user_id, message_id=None):
 def purchase_premium_stars(chat_id, user_id, plan, duration_days, cost_stars):
     success, error = create_premium_invoice(chat_id, user_id, plan, duration_days, cost_stars)
     if success:
-        send_message(chat_id, f"⭐ **Stars Payment Required**\n\nPlan: {plan.upper()}\nCost: {cost_stars}⭐\n\nPlease complete the payment using the invoice above.\n\nYour premium will activate automatically after payment.")
+        send_message(chat_id, f"⭐ *Stars Payment Required*\n\nPlan: {plan.upper()}\nCost: {cost_stars}⭐\n\nPlease complete the payment using the invoice above.\n\nYour premium will activate automatically after payment.")
     else:
         send_message(chat_id, f"❌ Failed to create invoice: {error}")
 
@@ -2408,7 +2514,7 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
         if success:
             resume_msg = f"\n\n✅ Resumed {resumed} paused deployment(s)!" if resumed > 0 else ""
             send_message(chat_id,
-                f"✅ **PREMIUM ACTIVATED!**{resume_msg}\n\n"
+                f"✅ *PREMIUM ACTIVATED!*{resume_msg}\n\n"
                 f"Plan: `{plan.upper()}`\n"
                 f"Duration: `{duration_days}` days\n"
                 f"Paid: `{cost_coins}🪙`\n\n"
@@ -2418,7 +2524,7 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
             send_message(chat_id, "❌ Failed to activate premium.")
     else:
         send_message(chat_id,
-            f"❌ **INSUFFICIENT COINS**\n\nRequired: `{cost_coins}🪙`\nYour balance: `{balances['coins']}🪙`\n\nUse redeem codes or pay with Stars!",
+            f"❌ *INSUFFICIENT COINS*\n\nRequired: `{cost_coins}🪙`\nYour balance: `{balances['coins']}🪙`\n\nUse redeem codes or pay with Stars!",
             {"inline_keyboard": [[{"text": "⭐ Pay with Stars", "callback_data": f"premium_{plan}_stars"},
                                   {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
 
@@ -3641,7 +3747,7 @@ def get_platform_env_hint(frameworks: list) -> str:
         hint = PLATFORM_ENV_HINTS.get(fw)
         if hint and hint not in hints:
             label = _PLATFORM_LABELS.get(fw, fw)
-            hints.append(f"**{label}:**\n{hint}")
+            hints.append(f"*{label}:*\n{hint}")
     return '\n\n'.join(hints) if hints else ''
 
 
@@ -4585,8 +4691,8 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             active_gh = count_github_deployments(user_id)
             if active_gh >= 1:
                 send_message(chat_id,
-                    "⚠️ **GitHub Deployment Limit Reached**\n\n"
-                    "Free users can have **1 active GitHub deployment** at a time (24hrs).\n\n"
+                    "⚠️ *GitHub Deployment Limit Reached*\n\n"
+                    "Free users can have *1 active GitHub deployment* at a time (24hrs).\n\n"
                     "Stop or wait for your existing GitHub deployment to expire, "
                     "or upgrade to Premium for unlimited deployments.",
                     {"inline_keyboard": [
@@ -4604,7 +4710,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         # ── Download repo ────────────────────────────────────────────
         if not download_github_repo(owner, repo, branch, deploy_folder, token, update_logs):
             edit_message(chat_id, status_message_id,
-                "❌ **GitHub download failed.**\n\n"
+                "❌ *GitHub download failed.*\n\n"
                 "• For private repos: ensure the token has `repo` scope\n"
                 "• Check the repo URL and branch name",
                 {"inline_keyboard": [[{"text": "🔄 Try Again", "callback_data": "github_deploy"},
@@ -4637,7 +4743,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 for c in crit[:5]:
                     update_logs(f"  • {c}")
                 edit_message(chat_id, status_message_id,
-                    f"🚫 **GitHub Deployment Blocked — Security**\n\n"
+                    f"🚫 *GitHub Deployment Blocked — Security*\n\n"
                     f"{scan_report}\n\n"
                     "Remove the flagged patterns from the repo and retry.",
                     {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
@@ -4772,14 +4878,14 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
             expire_str = "Never (lifetime)" if is_lifetime else expire_time.strftime('%Y-%m-%d %H:%M')
             edit_message(chat_id, status_message_id,
-                f"**🎉 GITHUB DEPLOYMENT SUCCESSFUL!**\n\n"
-                f"🐙 **Repo:** `{owner}/{repo}`\n"
-                f"🌿 **Branch:** `{branch}`\n"
-                f"🎯 **Entry:** `{dest_script.name}`\n"
-                f"🔧 **Framework:** {', '.join(frameworks)}\n"
-                f"📋 **Plan:** {plan.upper()}\n"
-                f"📅 **Expires:** `{expire_str}`\n"
-                f"🆔 **ID:** `{deployment_db_id}`",
+                f"*🎉 GITHUB DEPLOYMENT SUCCESSFUL!*\n\n"
+                f"🐙 *Repo:* `{owner}/{repo}`\n"
+                f"🌿 *Branch:* `{branch}`\n"
+                f"🎯 *Entry:* `{dest_script.name}`\n"
+                f"🔧 *Framework:* {', '.join(frameworks)}\n"
+                f"📋 *Plan:* {plan.upper()}\n"
+                f"📅 *Expires:* `{expire_str}`\n"
+                f"🆔 *ID:* `{deployment_db_id}`",
                 {"inline_keyboard": [
                     [{"text": "📄 Runtime Logs",  "callback_data": f"view_runtime_logs_{deployment_db_id}"}],
                     [{"text": "🔄 Restart",        "callback_data": f"restart_deploy_{deployment_db_id}"}],
@@ -4794,9 +4900,9 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             if log_file.exists():
                 err_tail = log_file.read_text(errors='replace')[-2500:].strip()
             edit_message(chat_id, status_message_id,
-                f"❌ **GITHUB DEPLOYMENT FAILED**\n\n"
+                f"❌ *GITHUB DEPLOYMENT FAILED*\n\n"
                 f"Repo: `{owner}/{repo}@{branch}`\n\n"
-                f"**Last output:**\n```\n{err_tail[-1500:]}\n```\n\n"
+                f"*Last output:*\n```\n{err_tail[-1500:]}\n```\n\n"
                 "Common fixes:\n"
                 "• Set `BOT_TOKEN` in env vars\n"
                 "• Check the main file name\n"
@@ -5049,25 +5155,25 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 ]
             }
             
-            expiry_line = "📅 **Expires:** `Never (lifetime)`" if is_lifetime \
-                else f"📅 **Expires:** {expire_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            duration_line = "⏱️ **Duration:** Lifetime — never expires" if is_lifetime \
-                else f"⏱️ **Duration:** {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
+            expiry_line = "📅 *Expires:* `Never (lifetime)`" if is_lifetime \
+                else f"📅 *Expires:* {expire_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            duration_line = "⏱️ *Duration:* Lifetime — never expires" if is_lifetime \
+                else f"⏱️ *Duration:* {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
 
             success_text = (
-                f"**🎉 DEPLOYMENT SUCCESSFUL!** 🎉\n\n"
-                f"📁 **File:** `{dest_script.name}`\n"
-                f"🤖 **Platform:** {get_platform_label(frameworks)}\n"
-                f"📋 **Plan:** {plan.upper()}\n"
+                f"*🎉 DEPLOYMENT SUCCESSFUL!* 🎉\n\n"
+                f"📁 *File:* `{dest_script.name}`\n"
+                f"🤖 *Platform:* {get_platform_label(frameworks)}\n"
+                f"📋 *Plan:* {plan.upper()}\n"
                 f"{duration_line}\n"
                 f"{expiry_line}\n"
-                f"📦 **Dependencies:** {len(requirements_list)} package(s)\n"
-                f"🔧 **Env Vars:** {len(env_vars_dict)}\n"
-                f"🆔 **ID:** `{deployment_db_id}`"
+                f"📦 *Dependencies:* {len(requirements_list)} package(s)\n"
+                f"🔧 *Env Vars:* {len(env_vars_dict)}\n"
+                f"🆔 *ID:* `{deployment_db_id}`"
             )
             
             if failed:
-                success_text += f"\n\n⚠️ **Partial Success:** {len(failed)} package(s) failed to install"
+                success_text += f"\n\n⚠️ *Partial Success:* {len(failed)} package(s) failed to install"
             
             edit_message(chat_id, status_message_id, success_text, success_keyboard)
             
@@ -5091,33 +5197,33 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             if error_tail:
                 low = error_tail.lower()
                 if 'no bot token' in low or 'bot_token' in low and 'not' in low:
-                    diagnosis = "\n\n💡 **Tip:** Your bot needs `BOT_TOKEN` — set it in env vars when deploying."
+                    diagnosis = "\n\n💡 *Tip:* Your bot needs `BOT_TOKEN` — set it in env vars when deploying."
                 elif 'modulenotfounderror' in low or 'importerror' in low:
                     import re as _re
                     m = _re.search(r"No module named '([^']+)'", error_tail)
                     pkg = m.group(1) if m else "unknown"
-                    diagnosis = f"\n\n💡 **Tip:** Missing package `{pkg}` — add it to `requirements.txt` and redeploy."
+                    diagnosis = f"\n\n💡 *Tip:* Missing package `{pkg}` — add it to `requirements.txt` and redeploy."
                 elif 'syntaxerror' in low:
-                    diagnosis = "\n\n💡 **Tip:** Your bot has a Python syntax error — test it locally first."
+                    diagnosis = "\n\n💡 *Tip:* Your bot has a Python syntax error — test it locally first."
                 elif 'telegramapiexception' in low or 'unauthorized' in low:
-                    diagnosis = "\n\n💡 **Tip:** Invalid bot token — check your `BOT_TOKEN` env var."
+                    diagnosis = "\n\n💡 *Tip:* Invalid bot token — check your `BOT_TOKEN` env var."
                 elif 'address already in use' in low or 'port' in low and 'bind' in low:
-                    diagnosis = "\n\n💡 **Tip:** Port conflict — another process is using the same port."
+                    diagnosis = "\n\n💡 *Tip:* Port conflict — another process is using the same port."
                 elif 'permissionerror' in low:
-                    diagnosis = "\n\n💡 **Tip:** File permission error — contact support."
+                    diagnosis = "\n\n💡 *Tip:* File permission error — contact support."
                 else:
-                    diagnosis = "\n\n💡 **Tip:** Check the error above. Common fixes:\n• Add `BOT_TOKEN` env var\n• Add a `requirements.txt`\n• Make sure your bot has no syntax errors"
+                    diagnosis = "\n\n💡 *Tip:* Check the error above. Common fixes:\n• Add `BOT_TOKEN` env var\n• Add a `requirements.txt`\n• Make sure your bot has no syntax errors"
             
-            error_msg = f"❌ **DEPLOYMENT FAILED**\n\n"
+            error_msg = f"❌ *DEPLOYMENT FAILED*\n\n"
             if error_tail:
-                error_msg += f"**Last output (tail):**\n```\n{error_tail}\n```{diagnosis}"
+                error_msg += f"*Last output (tail):*\n```\n{error_tail}\n```{diagnosis}"
             else:
                 error_msg += (
                     "No output captured. Common issues:\n"
                     "• Missing required env vars (e.g. `BOT_TOKEN`)\n"
                     "• Syntax error in your code\n"
                     "• Missing packages not in requirements.txt\n\n"
-                    "**Tip:** Test your bot locally before deploying."
+                    "*Tip:* Test your bot locally before deploying."
                 )
             
             edit_message(chat_id, status_message_id, error_msg[:4000])
@@ -5140,7 +5246,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             return False
             
     except Exception as e:
-        error_msg = f"❌ **DEPLOYMENT FAILED**\n\nException: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"❌ *DEPLOYMENT FAILED*\n\nException: {str(e)}\n{traceback.format_exc()}"
         edit_message(chat_id, status_message_id, error_msg[:4000])
         Path(temp_file).unlink(missing_ok=True)
         return False
@@ -5153,7 +5259,7 @@ def deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements_text, en
     
     can_deploy, reason = can_use_free_deployment(user_id)
     if not can_deploy:
-        send_message(chat_id, f"❌ **FREE DEPLOYMENT LIMIT REACHED**\n\n{reason}\n\nUpgrade to Premium for unlimited deployments!",
+        send_message(chat_id, f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}\n\nUpgrade to Premium for unlimited deployments!",
                     {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
         return False
     
@@ -5167,8 +5273,8 @@ def deploy_paid_bot(chat_id, user_id, temp_file, requirements_text, env_vars, pl
     
     if is_user_premium(user_id) or is_admin(user_id):
         send_message(chat_id, 
-            f"**✨ PREMIUM BENEFIT ACTIVE!**\n\n"
-            f"As a premium user, your {plan.upper()} deployment is **FREE**!\n\n"
+            f"*✨ PREMIUM BENEFIT ACTIVE!*\n\n"
+            f"As a premium user, your {plan.upper()} deployment is *FREE*!\n\n"
             f"Proceeding with deployment...")
         
         return deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, env_vars,
@@ -5224,11 +5330,11 @@ def delete_deployment(deployment_id, user_id, chat_id):
             used_count = get_free_deployment_used_count(user_id)
             remaining = FREE_USER_MAX_DEPLOYMENTS - used_count
             send_message(chat_id, 
-                f"✅ **Deployment `{deployment_id}` deleted!**\n\n"
+                f"✅ *Deployment `{deployment_id}` deleted!*\n\n"
                 f"📁 File: `{file_name}`\n"
                 f"🆓 Free slots left: `{remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
         else:
-            send_message(chat_id, f"✅ **Deployment `{deployment_id}` deleted!**\n\n📁 File: `{file_name}`")
+            send_message(chat_id, f"✅ *Deployment `{deployment_id}` deleted!*\n\n📁 File: `{file_name}`")
         
         with deployment_lock:
             if deployment_id in active_deployments:
@@ -5241,7 +5347,7 @@ def delete_deployment(deployment_id, user_id, chat_id):
         send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
         return False
 
-def restart_deployment(deployment_id, user_id, chat_id):
+def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=False):
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
@@ -5251,6 +5357,7 @@ def restart_deployment(deployment_id, user_id, chat_id):
         row = c.fetchone()
 
         if not row:
+            conn.close()
             send_message(chat_id, "❌ Deployment not found")
             return False
 
@@ -5258,6 +5365,7 @@ def restart_deployment(deployment_id, user_id, chat_id):
             status, start_time_str, expire_time_str, is_free, plan = row
 
         if owner_id != user_id and not is_admin(user_id):
+            conn.close()
             send_message(chat_id, "❌ Permission denied")
             return False
 
@@ -5265,19 +5373,52 @@ def restart_deployment(deployment_id, user_id, chat_id):
         # (lifetime deployments never expire, so they never legitimately hit
         # this state — but guard it anyway rather than trust that invariant)
         if is_paused and not is_free and plan != "lifetime":
+            conn.close()
             send_message(chat_id,
                 "⏸️ This premium deployment is paused.\n\n"
                 "Purchase or renew premium to resume it — your database stays intact.",
                 {"inline_keyboard": [[{"text": "⭐ Renew Premium", "callback_data": "subscribe_premium"}]]})
             return False
 
+        # ── Re-verify premium status before auto-extending a premium plan ──
+        # A deployment's `plan` reflects what it was created under, not the
+        # owner's CURRENT subscription — someone could restart a long-expired
+        # "monthly" deployment and silently get another free extension of the
+        # original duration even if their premium lapsed ages ago. Re-check
+        # live status and let the user explicitly choose how to proceed
+        # instead of assuming.
+        needs_expiry_extension = False
+        if expire_time_str and not is_free and plan != "lifetime":
+            current_expire = datetime.fromisoformat(expire_time_str)
+            needs_expiry_extension = status in ('stopped', 'failed') or current_expire < datetime.now()
+
+        if needs_expiry_extension and not force_free_downgrade:
+            conn.close()
+            if not is_user_premium(owner_id):
+                send_message(chat_id,
+                    f"⭐ *This bot's plan (`{plan}`) has expired, and your premium "
+                    f"subscription is no longer active.*\n\n"
+                    f"Your database and files are safe. How would you like to restart it?",
+                    {"inline_keyboard": [
+                        [{"text": "⭐ Renew Premium", "callback_data": "subscribe_premium"}],
+                        [{"text": "🆓 Restart as Free (24h)", "callback_data": f"restart_free_{deployment_id}"}],
+                        [{"text": "❌ Cancel", "callback_data": f"view_deploy_{deployment_id}"}],
+                    ]})
+                return False
+            # Still genuinely premium — reopen the connection and proceed
+            # exactly as before.
+            conn = sqlite3.connect(DATABASE_FILE)
+            c = conn.cursor()
+
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
         dest_script   = deploy_folder / file_name
 
         if not deploy_folder.exists():
+            conn.close()
             send_message(chat_id, "❌ Deployment folder missing — please create a new deployment.")
             return False
         if not dest_script.exists():
+            conn.close()
             send_message(chat_id,
                 f"❌ Bot file `{file_name}` missing.\n\nPlease delete this deployment and create a new one.")
             return False
@@ -5334,6 +5475,17 @@ def restart_deployment(deployment_id, user_id, chat_id):
                 # Lifetime deployment — never had an expiry and never gets one.
                 c.execute("UPDATE deployments SET proc_pid=?, status='active', is_paused=0 WHERE deployment_id=?",
                           (new_pid, deployment_id))
+            elif force_free_downgrade:
+                # User explicitly chose to continue on the free tier rather
+                # than renew — actually downgrade the plan, not just extend
+                # the expiry, so it's consistently treated as free from now on
+                # (future restarts, expiry monitor, resource accounting, etc.)
+                new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
+                c.execute("""UPDATE deployments
+                             SET proc_pid=?, status='active', is_paused=0, expire_time=?,
+                                 start_time=?, is_free=1, plan='free'
+                             WHERE deployment_id=?""",
+                          (new_pid, new_expire.isoformat(), datetime.now().isoformat(), deployment_id))
             else:
                 # For stopped/expired bots: extend expiry from now
                 current_expire = datetime.fromisoformat(expire_time_str)
@@ -5341,7 +5493,8 @@ def restart_deployment(deployment_id, user_id, chat_id):
                     if is_free:
                         new_expire = datetime.now() + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
                     else:
-                        # Premium restart: keep original duration window
+                        # Premium restart: owner's active status was already
+                        # re-verified above — keep the original duration window
                         original_hours = max(1, (current_expire - datetime.fromisoformat(start_time_str)).total_seconds() / 3600)
                         new_expire = datetime.now() + timedelta(hours=original_hours)
                     c.execute("""UPDATE deployments
@@ -5359,7 +5512,7 @@ def restart_deployment(deployment_id, user_id, chat_id):
 
             async_backup(f"restart_{deployment_id}")
             send_message(chat_id,
-                f"✅ **Bot #{deployment_id} Restarted**\n\n"
+                f"✅ *Bot #{deployment_id} Restarted*\n\n"
                 f"Your database and settings are preserved.\n"
                 f"Bot is running from the same deployment folder.",
                 {"inline_keyboard": [
@@ -5376,7 +5529,7 @@ def restart_deployment(deployment_id, user_id, chat_id):
             conn.commit()
             conn.close()
             send_message(chat_id,
-                f"❌ **Bot #{deployment_id} failed to start**\n\n"
+                f"❌ *Bot #{deployment_id} failed to start*\n\n"
                 f"```\n{log_tail[-400:]}\n```\n\n"
                 "Check your env vars and try again.",
                 {"inline_keyboard": [
@@ -5583,17 +5736,17 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "my_deployments"}])
     keyboard["inline_keyboard"].append([{"text": "🏠 Menu", "callback_data": "main_menu"}])
     
-    error_text = f"\n\n**❌ Error:**\n`{error_log[:500]}`" if error_log else ""
+    error_text = f"\n\n*❌ Error:*\n`{error_log[:500]}`" if error_log else ""
     
     if is_free and not is_user_premium(user_id) and not is_admin(user_id):
         used = get_free_deployment_used_count(user_id)
         remaining_slots = FREE_USER_MAX_DEPLOYMENTS - used
-        free_status_text = f"\n\n**🆓 Free Slots Left:** `{remaining_slots}/{FREE_USER_MAX_DEPLOYMENTS}`"
+        free_status_text = f"\n\n*🆓 Free Slots Left:* `{remaining_slots}/{FREE_USER_MAX_DEPLOYMENTS}`"
     else:
         free_status_text = ""
     
     text = (
-        f"**📄 DEPLOYMENT #{dep_id}**\n\n"
+        f"*📄 DEPLOYMENT #{dep_id}*\n\n"
         f"📁 File: `{fname}` ({size_str})\n"
         f"🔧 Framework: `{framework}`\n"
         f"📋 Plan: `{plan.upper()}`\n"
@@ -5629,9 +5782,9 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
             if credited:
                 # Notify referrer
                 send_message(referrer_id,
-                    f"🎉 **Referral Bonus!**\n\n"
+                    f"🎉 *Referral Bonus!*\n\n"
                     f"Someone joined using your referral link!\n"
-                    f"You earned **{REFERRAL_REWARD_COINS} 🪙** coins.\n\n"
+                    f"You earned *{REFERRAL_REWARD_COINS} 🪙* coins.\n\n"
                     f"Keep sharing to earn more!",
                     {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
         except Exception as _re:
@@ -5671,18 +5824,18 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
         conn.close()
         
         welcome = (
-            f"**🤖 BOT HOSTING SERVICE**\n\n"
+            f"*🤖 BOT HOSTING SERVICE*\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Welcome **{first_name}**!\n"
+            f"👤 Welcome *{first_name}*!\n"
             f"🪙 Coins: `{balances['coins']}`\n"
             f"⭐ Stars: `{balances['stars']}`\n"
             f"🎫 Status: {premium_badge}\n"
             f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
             f"⏸️ Paused: `{paused_count}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🖥️ **Server:** Uptime `{format_uptime(uptime)}`\n"
+            f"🖥️ *Server:* Uptime `{format_uptime(uptime)}`\n"
             f"💱 Exchange: `1⭐ = {STARS_PER_COIN}🪙`\n\n"
-            f"**⭐ Premium Benefits:**\n"
+            f"*⭐ Premium Benefits:*\n"
             f"• Unlimited free deployments (24h)\n"
             f"• FREE Monthly/Yearly deployments\n"
             f"• Auto-resume paused bots\n\n"
@@ -5715,7 +5868,7 @@ def handle_balance(chat_id, user_id, message_id=None):
     premium_badge = "⭐ PREMIUM ⭐" if is_premium else "🆓 FREE"
     
     text = (
-        f"**💰 YOUR BALANCE**\n\n"
+        f"*💰 YOUR BALANCE*\n\n"
         f"🪙 Coins: `{balances['coins']}`\n"
         f"⭐ Stars: `{balances['stars']}`\n"
         f"🎫 Status: {premium_badge}\n"
@@ -5724,7 +5877,7 @@ def handle_balance(chat_id, user_id, message_id=None):
         f"🪙 Spent: `{row[1] if row else 0}`\n"
         f"⭐ Earned: `{row[2] if row else 0}`\n"
         f"⭐ Spent: `{row[3] if row else 0}`\n\n"
-        f"**Premium Pricing:**\n"
+        f"*Premium Pricing:*\n"
         f"📅 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
         f"🌟 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`"
     )
@@ -5741,7 +5894,7 @@ def handle_redeem(chat_id, user_id, message_id=None):
     
     set_user_step(user_id, 'awaiting_redeem', waiting_for_redeem=1)
     send_message(chat_id,
-        f"**🎫 REDEEM CODE**\n\nSend your code:",
+        f"*🎫 REDEEM CODE*\n\nSend your code:",
         {"inline_keyboard": [[{"text": "🔙 Cancel", "callback_data": "main_menu"}]]})
 
 def process_redeem(chat_id, user_id, code):
@@ -5767,11 +5920,11 @@ def handle_free_deployment(chat_id, user_id, message_id=None):
     if not can_deploy:
         if message_id:
             edit_message(chat_id, message_id,
-                f"❌ **FREE DEPLOYMENT LIMIT REACHED**\n\n{reason}\n\nUpgrade to Premium for unlimited free deployments!",
+                f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}\n\nUpgrade to Premium for unlimited free deployments!",
                 {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
         else:
             send_message(chat_id,
-                f"❌ **FREE DEPLOYMENT LIMIT REACHED**\n\n{reason}\n\nUpgrade to Premium for unlimited free deployments!",
+                f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}\n\nUpgrade to Premium for unlimited free deployments!",
                 {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
         return
     
@@ -5779,12 +5932,12 @@ def handle_free_deployment(chat_id, user_id, message_id=None):
                   cost_coins=0, cost_stars=0, payment_method='none')
     
     text = (
-        f"**🆓 FREE DEPLOYMENT**\n\n"
+        f"*🆓 FREE DEPLOYMENT*\n\n"
         f"⏱️ Duration: `{FREE_DEPLOYMENT_DURATION_HOURS}` hours\n"
         f"💰 Cost: FREE\n"
         f"📊 Free slots left: {reason}\n"
         f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
-        f"📤 **Send your Python file (.py)**\n\n"
+        f"📤 *Send your Python file (.py)*\n\n"
         f"After sending the file, send:\n"
         f"• requirements.txt file (optional)\n"
         f"• Environment variables (KEY=VALUE, one per line)"
@@ -5811,39 +5964,39 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
     
     if plan == "lifetime":
         text = (
-            f"**♾️ LIFETIME DEPLOYMENT (ADMIN)**\n\n"
+            f"*♾️ LIFETIME DEPLOYMENT (ADMIN)*\n\n"
             f"⏱️ Duration: `Never expires`\n"
             f"💰 Cost: FREE\n\n"
-            f"📤 **Send your file (.py, .js, etc.)**\n"
+            f"📤 *Send your file (.py, .js, etc.)*\n"
             f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
             f"After sending the file, send:\n"
             f"• requirements.txt / package.json (optional)\n"
             f"• Environment variables (KEY=VALUE, one per line)\n\n"
-            f"**Note:** All environment variables will be available via os.environ.get('KEY')"
+            f"*Note:* All environment variables will be available via os.environ.get('KEY')"
         )
     elif is_user_premium(user_id) or is_admin(user_id):
         text = (
-            f"**✨ PREMIUM BENEFIT!**\n\n"
-            f"Your {plan.upper()} deployment is **FREE** as a premium member!\n\n"
-            f"📤 **Send your Python file (.py)**\n"
+            f"*✨ PREMIUM BENEFIT!*\n\n"
+            f"Your {plan.upper()} deployment is *FREE* as a premium member!\n\n"
+            f"📤 *Send your Python file (.py)*\n"
             f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
             f"After sending the file, send:\n"
             f"• requirements.txt file (optional)\n"
             f"• Environment variables (KEY=VALUE, one per line)\n\n"
-            f"**Note:** All environment variables will be available via os.environ.get('KEY')"
+            f"*Note:* All environment variables will be available via os.environ.get('KEY')"
         )
     else:
         text = (
-            f"**💰 {plan.capitalize()} DEPLOYMENT**\n\n"
+            f"*💰 {plan.capitalize()} DEPLOYMENT*\n\n"
             f"⏱️ Duration: `{duration}` days\n"
             f"⭐ Cost: `{cost_stars}⭐`\n"
             f"🪙 Cost: `{cost_coins}🪙`\n\n"
-            f"📤 **Send your Python file (.py)**\n"
+            f"📤 *Send your Python file (.py)*\n"
             f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
             f"After sending the file, send:\n"
             f"• requirements.txt file (optional)\n"
             f"• Environment variables (KEY=VALUE, one per line)\n\n"
-            f"**Note:** All environment variables will be available via os.environ.get('KEY')"
+            f"*Note:* All environment variables will be available via os.environ.get('KEY')"
         )
     
     edit_message(chat_id, message_id, text,
@@ -5863,17 +6016,17 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
     if not rows:
         keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
         if message_id:
-            edit_message(chat_id, message_id, "📭 **No Deployments**", keyboard)
+            edit_message(chat_id, message_id, "📭 *No Deployments*", keyboard)
         else:
-            send_message(chat_id, "📭 **No Deployments**", keyboard)
+            send_message(chat_id, "📭 *No Deployments*", keyboard)
         return
     
     if not is_user_premium(user_id) and not is_admin(user_id):
         used = get_free_deployment_used_count(user_id)
         remaining = FREE_USER_MAX_DEPLOYMENTS - used
-        header = f"📦 **Your Deployments**\n\n🆓 Free slots: `{remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n\n"
+        header = f"📦 *Your Deployments*\n\n🆓 Free slots: `{remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n\n"
     else:
-        header = "📦 **Your Deployments**\n\n"
+        header = "📦 *Your Deployments*\n\n"
     
     keyboard = {"inline_keyboard": []}
     for dep_id, fname, fsize, plan, exp_str, status, is_free, payment, is_paused, framework in rows:
@@ -6018,6 +6171,63 @@ def get_env_keyboard(env_count):
     }
 
 # ==================== ADMIN PANEL ====================
+def admin_resources_view(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+
+    edit_message(chat_id, message_id, "📊 Measuring resource usage...")
+
+    sys_res = get_system_resources(sample_seconds=0.5)
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT deployment_id, user_id, file_name, proc_pid FROM deployments "
+              "WHERE status = 'active' AND proc_pid IS NOT NULL")
+    active = c.fetchall()
+    conn.close()
+
+    per_deploy = []
+    for dep_id, owner_id, fname, pid in active:
+        usage = get_deployment_resource_usage(pid)
+        if usage:
+            per_deploy.append((dep_id, owner_id, fname, usage['ram_mb'], usage['cpu_percent']))
+
+    # Heaviest RAM users first — the ones most likely to matter if something's
+    # starving other bots for resources.
+    per_deploy.sort(key=lambda x: x[3], reverse=True)
+
+    bar_len = 20
+    def _bar(pct):
+        filled = int(pct / 100 * bar_len)
+        return '█' * filled + '░' * (bar_len - filled)
+
+    text = (
+        f"*📊 SYSTEM RESOURCE USAGE*\n\n"
+        f"🖥️ CPU: `{sys_res['cpu_percent']:.1f}%` ({sys_res['cpu_count']} core(s))\n"
+        f"`{_bar(sys_res['cpu_percent'])}`\n\n"
+        f"💾 RAM: `{sys_res['ram_used_mb']:.0f} / {sys_res['ram_total_mb']:.0f} MB` "
+        f"(`{sys_res['ram_percent']:.1f}%`)\n"
+        f"`{_bar(sys_res['ram_percent'])}`\n\n"
+        f"⚖️ Load average: `{sys_res['load_avg'][0]:.2f}, {sys_res['load_avg'][1]:.2f}, "
+        f"{sys_res['load_avg'][2]:.2f}`\n"
+        f"🤖 Active deployments: `{len(active)}`\n"
+    )
+
+    if per_deploy:
+        text += f"\n*Top RAM usage by deployment:*\n"
+        for dep_id, owner_id, fname, ram_mb, cpu_pct in per_deploy[:10]:
+            cpu_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
+            text += f"• #{dep_id} `{fname[:25]}` — `{ram_mb:.0f}MB` / CPU `{cpu_str}`\n"
+
+    if sys_res['source'] == 'proc':
+        text += f"\n_ℹ️ Per-deployment CPU% unavailable without psutil (RAM still accurate)_"
+
+    edit_message(chat_id, message_id, text,
+        {"inline_keyboard": [
+            [{"text": "🔄 Refresh", "callback_data": "admin_resources"}],
+            [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+
+
 def admin_database_menu(chat_id, message_id, user_id):
     if not is_admin(user_id):
         return
@@ -6029,13 +6239,13 @@ def admin_database_menu(chat_id, message_id, user_id):
     last_backup = (f"{int(datetime.now().timestamp() - _last_backup_time)}s ago"
                    if _last_backup_time else "never (this run)")
     text = (
-        f"**💾 DATABASE BACKUP**\n\n"
+        f"*💾 DATABASE BACKUP*\n\n"
         f"📦 Current size: `{size_kb:.1f} KB`\n"
         f"☁️ GitHub backup: {gh_status}\n"
         f"🕐 Last GitHub push: `{last_backup}`\n\n"
-        f"• **Backup Now** — pushes the current database to GitHub immediately.\n"
-        f"• **Download** — sends you the raw `.db` file here in chat.\n"
-        f"• **Restore** — replaces the live database with a `.db` file you "
+        f"• *Backup Now* — pushes the current database to GitHub immediately.\n"
+        f"• *Download* — sends you the raw `.db` file here in chat.\n"
+        f"• *Restore* — replaces the live database with a `.db` file you "
         f"upload. A safety copy of the current database is made first."
     )
     keyboard = {"inline_keyboard": [
@@ -6060,11 +6270,11 @@ def admin_db_backup_now(chat_id, message_id, user_id):
     ok = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
     if ok:
         edit_message(chat_id, message_id,
-            "✅ **Backup complete!**\n\nThe database was pushed to GitHub successfully.",
+            "✅ *Backup complete!*\n\nThe database was pushed to GitHub successfully.",
             {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
     else:
         edit_message(chat_id, message_id,
-            "❌ **Backup failed.**\n\nCheck the server logs (invalid token, repo not "
+            "❌ *Backup failed.*\n\nCheck the server logs (invalid token, repo not "
             "found, or the database has no data yet are the usual causes).",
             {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
 
@@ -6084,9 +6294,9 @@ def admin_db_download(chat_id, message_id, user_id):
         # a too-large DB just fails silently with a generic error and no
         # way to tell what actually went wrong.
         edit_message(chat_id, message_id,
-            f"❌ **Database is too large to send via Telegram** ({size_mb:.1f} MB).\n\n"
+            f"❌ *Database is too large to send via Telegram* ({size_mb:.1f} MB).\n\n"
             f"Telegram's bot API caps file uploads at 50 MB. Use "
-            f"**🔄 Backup to GitHub Now** instead, or download it directly "
+            f"*🔄 Backup to GitHub Now* instead, or download it directly "
             f"from the server's disk.",
             {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
         return
@@ -6115,7 +6325,7 @@ def admin_db_restore_start(chat_id, message_id, user_id):
         return
     set_user_step(user_id, 'awaiting_db_restore')
     edit_message(chat_id, message_id,
-        "**⬆️ RESTORE DATABASE**\n\n"
+        "*⬆️ RESTORE DATABASE*\n\n"
         "Send the `.db` file to restore.\n\n"
         "⚠️ This replaces ALL current data (users, deployments, coins, "
         "everything) with the contents of the file you send. A safety copy "
@@ -6195,7 +6405,7 @@ def handle_db_restore_upload(message, user_id, chat_id):
         deploys_count = conn.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
         conn.close()
         send_message(chat_id,
-            f"✅ **Database restored successfully!**\n\n"
+            f"✅ *Database restored successfully!*\n\n"
             f"👥 Users: `{users_count}`\n"
             f"📦 Deployments: `{deploys_count}`\n\n"
             f"A safety copy of the previous database was kept as "
@@ -6228,7 +6438,7 @@ def show_admin_panel(chat_id, message_id):
         top_referrer = None
 
     stats_text = (
-        f"**📊 System Stats**\n\n"
+        f"*📊 System Stats*\n\n"
         f"👥 Users: `{stats.get('total_users', 0)}`\n"
         f"📦 Deployments: `{stats.get('total_deployments', 0)}`\n"
         f"🟢 Active: `{stats.get('active_deployments', 0)}`\n"
@@ -6255,11 +6465,12 @@ def show_admin_panel(chat_id, message_id):
             [{"text": "👥 List Users",               "callback_data": "admin_list_users"}],
             [{"text": "📊 View Subscriptions",       "callback_data": "admin_subscriptions"}],
             [{"text": "💾 Database Backup",          "callback_data": "admin_database"}],
+            [{"text": "📊 Resource Usage",           "callback_data": "admin_resources"}],
             [{"text": "🔙 Back to Main Menu",        "callback_data": "main_menu"}]
         ]
     }
 
-    edit_message(chat_id, message_id, f"**🔧 ADMIN PANEL**\n\n{stats_text}", keyboard)
+    edit_message(chat_id, message_id, f"*🔧 ADMIN PANEL*\n\n{stats_text}", keyboard)
 
 def admin_list_codes(chat_id, message_id):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -6272,7 +6483,7 @@ def admin_list_codes(chat_id, message_id):
     if not rows:
         text = "📭 No redeem codes found."
     else:
-        text = "**🎫 REDEEM CODES**\n\n"
+        text = "*🎫 REDEEM CODES*\n\n"
         for code, coins, used, max_uses, expires, active, created in rows:
             status = "✅" if active else "❌"
             max_text = "∞" if max_uses == 0 else str(max_uses)
@@ -6295,7 +6506,7 @@ def admin_list_users(chat_id, message_id):
     if not rows:
         text = "👥 No users found."
     else:
-        text = "**👥 USERS**\n\n"
+        text = "*👥 USERS*\n\n"
         for uid, username, first, coins, stars, premium, join_date in rows:
             premium_icon = "⭐" if premium else "🆓"
             join_short = join_date[:10] if join_date else "Unknown"
@@ -6319,7 +6530,7 @@ def admin_subscriptions(chat_id, message_id):
     if not rows:
         text = "📭 No subscriptions found."
     else:
-        text = "**📋 SUBSCRIPTIONS**\n\n"
+        text = "*📋 SUBSCRIPTIONS*\n\n"
         for sub_id, uid, name, plan, stars, start_date, end_date, status in rows:
             start_short = start_date[:10] if start_date else "Unknown"
             end_short = end_date[:10] if end_date else "Unknown"
@@ -6343,7 +6554,7 @@ def admin_create_code(chat_id, message_id):
             [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]
         ]
     }
-    edit_message(chat_id, message_id, "**🎫 CREATE REDEEM CODE**\n\nSelect amount:", keyboard)
+    edit_message(chat_id, message_id, "*🎫 CREATE REDEEM CODE*\n\nSelect amount:", keyboard)
 
 def ask_code_max_uses(admin_id, amount, chat_id, message_id):
     set_user_step(admin_id, 'awaiting_code_uses', temp_code_amount=amount)
@@ -6359,7 +6570,7 @@ def ask_code_max_uses(admin_id, amount, chat_id, message_id):
             [{"text": "🔙 Back", "callback_data": "admin_create_code"}]
         ]
     }
-    text = f"**🎫 CREATE REDEEM CODE**\n\n💰 Amount: `{amount}🪙`\n\nHow many times can this code be used in total?"
+    text = f"*🎫 CREATE REDEEM CODE*\n\n💰 Amount: `{amount}🪙`\n\nHow many times can this code be used in total?"
     if message_id:
         edit_message(chat_id, message_id, text, keyboard)
     else:
@@ -6380,7 +6591,7 @@ def ask_code_expiry(admin_id, max_uses, chat_id, message_id):
         ]
     }
     uses_label = "Unlimited" if max_uses == 0 else str(max_uses)
-    text = f"**🎫 CREATE REDEEM CODE**\n\n🔢 Max uses: `{uses_label}`\n\nHow many days until this code expires?"
+    text = f"*🎫 CREATE REDEEM CODE*\n\n🔢 Max uses: `{uses_label}`\n\nHow many days until this code expires?"
     if message_id:
         edit_message(chat_id, message_id, text, keyboard)
     else:
@@ -6406,7 +6617,7 @@ def finalize_create_code(admin_id, expiry_days, chat_id, message_id):
     uses_label = "Unlimited" if max_uses == 0 else f"{max_uses} use(s)"
     expiry_label = "Never expires" if expiry_days >= 36500 else f"{expiry_days} day(s)"
 
-    text = (f"✅ **CODE CREATED!**\n\n"
+    text = (f"✅ *CODE CREATED!*\n\n"
             f"🎫 `{code}`\n"
             f"💰 {amount}🪙\n"
             f"📅 {expiry_label}\n"
@@ -6438,9 +6649,9 @@ def admin_add_coins_start(admin_id, chat_id, message_id):
     }
     
     edit_message(chat_id, message_id,
-        f"**🪙 ADD COINS**\n\n"
-        f"Enter the **User ID** using the number pad below:\n\n"
-        f"**User ID:** ` `\n\n"
+        f"*🪙 ADD COINS*\n\n"
+        f"Enter the *User ID* using the number pad below:\n\n"
+        f"*User ID:* ` `\n\n"
         f"Example: `123456789`",
         keyboard)
 
@@ -6468,9 +6679,9 @@ def update_target_id_display(admin_id, digit, chat_id, message_id):
     
     display_target = new_target if new_target else " "
     edit_message(chat_id, message_id,
-        f"**🪙 ADD COINS**\n\n"
-        f"Enter the **User ID** using the number pad below:\n\n"
-        f"**User ID:** `{display_target}`\n\n"
+        f"*🪙 ADD COINS*\n\n"
+        f"Enter the *User ID* using the number pad below:\n\n"
+        f"*User ID:* `{display_target}`\n\n"
         f"Click ✅ when done.",
         keyboard)
 
@@ -6480,7 +6691,7 @@ def confirm_target_user(admin_id, chat_id, message_id):
     
     if not target_user_id or not target_user_id.strip():
         edit_message(chat_id, message_id,
-            f"❌ **No User ID entered!**\n\nPlease enter a user ID using the number pad.",
+            f"❌ *No User ID entered!*\n\nPlease enter a user ID using the number pad.",
             {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]]})
         return
     
@@ -6488,7 +6699,7 @@ def confirm_target_user(admin_id, chat_id, message_id):
         target_user_id = int(target_user_id)
     except ValueError:
         edit_message(chat_id, message_id,
-            f"❌ **Invalid User ID!**\n\nPlease enter a valid numeric user ID.",
+            f"❌ *Invalid User ID!*\n\nPlease enter a valid numeric user ID.",
             {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]]})
         return
     
@@ -6500,7 +6711,7 @@ def confirm_target_user(admin_id, chat_id, message_id):
     
     if not user:
         edit_message(chat_id, message_id,
-            f"❌ **User not found!**\n\nUser ID `{target_user_id}` does not exist.\n\nPlease check and try again.",
+            f"❌ *User not found!*\n\nUser ID `{target_user_id}` does not exist.\n\nPlease check and try again.",
             {"inline_keyboard": [[{"text": "🔙 Try Again", "callback_data": "admin_add_coins"}]]})
         return
     
@@ -6522,11 +6733,11 @@ def confirm_target_user(admin_id, chat_id, message_id):
     }
     
     edit_message(chat_id, message_id,
-        f"**🪙 ADD COINS**\n\n"
+        f"*🪙 ADD COINS*\n\n"
         f"Target user: `{target_user_id}` ({first_name})\n"
         f"Current balance: `{get_user_balances(target_user_id)['coins']}🪙`\n\n"
         f"Enter the amount of coins to add using the number pad below:\n\n"
-        f"**Amount: `0` 🪙**",
+        f"*Amount: `0` 🪙*",
         keyboard)
 
 def update_coin_amount_display(admin_id, digit, chat_id, message_id):
@@ -6554,7 +6765,7 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
         target_line = f"Target user: `{target_user_id}` ({first_name})\n"
         balance_line = f"Current balance: `{get_user_balances(targets[0])['coins']}🪙`\n\n"
     else:
-        target_line = f"Target: **{len(targets)} users**\n"
+        target_line = f"Target: *{len(targets)} users*\n"
         balance_line = ""
 
     keyboard = {
@@ -6571,11 +6782,11 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
     }
     
     edit_message(chat_id, message_id,
-        f"**🪙 ADD COINS**\n\n"
+        f"*🪙 ADD COINS*\n\n"
         f"{target_line}"
         f"{balance_line}"
         f"Enter the amount of coins to add using the number pad below:\n\n"
-        f"**Amount: `{new_amount}` 🪙**",
+        f"*Amount: `{new_amount}` 🪙*",
         keyboard)
 
 def _parse_coin_targets(target_str):
@@ -6641,10 +6852,10 @@ def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
         target_line = f"Target user: `{target_user_id}` ({first_name})\n"
     else:
         balance_line = ""
-        target_line = f"Target: **{first_name}**\n"
+        target_line = f"Target: *{first_name}*\n"
 
     edit_message(chat_id, message_id,
-        f"**🪙 ADD COINS**\n\n"
+        f"*🪙 ADD COINS*\n\n"
         f"{target_line}"
         f"{balance_line}"
         f"Amount preset: `{preset_amount}` 🪙\n\n"
@@ -6683,7 +6894,7 @@ def confirm_add_coins(admin_id, chat_id, message_id):
         # stop the rest of the batch from being credited.
         try:
             send_message(uid,
-                f"🎉 **You received {amount} Coins!** 🎉\n\n"
+                f"🎉 *You received {amount} Coins!* 🎉\n\n"
                 f"Your new balance: `{new_balance}🪙`\n\n"
                 f"Use your coins to purchase premium subscription!",
                 {"inline_keyboard": [[{"text": "⭐ Get Premium", "callback_data": "subscribe_premium"}]]})
@@ -6696,7 +6907,7 @@ def confirm_add_coins(admin_id, chat_id, message_id):
         if succeeded:
             uid, new_balance = succeeded[0]
             edit_message(chat_id, message_id,
-                f"✅ **COINS ADDED SUCCESSFULLY!**\n\n"
+                f"✅ *COINS ADDED SUCCESSFULLY!*\n\n"
                 f"User: `{uid}`\n"
                 f"Added: `+{amount}🪙`\n"
                 f"New balance: `{new_balance}🪙`",
@@ -6707,7 +6918,7 @@ def confirm_add_coins(admin_id, chat_id, message_id):
                 f"❌ Failed to add coins to `{targets[0]}`: {failed[0][1]}",
                 {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
     else:
-        summary = f"✅ **COINS ADDED TO {len(succeeded)}/{len(targets)} USERS!**\n\n" \
+        summary = f"✅ *COINS ADDED TO {len(succeeded)}/{len(targets)} USERS!*\n\n" \
                   f"Amount each: `+{amount}🪙`\n\n"
         summary += "\n".join(f"• `{uid}` → `{bal}🪙`" for uid, bal in succeeded[:20])
         if len(succeeded) > 20:
@@ -6761,7 +6972,7 @@ def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
                   temp_source='github')
 
     msg = (
-        f"**🐙 REPO CONFIRMED**\n\n"
+        f"*🐙 REPO CONFIRMED*\n\n"
         f"Repo:   `{owner}/{repo}`\n"
         f"Branch: `{branch}`\n"
         + (f"Lang:   `{lang}` | ⭐ {stars}\n" if lang else "")
@@ -6844,7 +7055,7 @@ def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons):
         [{"text": "❌ Cancel",              "callback_data": "admin_panel"}],
     ]}
 
-    send_message(chat_id, "**👁 PREVIEW — exactly what users will see:**", None)
+    send_message(chat_id, "*👁 PREVIEW — exactly what users will see:*", None)
     try:
         if btype == 'photo' and file_id:
             _tg_send_media(chat_id, 'photo', file_id, caption or '', confirm_kb)
@@ -6855,7 +7066,7 @@ def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons):
             send_message(chat_id, msg_text, confirm_kb)
     except Exception as e:
         send_message(chat_id,
-            f"⚠️ Preview error: `{e}`\n\n**Caption:**\n{caption or '(empty)'}",
+            f"⚠️ Preview error: `{e}`\n\n*Caption:*\n{caption or '(empty)'}",
             confirm_kb)
 
 
@@ -6991,7 +7202,7 @@ def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_r
         success, fail, skipped = do_broadcast(admin_id, btype, file_id, caption, btns_raw)
         total = success + fail
         send_message(chat_id,
-            f"✅ **Broadcast Complete**\n\n"
+            f"✅ *Broadcast Complete*\n\n"
             f"✅ Delivered: `{success}`\n"
             f"❌ Failed:    `{fail}`\n"
             f"⏭ Skipped:   `{skipped}` (blocked/admin)\n"
@@ -7001,7 +7212,7 @@ def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_r
         print(f"❌ _run_broadcast_and_notify error: {e}")
         try:
             send_message(chat_id,
-                f"❌ **Broadcast failed with error:**\n`{e}`",
+                f"❌ *Broadcast failed with error:*\n`{e}`",
                 {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
         except Exception:
             pass
@@ -7026,8 +7237,8 @@ def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
     else:
         # Non-premium paid plan — show payment options
         edit_message(chat_id, message_id,
-            f"**💰 Choose Payment Method**\n\n"
-            f"Plan: **{plan.upper()}**\n"
+            f"*💰 Choose Payment Method*\n\n"
+            f"Plan: *{plan.upper()}*\n"
             f"Duration: {duration} days\n"
             f"Env vars: {len(env_vars)}\n\n"
             f"Cost: `{cost_stars}⭐` or `{cost_coins}🪙`",
@@ -7050,7 +7261,7 @@ def handle_callback(callback):
     if data == "main_menu":
         if is_user_verified(user_id):
             balances = get_user_balances(user_id)
-            welcome = f"**🤖 BOT HOSTING**\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
+            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
             edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
         else:
             user_info = get_user_info(user_id)
@@ -7088,6 +7299,13 @@ def handle_callback(callback):
             edit_message(chat_id, message_id, "🔒 Unauthorized!")
         return
 
+    if data == "admin_resources":
+        if is_admin(user_id):
+            admin_resources_view(chat_id, message_id, user_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+
     if data == "admin_db_backup_now":
         if is_admin(user_id):
             admin_db_backup_now(chat_id, message_id, user_id)
@@ -7119,7 +7337,7 @@ def handle_callback(callback):
             set_user_step(user_id, 'awaiting_code_uses_custom',
                           temp_code_amount=get_user_step(user_id).get('temp_code_amount'))
             edit_message(chat_id, message_id,
-                "**🎫 CREATE REDEEM CODE**\n\nSend the max number of uses as a number "
+                "*🎫 CREATE REDEEM CODE*\n\nSend the max number of uses as a number "
                 "(send `0` for unlimited):")
         return
 
@@ -7136,7 +7354,7 @@ def handle_callback(callback):
                           temp_code_amount=us.get('temp_code_amount'),
                           temp_code_max_uses=us.get('temp_code_max_uses'))
             edit_message(chat_id, message_id,
-                "**🎫 CREATE REDEEM CODE**\n\nSend the number of days until expiry "
+                "*🎫 CREATE REDEEM CODE*\n\nSend the number of days until expiry "
                 "(send `0` for never expires):")
         return
 
@@ -7224,7 +7442,7 @@ def handle_callback(callback):
         if not is_user_verified(user_id):
             send_verification_required(chat_id, user_id, "User", message_id)
             return
-        edit_message(chat_id, message_id, "**💰 DEPLOYMENT OPTIONS**\n\nChoose your plan:", get_deploy_menu(user_id))
+        edit_message(chat_id, message_id, "*💰 DEPLOYMENT OPTIONS*\n\nChoose your plan:", get_deploy_menu(user_id))
         return
     
     if data == "plan_monthly":
@@ -7296,7 +7514,7 @@ def handle_callback(callback):
                 result = json.loads(response.read().decode('utf-8'))
                 if result.get('ok'):
                     edit_message(chat_id, message_id,
-                        f"**⭐ STARS PAYMENT REQUIRED**\n\n"
+                        f"*⭐ STARS PAYMENT REQUIRED*\n\n"
                         f"Plan: {plan.capitalize()}\n"
                         f"Cost: {user_step.get('cost_stars')}⭐\n\n"
                         f"Please complete the payment.",
@@ -7319,7 +7537,7 @@ def handle_callback(callback):
         
         if balances['coins'] < cost_coins:
             edit_message(chat_id, message_id,
-                f"❌ **INSUFFICIENT COINS**\n\n"
+                f"❌ *INSUFFICIENT COINS*\n\n"
                 f"Required: `{cost_coins}🪙`\n"
                 f"Your balance: `{balances['coins']}🪙`\n\n"
                 f"Use a redeem code to get more coins!",
@@ -7343,7 +7561,7 @@ def handle_callback(callback):
                      payment_method=user_step.get('payment_method'),
                      env_vars=user_step.get('env_vars', {}))
         edit_message(chat_id, message_id,
-            f"**📦 SEND requirements.txt FILE**\n\n"
+            f"*📦 SEND requirements.txt FILE*\n\n"
             f"Please send your `requirements.txt` file now.\n\n"
             f"Example content:\n"
             f"```\npython-telegram-bot==20.7\nrequests==2.31.0\n```\n\n"
@@ -7364,9 +7582,9 @@ def handle_callback(callback):
                 plabel = get_platform_label(fws)
                 phint  = get_platform_env_hint(fws)
                 if fws and fws != ['generic']:
-                    platform_hint = f"\n\n🔍 **Detected: {plabel}**"
+                    platform_hint = f"\n\n🔍 *Detected: {plabel}*"
                 if phint:
-                    platform_hint += f"\n\n**Required env vars:**\n{phint}"
+                    platform_hint += f"\n\n*Required env vars:*\n{phint}"
         except Exception:
             pass
         set_user_step(user_id, 'awaiting_env',
@@ -7380,7 +7598,7 @@ def handle_callback(callback):
                      payment_method=user_step.get('payment_method'),
                      env_vars=user_step.get('env_vars') or {})
         edit_message(chat_id, message_id,
-            f"**🔧 ENVIRONMENT VARIABLES**{platform_hint}\n\n"
+            f"*🔧 ENVIRONMENT VARIABLES*{platform_hint}\n\n"
             "Send variables one per line:\n"
             "```\nBOT_TOKEN=your_token\nAPI_KEY=abc123\n```\n\n"
             "Or deploy without any:",
@@ -7392,9 +7610,9 @@ def handle_callback(callback):
         user_step = get_user_step(user_id)
         env_vars = user_step.get('env_vars', {})
         if not env_vars:
-            text = "📝 **No environment variables set**\n\nSend as KEY=VALUE (one per line)\n\nExample:\n```\nBOT_TOKEN=123456:ABC\nAPI_KEY=your_key\nDATABASE_URL=postgresql://...\n```"
+            text = "📝 *No environment variables set*\n\nSend as KEY=VALUE (one per line)\n\nExample:\n```\nBOT_TOKEN=123456:ABC\nAPI_KEY=your_key\nDATABASE_URL=postgresql://...\n```"
         else:
-            text = "📝 **Current Variables:**\n\n"
+            text = "📝 *Current Variables:*\n\n"
             for k, v in list(env_vars.items())[:15]:
                 if any(s in k.upper() for s in ['TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'HASH']):
                     display_v = v[:10] + "..." if len(v) > 15 else v
@@ -7417,11 +7635,11 @@ def handle_callback(callback):
                      cost_coins=user_step.get('cost_coins'), cost_stars=user_step.get('cost_stars'),
                      payment_method=user_step.get('payment_method'))
         edit_message(chat_id, message_id,
-            f"**📤 SEND ENVIRONMENT VARIABLES**\n\n"
+            f"*📤 SEND ENVIRONMENT VARIABLES*\n\n"
             f"Send your environment variables as text:\n"
             f"```\nBOT_TOKEN=your_actual_token\nAPI_KEY=your_api_key\nDATABASE_URL=postgresql://user:pass@localhost/db\n```\n\n"
             f"One variable per line. Use KEY=VALUE format.\n\n"
-            f"**All variables will be available via `os.environ.get('KEY')`**\n\n"
+            f"*All variables will be available via `os.environ.get('KEY')`*\n\n"
             f"Click Skip if you have none:",
             {"inline_keyboard": [[{"text": "⏭️ Skip", "callback_data": "env_skip"}],
                                   [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]]})
@@ -7482,6 +7700,12 @@ def handle_callback(callback):
         restart_deployment(dep_id, user_id, chat_id)
         view_deployment(chat_id, message_id, user_id, dep_id)
         return
+
+    if data.startswith("restart_free_"):
+        dep_id = int(data.split("_")[2])
+        restart_deployment(dep_id, user_id, chat_id, force_free_downgrade=True)
+        view_deployment(chat_id, message_id, user_id, dep_id)
+        return
     
     if data.startswith("delete_deploy_"):
         dep_id = int(data.split("_")[2])
@@ -7492,7 +7716,7 @@ def handle_callback(callback):
             ]
         }
         edit_message(chat_id, message_id,
-            f"**⚠️ DELETE DEPLOYMENT**\n\n"
+            f"*⚠️ DELETE DEPLOYMENT*\n\n"
             f"Delete deployment `{dep_id}`?\n\n"
             f"This will:\n"
             f"• Stop the bot\n"
@@ -7517,7 +7741,7 @@ def handle_callback(callback):
                 return
             balances = get_user_balances(user_id)
             edit_message(chat_id, message_id,
-                f"✅ **VERIFIED!**\n\n"
+                f"✅ *VERIFIED!*\n\n"
                 f"🪙 {balances['coins']} | ⭐ {balances['stars']}\n\n"
                 f"Welcome!",
                 get_main_menu(user_id))
@@ -7533,12 +7757,12 @@ def handle_callback(callback):
                 return
             balances = get_user_balances(user_id)
             edit_message(chat_id, message_id,
-                f"✅ **VERIFIED!**\n\n"
+                f"✅ *VERIFIED!*\n\n"
                 f"Thank you for joining {REQUIRED_CHANNEL}!",
                 get_main_menu(user_id))
         else:
             edit_message(chat_id, message_id,
-                f"❌ **NOT VERIFIED**\n\n"
+                f"❌ *NOT VERIFIED*\n\n"
                 f"Please join {REQUIRED_CHANNEL} first.",
                 {"inline_keyboard": [
                     [{"text": "📢 JOIN", "url": CHANNEL_LINK},
@@ -7551,7 +7775,7 @@ def handle_callback(callback):
         mark_tos_accepted(user_id)
         balances = get_user_balances(user_id)
         edit_message(chat_id, message_id,
-            f"✅ **Thanks for confirming!**\n\n"
+            f"✅ *Thanks for confirming!*\n\n"
             f"🪙 {balances['coins']} | ⭐ {balances['stars']}\n\n"
             f"Welcome!",
             get_main_menu(user_id))
@@ -7569,14 +7793,14 @@ def handle_callback(callback):
             return
         set_user_step(user_id, 'awaiting_github_url')
         edit_message(chat_id, message_id,
-            "**🐙 DEPLOY FROM GITHUB**\n\n"
+            "*🐙 DEPLOY FROM GITHUB*\n\n"
             "Send me the GitHub repository URL or shorthand:\n\n"
-            "**Examples:**\n"
+            "*Examples:*\n"
             "`https://github.com/owner/repo`\n"
             "`github.com/owner/repo`\n"
             "`owner/repo`\n"
             "`owner/repo@branch` ← specific branch\n\n"
-            "Supports **public and private** repos.\n"
+            "Supports *public and private* repos.\n"
             "For private repos you'll be asked for a token next.",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
         return
@@ -7599,8 +7823,8 @@ def handle_callback(callback):
                       temp_github_repo=step.get('temp_github_repo'),
                       temp_github_branch=step.get('temp_github_branch'))
         edit_message(chat_id, message_id,
-            "**🔑 PRIVATE REPO — GitHub Token**\n\n"
-            "Send your **GitHub Personal Access Token** (PAT).\n\n"
+            "*🔑 PRIVATE REPO — GitHub Token*\n\n"
+            "Send your *GitHub Personal Access Token* (PAT).\n\n"
             "The token needs the `repo` scope.\n"
             "Create one at: `github.com/settings/tokens`\n\n"
             "⚠️ Stored only in `.env` inside the deployment folder, never logged.",
@@ -7638,7 +7862,7 @@ def handle_callback(callback):
                      cost_stars=user_step.get('cost_stars'),
                      payment_method=user_step.get('payment_method'))
         edit_message(chat_id, message_id,
-            "**📝 TYPE YOUR VARIABLES**\n\n"
+            "*📝 TYPE YOUR VARIABLES*\n\n"
             "Send one or more `KEY=VALUE` pairs, one per line:\n\n"
             "```\nBOT_TOKEN=7712345:AAFabcXYZ\nAPI_KEY=sk-abc123\nDATABASE_URL=sqlite:///bot.db\n```\n\n"
             "Send them now 👇",
@@ -7656,7 +7880,7 @@ def handle_callback(callback):
     if data == "admin_broadcast":
         if not is_admin(user_id): return
         edit_message(chat_id, message_id,
-            "**📢 BROADCAST TO ALL USERS**\n\nChoose message type:",
+            "*📢 BROADCAST TO ALL USERS*\n\nChoose message type:",
             {"inline_keyboard": [
                 [{"text": "✉️ Text Message",   "callback_data": "broadcast_type_text"}],
                 [{"text": "🖼 Photo + Caption", "callback_data": "broadcast_type_photo"}],
@@ -7669,8 +7893,8 @@ def handle_callback(callback):
         if not is_admin(user_id): return
         set_user_step(user_id, 'awaiting_broadcast_text')
         edit_message(chat_id, message_id,
-            "**✉️ TEXT BROADCAST**\n\nType the message to send to all users.\n"
-            "Supports **bold**, _italic_, `code`:",
+            "*✉️ TEXT BROADCAST*\n\nType the message to send to all users.\n"
+            "Supports *bold*, _italic_, `code`:",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
         return
 
@@ -7678,7 +7902,7 @@ def handle_callback(callback):
         if not is_admin(user_id): return
         set_user_step(user_id, 'awaiting_broadcast_media', temp_broadcast_type='photo')
         edit_message(chat_id, message_id,
-            "**🖼 PHOTO BROADCAST**\n\nSend the photo now:",
+            "*🖼 PHOTO BROADCAST*\n\nSend the photo now:",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
         return
 
@@ -7686,7 +7910,7 @@ def handle_callback(callback):
         if not is_admin(user_id): return
         set_user_step(user_id, 'awaiting_broadcast_media', temp_broadcast_type='video')
         edit_message(chat_id, message_id,
-            "**🎬 VIDEO BROADCAST**\n\nSend the video now:",
+            "*🎬 VIDEO BROADCAST*\n\nSend the video now:",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
         return
 
@@ -7710,7 +7934,7 @@ def handle_callback(callback):
         set_user_step(user_id, 'awaiting_broadcast_caption',
                      temp_broadcast_type=step.get('temp_broadcast_type'),
                      temp_broadcast_file=step.get('temp_broadcast_file', ''))
-        send_message(chat_id, "**✏️ New Caption**\n\nSend the new caption text:",
+        send_message(chat_id, "*✏️ New Caption*\n\nSend the new caption text:",
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_panel"}]]})
         return
 
@@ -7722,7 +7946,7 @@ def handle_callback(callback):
         caption  = step.get('temp_broadcast_caption', '')
         btns_raw = step.get('temp_broadcast_buttons', '[]')
         set_user_step(user_id, None)
-        send_message(chat_id, "📤 **Sending to all users…**", None)
+        send_message(chat_id, "📤 *Sending to all users…*", None)
         threading.Thread(
             target=_run_broadcast_and_notify,
             args=(chat_id, user_id, btype, file_id, caption, btns_raw),
@@ -7736,7 +7960,7 @@ def handle_callback(callback):
             return
         set_user_step(user_id, 'awaiting_bug_report')
         edit_message(chat_id, message_id,
-            "**🐛 REPORT A BUG**\n\n"
+            "*🐛 REPORT A BUG*\n\n"
             "Please describe the issue you're experiencing in as much detail as possible:\n\n"
             "• What were you trying to do?\n"
             "• What happened instead?\n"
@@ -7767,11 +7991,11 @@ def handle_callback(callback):
             coins_paid = c.execute("SELECT COALESCE(SUM(reward_coins),0) FROM referrals WHERE reward_given=1").fetchone()[0]
             conn.close()
 
-            text = (f"**👥 REFERRAL STATS**\n\n"
+            text = (f"*👥 REFERRAL STATS*\n\n"
                     f"Total referrals: `{total}`\n"
                     f"Coins paid out:  `{coins_paid}🪙`\n"
                     f"Reward per ref:  `{REFERRAL_REWARD_COINS}🪙`\n\n"
-                    f"**Top Referrers:**\n")
+                    f"*Top Referrers:*\n")
             for i, (rid, uname, fname, cnt, earned) in enumerate(rows, 1):
                 who = f"@{uname}" if uname else (fname or f"#{rid}")
                 text += f"{i}. {who} — `{cnt}` refs → `{earned}🪙`\n"
@@ -7811,7 +8035,7 @@ def handle_callback(callback):
                 who = f"@{row[1]}" if row[1] else f"User {row[0]}"
                 preview = row[3][:100]
                 edit_message(chat_id, message_id,
-                    f"**✉️ REPLY TO REPORT #{report_id}**\n\n"
+                    f"*✉️ REPLY TO REPORT #{report_id}*\n\n"
                     f"From: {who}\n"
                     f"Message: _{preview}_\n\n"
                     f"Type your reply and send it:",
@@ -7919,7 +8143,7 @@ def get_user_step(user_id):
         pj = {}
 
     # Build result: pending_json as base, then overlay dedicated columns
-    result = {**_DEFAULTS, **pj}
+    result = {*_DEFAULTS, *pj}
 
     col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
                'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
@@ -7979,8 +8203,8 @@ def handle_message(message):
                           temp_github_repo=repo,
                           temp_github_branch=branch or '')
             send_message(chat_id,
-                f"**🐙 Repo detected:** `{owner}/{repo}`"
-                + (f"\n**Branch:** `{branch}`" if branch else ""),
+                f"*🐙 Repo detected:* `{owner}/{repo}`"
+                + (f"\n*Branch:* `{branch}`" if branch else ""),
                 {"inline_keyboard": [
                     [{"text": "🌐 Public repo",  "callback_data": "github_public"}],
                     [{"text": "🔒 Private repo", "callback_data": "github_private"}],
@@ -8009,7 +8233,7 @@ def handle_message(message):
                 report_id = submit_bug_report(user_id, uname, first_name, text.strip())
                 set_user_step(user_id, None)
                 send_message(chat_id,
-                    f"✅ **Bug Report #{report_id} Submitted!**\n\n"
+                    f"✅ *Bug Report #{report_id} Submitted!*\n\n"
                     f"Thank you for your report. An admin will review it and reply to you here.\n\n"
                     f"You'll receive a notification when there's a reply.",
                     {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
@@ -8026,7 +8250,7 @@ def handle_message(message):
                 set_user_step(user_id, None)
                 if ok:
                     send_message(chat_id,
-                        f"✅ **Reply sent to user `{result}` for report #{report_id}**",
+                        f"✅ *Reply sent to user `{result}` for report #{report_id}*",
                         {"inline_keyboard": [
                             [{"text": "📋 All Reports", "callback_data": "admin_bug_reports"}],
                             [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
@@ -8087,9 +8311,9 @@ def handle_message(message):
             if invalid_lines:
                 warn += f"\n⚠️ Not numeric, skipped: `{', '.join(invalid_lines[:10])}`"
 
-            target_desc = f"`{found[0]}`" if len(found) == 1 else f"**{len(found)} users**"
+            target_desc = f"`{found[0]}`" if len(found) == 1 else f"*{len(found)} users*"
             send_message(chat_id,
-                f"🪙 **Add coins to {target_desc}**{warn}\n\nEnter amount or pick preset:",
+                f"🪙 *Add coins to {target_desc}*{warn}\n\nEnter amount or pick preset:",
                 {"inline_keyboard": [
                     [{"text": "50",   "callback_data": "coin_preset_50"},
                      {"text": "100",  "callback_data": "coin_preset_100"},
@@ -8107,7 +8331,7 @@ def handle_message(message):
                 set_user_step(user_id, 'awaiting_coins_confirm',
                              temp_target_user=target, temp_coins_amount=amount)
                 send_message(chat_id,
-                    f"Confirm: add **{amount}🪙** to `{target}`?",
+                    f"Confirm: add *{amount}🪙* to `{target}`?",
                     {"inline_keyboard": [
                         [{"text": "✅ Confirm", "callback_data": "coin_confirm"},
                          {"text": "❌ Cancel",  "callback_data": "admin_panel"}]]})
@@ -8146,7 +8370,7 @@ def handle_message(message):
                          temp_broadcast_type=user_step.get('temp_broadcast_type'),
                          temp_broadcast_file=user_step.get('temp_broadcast_file'))
             send_message(chat_id,
-                "**🔘 Inline Buttons (Optional)**\n\n"
+                "*🔘 Inline Buttons (Optional)*\n\n"
                 "Send buttons in this format (one per line):\n"
                 "`Button Text | https://url.com`\n\n"
                 "Or skip for no buttons:",
@@ -8180,7 +8404,7 @@ def handle_message(message):
                          temp_broadcast_file='',
                          temp_broadcast_caption=text.strip())
             send_message(chat_id,
-                "**🔘 Inline Buttons (Optional)**\n\nFormat: `Label | https://url`\n\nOr skip:",
+                "*🔘 Inline Buttons (Optional)*\n\nFormat: `Label | https://url`\n\nOr skip:",
                 {"inline_keyboard": [
                     [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
                     [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
@@ -8224,7 +8448,7 @@ def handle_message(message):
                          payment_method=user_step.get('payment_method'))
             if added:
                 send_message(chat_id,
-                    f"✅ **{added}** variable(s) saved — total: `{len(env_vars)}`\n\nSend more, or:",
+                    f"✅ *{added}* variable(s) saved — total: `{len(env_vars)}`\n\nSend more, or:",
                     get_env_keyboard(len(env_vars)))
             else:
                 send_message(chat_id,
@@ -8236,7 +8460,7 @@ def handle_message(message):
         # ── Waiting for requirements file ─────────────────────────────
         if user_step.get('waiting_for_reqs') == 1 and text and not text.startswith('/'):
             send_message(chat_id,
-                "📦 Please **upload** your `requirements.txt` file, or click **Auto-detect**.",
+                "📦 Please *upload* your `requirements.txt` file, or click *Auto-detect*.",
                 get_reqs_keyboard())
             return
         
@@ -8266,13 +8490,13 @@ def handle_message(message):
                              temp_broadcast_caption=caption)
                 send_message(chat_id,
                     f"✅ Photo received! Caption: _{caption[:80]}_\n\n"
-                    "**🔘 Add inline buttons?** Format: `Label | https://url`\n\nOr skip:",
+                    "*🔘 Add inline buttons?* Format: `Label | https://url`\n\nOr skip:",
                     {"inline_keyboard": [
                         [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
                         [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
             else:
                 send_message(chat_id,
-                    "✅ Photo received!\n\n**Add a caption** (or skip):",
+                    "✅ Photo received!\n\n*Add a caption* (or skip):",
                     {"inline_keyboard": [
                         [{"text": "⏭️ No Caption", "callback_data": "broadcast_no_buttons"}],
                         [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
@@ -8291,7 +8515,7 @@ def handle_message(message):
                              temp_broadcast_caption=caption)
                 send_message(chat_id,
                     f"✅ Video received! Caption: _{caption[:80]}_\n\n"
-                    "**🔘 Add inline buttons?** Format: `Label | https://url`\n\nOr skip:",
+                    "*🔘 Add inline buttons?* Format: `Label | https://url`\n\nOr skip:",
                     {"inline_keyboard": [
                         [{"text": "⏭️ No Buttons", "callback_data": "broadcast_no_buttons"}],
                         [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
@@ -8300,7 +8524,7 @@ def handle_message(message):
                              temp_broadcast_type='video',
                              temp_broadcast_file=file_id)
                 send_message(chat_id,
-                    "✅ Video received!\n\n**Add a caption** (or skip):",
+                    "✅ Video received!\n\n*Add a caption* (or skip):",
                     {"inline_keyboard": [
                         [{"text": "⏭️ No Caption", "callback_data": "broadcast_no_buttons"}],
                         [{"text": "❌ Cancel",       "callback_data": "admin_panel"}]]})
@@ -8364,7 +8588,7 @@ def handle_message(message):
                         pkg_count = len([l for l in requirements_text.splitlines()
                                          if l.strip() and not l.startswith('#')])
                     send_message(chat_id,
-                        f"✅ **{'package.json' if is_json_manifest else 'Requirements'} received!** "
+                        f"✅ *{'package.json' if is_json_manifest else 'Requirements'} received!* "
                         f"({pkg_count} package(s))\n\n"
                         f"```\n{requirements_text[:400]}\n```\n\n"
                         "Now set environment variables, or deploy directly:",
@@ -8390,7 +8614,7 @@ def handle_message(message):
                     "For Node.js projects with multiple files, zip them and send the `.zip`.")
                 return
 
-            scan_msg = send_message(chat_id, "🔒 **Running 6-layer security scan…**", None)
+            scan_msg = send_message(chat_id, "🔒 *Running 6-layer security scan…*", None)
             scan_msg_id = (scan_msg or {}).get('result', {}).get('message_id')
 
             file_id   = doc['file_id']
@@ -8414,9 +8638,9 @@ def handle_message(message):
 
             if blocked:
                 report_text = (
-                    f"🚫 **FILE REJECTED**\n\n"
+                    f"🚫 *FILE REJECTED*\n\n"
                     f"{report}\n\n"
-                    "Your file was **not accepted** due to critical security issues.\n"
+                    "Your file was *not accepted* due to critical security issues.\n"
                     "Remove the flagged patterns and try again."
                 )
                 if scan_msg_id:
@@ -8429,7 +8653,7 @@ def handle_message(message):
                 for admin_id in ADMIN_IDS:
                     try:
                         send_message(admin_id,
-                            f"🚨 **Security block**\n"
+                            f"🚨 *Security block*\n"
                             f"User: `{user_id}`\n"
                             f"File: `{file_name}`\n"
                             f"Issues: {len(critical)}\n\n"
@@ -8469,16 +8693,16 @@ def handle_message(message):
             }.get(ext, '📄 Script')
 
             summary = (
-                f"**✅ File accepted** — {lang_label}\n\n"
+                f"*✅ File accepted* — {lang_label}\n\n"
                 f"📁 `{file_name}` ({format_file_size(file_size)})\n"
                 f"🔒 {scan_note}\n\n"
             )
             if scan_warnings:
-                summary += f"**Warnings:**\n" + '\n'.join(f'• {w}' for w in scan_warnings[:4]) + "\n\n"
+                summary += f"*Warnings:*\n" + '\n'.join(f'• {w}' for w in scan_warnings[:4]) + "\n\n"
             summary += (
                 f"📋 Plan: `{(user_step.get('plan') or 'free').upper()}`\n"
                 f"⏱️ Duration: `{user_step.get('duration', 'N/A')}` days\n\n"
-                "**📦 Add requirements?**\nUpload `requirements.txt` or `package.json`, or click Auto-detect:"
+                "*📦 Add requirements?*\nUpload `requirements.txt` or `package.json`, or click Auto-detect:"
             )
 
             if scan_msg_id:
@@ -8513,10 +8737,10 @@ def handle_successful_payment(message):
             
             if plan == "monthly":
                 activate_premium(user_id, "monthly", total_amount, total_amount * STARS_PER_COIN, 30)
-                send_message(chat_id, f"✅ **PREMIUM ACTIVATED!**\n\nMonthly plan active for 30 days!\nThank you! 🙏")
+                send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\nMonthly plan active for 30 days!\nThank you! 🙏")
             elif plan == "yearly":
                 activate_premium(user_id, "yearly", total_amount, total_amount * STARS_PER_COIN, 365)
-                send_message(chat_id, f"✅ **PREMIUM ACTIVATED!**\n\nYearly plan active for 365 days!\nThank you! 🙏")
+                send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\nYearly plan active for 365 days!\nThank you! 🙏")
             return
         
         conn = sqlite3.connect(DATABASE_FILE)
@@ -8614,7 +8838,7 @@ def deployment_expiry_monitor():
                     if is_free:
                         # Free bot expired: offer restart for another 24h
                         send_message(uid,
-                            f"⏰ **Free Bot #{dep_id} Expired**\n\n"
+                            f"⏰ *Free Bot #{dep_id} Expired*\n\n"
                             f"Your 24-hour deployment has ended.\n"
                             f"Restart for another 24h — your database is intact.",
                             {"inline_keyboard": [
@@ -8625,9 +8849,9 @@ def deployment_expiry_monitor():
                     else:
                         # Premium bot expired: reactivate or continue free
                         send_message(uid,
-                            f"⏰ **Premium Bot #{dep_id} Expired**\n\n"
+                            f"⏰ *Premium Bot #{dep_id} Expired*\n\n"
                             f"Your `{plan.upper()}` plan has ended.\n\n"
-                            f"**Options:**\n"
+                            f"*Options:*\n"
                             f"• ⭐ Reactivate Premium — bot resumes immediately with full history\n"
                             f"• 🆓 Continue as Free — bot runs 24h more, database preserved",
                             {"inline_keyboard": [
@@ -8718,7 +8942,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         conn.close()
         try:
             send_message(owner_id,
-                f"⚠️ **Bot #{deployment_id} could not be restarted**\n\n"
+                f"⚠️ *Bot #{deployment_id} could not be restarted*\n\n"
                 f"Its files are missing on disk (most likely lost during a host "
                 f"restart/redeploy). Please redeploy this bot — your account "
                 f"data and coin balance are unaffected.",
@@ -8787,7 +9011,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         print(f"🔄 Auto-restarted deployment {deployment_id} ({reason})")
         try:
             send_message(owner_id,
-                f"🔄 **Bot #{deployment_id} auto-restarted**\n\n"
+                f"🔄 *Bot #{deployment_id} auto-restarted*\n\n"
                 f"It stopped unexpectedly and has been brought back online automatically.\n"
                 f"Your database and settings are untouched.",
                 {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]})
@@ -8853,7 +9077,7 @@ def process_health_monitor():
                 # the owner isn't left in the dark.
                 try:
                     send_message(uid,
-                        f"⚠️ **Bot #{dep_id} Crashed**\n\n"
+                        f"⚠️ *Bot #{dep_id} Crashed*\n\n"
                         f"Automatic restart didn't succeed. Your database is safe — "
                         f"click Restart to try again manually.",
                         {"inline_keyboard": [
@@ -8982,37 +9206,47 @@ def main():
             if data and data.get('ok'):
                 for update in data['result']:
                     LAST_UPDATE_ID = update['update_id']
-                    # Each update is isolated: if handling one throws, we log
-                    # it and move on instead of silently dropping that
-                    # user's message with no reply and no trace, and instead
-                    # of losing the rest of the batch.
-                    try:
-                        if 'callback_query' in update:
-                            handle_callback(update['callback_query'])
-                        elif 'pre_checkout_query' in update:
-                            handle_pre_checkout_query(update['pre_checkout_query'])
-                        elif 'message' in update:
-                            msg = update['message']
-                            if 'successful_payment' in msg:
-                                handle_successful_payment(msg)
-                            else:
-                                handle_message(msg)
-                    except Exception as ue:
-                        print(f"❌ Error handling update {update['update_id']}: {ue}")
-                        traceback.print_exc()
-                        # Best-effort: let the user know something broke instead
-                        # of leaving them with total silence.
+
+                    def _handle_one(update=update):
+                        # Each update is isolated: if handling one throws, we log
+                        # it and move on instead of silently dropping that
+                        # user's message with no reply and no trace.
                         try:
-                            fail_chat_id = None
-                            if 'message' in update:
-                                fail_chat_id = update['message']['chat']['id']
-                            elif 'callback_query' in update:
-                                fail_chat_id = update['callback_query']['message']['chat']['id']
-                            if fail_chat_id:
-                                send_message(fail_chat_id,
-                                    "⚠️ Something went wrong processing that. Please try again.")
-                        except Exception:
-                            pass
+                            if 'callback_query' in update:
+                                handle_callback(update['callback_query'])
+                            elif 'pre_checkout_query' in update:
+                                handle_pre_checkout_query(update['pre_checkout_query'])
+                            elif 'message' in update:
+                                msg = update['message']
+                                if 'successful_payment' in msg:
+                                    handle_successful_payment(msg)
+                                else:
+                                    handle_message(msg)
+                        except Exception as ue:
+                            print(f"❌ Error handling update {update['update_id']}: {ue}")
+                            traceback.print_exc()
+                            # Best-effort: let the user know something broke instead
+                            # of leaving them with total silence.
+                            try:
+                                fail_chat_id = None
+                                if 'message' in update:
+                                    fail_chat_id = update['message']['chat']['id']
+                                elif 'callback_query' in update:
+                                    fail_chat_id = update['callback_query']['message']['chat']['id']
+                                if fail_chat_id:
+                                    send_message(fail_chat_id,
+                                        "⚠️ Something went wrong processing that. Please try again.")
+                            except Exception:
+                                pass
+
+                    # Run in a background thread — a slow operation for one
+                    # user (deployment installs, GitHub downloads, broadcasts)
+                    # must never block the main loop from polling and
+                    # dispatching updates for every OTHER user in the
+                    # meantime. Each DB call already opens its own fresh
+                    # sqlite3 connection, so this is safe across threads.
+                    threading.Thread(target=_handle_one, daemon=True,
+                                     name=f"Update-{update['update_id']}").start()
             sleep(0.5)
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped")
