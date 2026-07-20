@@ -8143,7 +8143,7 @@ def get_user_step(user_id):
         pj = {}
 
     # Build result: pending_json as base, then overlay dedicated columns
-    result = {*_DEFAULTS, *pj}
+    result = {**_DEFAULTS, **pj}
 
     col_map = ['step','temp_file','requirements','env_vars','plan','payment_method',
                'duration','cost_coins','cost_stars','waiting_for_env','waiting_for_reqs',
