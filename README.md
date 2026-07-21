@@ -1,11 +1,12 @@
 # Telegram Bot Hosting Platform
 
-A self-hosted platform that lets users deploy their own Telegram bots through a Telegram bot interface.
+A self-hosted platform that lets users deploy their own bots through a Telegram bot interface.
 
 ## Features
-- Deploy Python Telegram bots
+- Deploy Python & node js bots
 - Premium subscriptions with Stars/Coins
-- Free tier (2 deployments, 24h each)
+- Free tier (3 deployments, 24h each)
+- GitHub deployment 
 - Environment variable support
 - Persistent storage
 
