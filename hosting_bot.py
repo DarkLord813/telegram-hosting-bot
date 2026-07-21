@@ -880,7 +880,7 @@ def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, lis
         # Scanner itself crashed — log and let deployment proceed with a warning
         return False, [], [f"Scanner error: {e}"], f"⚠️ Security scan encountered an error: {e}"
 
-    lines = [f"🔒 *Security Scan — `{filename}`*\n"]
+    lines = [f"🔒 Security Scan — `{display_filename(filename)}`\n"]
     if critical:
         lines.append(f"🔴 *{len(critical)} CRITICAL issue(s) — BLOCKED:*")
         for i in critical[:10]:
@@ -1921,6 +1921,39 @@ def http_get(url, params=None):
     except Exception as e:
         print(f"HTTP error: {e}")
         return None
+
+_FILENAME_PREFIX_RE = re.compile(r'^\d{8}_\d{6}_temp_\d+_')
+
+def display_filename(system_filename: str) -> str:
+    """
+    Deployment files on disk are named like
+    "20260720_211725_temp_7713987088_index.js" (timestamp + temp + user id
+    prefix). That's fine for storage, but showing it raw to the user is both
+    ugly AND risky: legacy Telegram Markdown's handling of underscores inside
+    backtick-wrapped text is notoriously unreliable (well-documented — even
+    content inside backticks isn't always treated as truly literal the way
+    it should be), and this prefix always contains multiple underscores.
+    Strip it for display; fall back to the full name if it doesn't match
+    (e.g. GitHub deployments, which aren't named this way).
+    """
+    if not system_filename:
+        return system_filename
+    return _FILENAME_PREFIX_RE.sub('', system_filename)
+
+
+def escape_md_v1(text: str) -> str:
+    """
+    Escape legacy-Markdown special characters in text that will appear
+    OUTSIDE of backticks/code spans — per Telegram's own documented rule,
+    prefix _, *, `, [ with a backslash. Do NOT use this on text that's
+    already inside a backtick span (code spans have different, stricter
+    rules — escaping inside them shows a literal backslash instead of
+    hiding it).
+    """
+    if not text:
+        return text
+    return re.sub(r'([_*`\[])', r'\\\1', str(text))
+
 
 def format_file_size(size_bytes):
     if size_bytes == 0:
@@ -5162,7 +5195,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
 
             success_text = (
                 f"*🎉 DEPLOYMENT SUCCESSFUL!* 🎉\n\n"
-                f"📁 *File:* `{dest_script.name}`\n"
+                f"📁 *File:* `{display_filename(dest_script.name)}`\n"
                 f"🤖 *Platform:* {get_platform_label(frameworks)}\n"
                 f"📋 *Plan:* {plan.upper()}\n"
                 f"{duration_line}\n"
@@ -5330,11 +5363,11 @@ def delete_deployment(deployment_id, user_id, chat_id):
             used_count = get_free_deployment_used_count(user_id)
             remaining = FREE_USER_MAX_DEPLOYMENTS - used_count
             send_message(chat_id, 
-                f"✅ *Deployment `{deployment_id}` deleted!*\n\n"
-                f"📁 File: `{file_name}`\n"
+                f"✅ Deployment `{deployment_id}` deleted!\n\n"
+                f"📁 File: `{display_filename(file_name)}`\n"
                 f"🆓 Free slots left: `{remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
         else:
-            send_message(chat_id, f"✅ *Deployment `{deployment_id}` deleted!*\n\n📁 File: `{file_name}`")
+            send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!\n\n📁 File: `{display_filename(file_name)}`")
         
         with deployment_lock:
             if deployment_id in active_deployments:
@@ -5591,7 +5624,7 @@ def view_install_logs(chat_id, message_id, user_id, dep_id):
     }
     
     edit_message(chat_id, message_id,
-        f"```\n📋 INSTALLATION LOGS\n📁 {file_name}\n\n{log_text[-3000:]}\n```",
+        f"```\n📋 INSTALLATION LOGS\n📁 {display_filename(file_name)}\n\n{log_text[-3000:]}\n```",
         keyboard)
 
 def view_runtime_logs(chat_id, message_id, user_id, dep_id):
@@ -5640,7 +5673,7 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
     }
     
     edit_message(chat_id, message_id,
-        f"```\n📄 RUNTIME LOGS\n📁 {file_name} (Status: {status.upper()})\n\n{log_text[-3000:]}\n```",
+        f"```\n📄 RUNTIME LOGS\n📁 {display_filename(file_name)} (Status: {status.upper()})\n\n{log_text[-3000:]}\n```",
         keyboard)
 
 def view_deployment(chat_id, message_id, user_id, dep_id):
@@ -5747,7 +5780,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     
     text = (
         f"*📄 DEPLOYMENT #{dep_id}*\n\n"
-        f"📁 File: `{fname}` ({size_str})\n"
+        f"📁 File: `{display_filename(fname)}` ({size_str})\n"
         f"🔧 Framework: `{framework}`\n"
         f"📋 Plan: `{plan.upper()}`\n"
         f"💰 Cost: {cost_text}\n"
@@ -6069,7 +6102,8 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
             fw_icon = "🐍"
         
         size_str = format_file_size(fsize) if fsize else "Unknown"
-        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon}{fw_icon} ID:{dep_id} - {fname[:20]} ({size_str}) [{remaining_text}]", 
+        clean_fname = display_filename(fname)
+        keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon}{fw_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str}) [{remaining_text}]", 
                          "callback_data": f"view_deploy_{dep_id}"}])
     
     keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
@@ -6737,7 +6771,7 @@ def confirm_target_user(admin_id, chat_id, message_id):
         f"Target user: `{target_user_id}` ({first_name})\n"
         f"Current balance: `{get_user_balances(target_user_id)['coins']}🪙`\n\n"
         f"Enter the amount of coins to add using the number pad below:\n\n"
-        f"*Amount: `0` 🪙*",
+        f"Amount: `0` 🪙",
         keyboard)
 
 def update_coin_amount_display(admin_id, digit, chat_id, message_id):
@@ -6786,7 +6820,7 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
         f"{target_line}"
         f"{balance_line}"
         f"Enter the amount of coins to add using the number pad below:\n\n"
-        f"*Amount: `{new_amount}` 🪙*",
+        f"Amount: `{new_amount}` 🪙",
         keyboard)
 
 def _parse_coin_targets(target_str):
@@ -7639,7 +7673,7 @@ def handle_callback(callback):
             f"Send your environment variables as text:\n"
             f"```\nBOT_TOKEN=your_actual_token\nAPI_KEY=your_api_key\nDATABASE_URL=postgresql://user:pass@localhost/db\n```\n\n"
             f"One variable per line. Use KEY=VALUE format.\n\n"
-            f"*All variables will be available via `os.environ.get('KEY')`*\n\n"
+            f"All variables will be available via `os.environ.get('KEY')`\n\n"
             f"Click Skip if you have none:",
             {"inline_keyboard": [[{"text": "⏭️ Skip", "callback_data": "env_skip"}],
                                   [{"text": "❌ Cancel", "callback_data": "cancel_deploy"}]]})
@@ -8250,7 +8284,7 @@ def handle_message(message):
                 set_user_step(user_id, None)
                 if ok:
                     send_message(chat_id,
-                        f"✅ *Reply sent to user `{result}` for report #{report_id}*",
+                        f"✅ Reply sent to user `{result}` for report #{report_id}",
                         {"inline_keyboard": [
                             [{"text": "📋 All Reports", "callback_data": "admin_bug_reports"}],
                             [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
