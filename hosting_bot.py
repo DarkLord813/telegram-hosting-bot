@@ -417,6 +417,50 @@ def init_db():
     print("✅ Database initialized with enhanced schema")
 
 # ========== DEPLOY FOLDER HELPER ==========
+def kill_deployment_process(pid, sig=None):
+    """
+    Terminate a deployment's process AND anything it spawned as children.
+
+    A deployment's launcher (run.py) often runs the actual bot as a
+    subprocess (Method 2 execution — the fallback when the launcher can't
+    find a recognizable entry point to import directly, which is common).
+    That child process shares the launcher's process group by default.
+    Killing only the launcher's own PID (os.kill) leaves that child running
+    forever, completely orphaned and untracked — silently consuming RAM/CPU
+    with no record of what it even is. Killing the whole process GROUP
+    instead takes the launcher and everything it spawned down together.
+
+    Critical safety check: a target's process group must NEVER be killed if
+    it matches OUR OWN group. Every deployment spawned via the current
+    (setsid-based) start.sh gets its own isolated group, so this should
+    never normally happen for a live deployment — but pre-existing orphans
+    from before that fix was in place were spawned WITHOUT setsid, meaning
+    they very likely still share the hosting bot's own inherited group.
+    Group-killing those would take the whole hosting bot down as collateral
+    damage. When target and caller share a group, fall back to a plain
+    single-PID kill instead — safe either way, just less thorough about
+    orphaned grandchildren in that specific legacy case.
+    """
+    if sig is None:
+        sig = signal.SIGTERM
+    if not pid:
+        return
+    try:
+        target_pgid = os.getpgid(pid)
+        own_pgid = os.getpgid(os.getpid())
+        if target_pgid == own_pgid:
+            os.kill(pid, sig)
+            return
+        os.killpg(target_pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception:
+        try:
+            os.kill(pid, sig)
+        except Exception:
+            pass
+
+
 def get_deploy_folder(user_id, deployment_id):
     """Return the correct deploy folder path using folder_name from DB (fixes timestamp vs DB-id mismatch)."""
     try:
@@ -1424,7 +1468,7 @@ def stop_free_deployments_for_user(user_id):
     for dep_id, proc_pid in rows:
         if proc_pid:
             try:
-                os.kill(proc_pid, signal.SIGTERM)
+                kill_deployment_process(proc_pid)
             except Exception:
                 pass
         c.execute("""UPDATE deployments SET status='stopped', proc_pid=NULL, is_paused=0
@@ -1462,7 +1506,7 @@ def resume_premium_deployment(user_id, duration_days):
     # Kill stale process if any
     if old_pid:
         try:
-            os.kill(old_pid, signal.SIGTERM)
+            kill_deployment_process(old_pid)
         except Exception:
             pass
 
@@ -1536,7 +1580,7 @@ def continue_deployment_as_free(deployment_id, user_id, chat_id):
     conn.close()
     if r and r[0]:
         try:
-            os.kill(r[0], signal.SIGTERM)
+            kill_deployment_process(r[0])
         except Exception:
             pass
 
@@ -3723,6 +3767,18 @@ _PLATFORM_LABELS = {
     'django':            '🌐 Django',
     'aiohttp':           '🌐 aiohttp',
     'starlette':         '🌐 Starlette',
+    # Node.js (from create_node_launcher_script's own detection — separate
+    # from the Python-oriented _PLATFORM_PATTERNS above). Every one of these
+    # previously fell through get_platform_label()'s fallback and displayed
+    # as its raw internal key — several contain underscores, which breaks
+    # legacy Markdown parsing outright when shown unprotected by backticks.
+    'typescript':        '🟦 TypeScript',
+    'node_esm':          '🟩 Node.js (ESM)',
+    'node':              '🟩 Node.js',
+    'discord_js':        '🎮 Discord (discord.js)',
+    'telegram_node':     '📱 Telegram (node-telegram-bot-api)',
+    'whatsapp_node':     '💬 WhatsApp (Node.js)',
+    'web_server':        '🌐 Web Server',
 }
 
 # Required env vars hints per platform
@@ -3786,7 +3842,12 @@ def get_platform_env_hint(frameworks: list) -> str:
 
 def get_platform_label(frameworks: list) -> str:
     """Return a human-readable platform summary."""
-    labels = [_PLATFORM_LABELS.get(fw, fw) for fw in frameworks if fw != 'generic']
+    # Defense in depth: even for a framework key with no _PLATFORM_LABELS
+    # entry (future additions, typos, etc.), never expose the raw internal
+    # key verbatim — it's very likely to contain an underscore, which
+    # breaks legacy Markdown parsing outright when unprotected by backticks.
+    labels = [_PLATFORM_LABELS.get(fw, fw.replace('_', ' ').title())
+              for fw in frameworks if fw != 'generic']
     return ', '.join(labels) if labels else '🤖 Generic Python Bot'
 
 # ========== ENHANCED LAUNCHER SCRIPT ==========
@@ -3801,11 +3862,17 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
 
     if ext in ('.ts', '.tsx'):
         # Prefer tsx (faster) then ts-node
+        # setsid gives this its own process group, separate from the
+        # hosting bot's own — without it, stopping/restarting this
+        # deployment could only ever kill THIS PID, leaving the actual
+        # node process (a child, once npx/ts-node execs or forks) running
+        # forever as an orphan, or worse, a bare killpg here would risk
+        # taking down unrelated processes that share the inherited group.
         run_cmd = (
             f'if command -v npx &>/dev/null; then\n'
-            f'    npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
+            f'    setsid npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
             f'elif command -v ts-node &>/dev/null; then\n'
-            f'    ts-node "{dest_script}" >> output.log 2>&1 &\n'
+            f'    setsid ts-node "{dest_script}" >> output.log 2>&1 &\n'
             f'else\n'
             f'    echo "❌ No TypeScript runner found (install tsx or ts-node)" >> output.log\n'
             f'    exit 1\n'
@@ -3813,10 +3880,10 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         )
         framework = ['typescript']
     elif ext in ('.mjs',):
-        run_cmd = f'node --input-type=module "{dest_script}" >> output.log 2>&1 &'
+        run_cmd = f'setsid node --input-type=module "{dest_script}" >> output.log 2>&1 &'
         framework = ['node_esm']
     else:
-        run_cmd = f'node "{dest_script}" >> output.log 2>&1 &'
+        run_cmd = f'setsid node "{dest_script}" >> output.log 2>&1 &'
         framework = ['node']
 
     # Detect framework from content
@@ -4842,7 +4909,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         start_script = deploy_folder / "start.sh"
         start_script.write_text(
             f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
-            f"nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
+            f"setsid nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
         start_script.chmod(0o755)
 
         update_logs("🚀 Starting bot...")
@@ -4914,8 +4981,8 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 f"*🎉 GITHUB DEPLOYMENT SUCCESSFUL!*\n\n"
                 f"🐙 *Repo:* `{owner}/{repo}`\n"
                 f"🌿 *Branch:* `{branch}`\n"
-                f"🎯 *Entry:* `{dest_script.name}`\n"
-                f"🔧 *Framework:* {', '.join(frameworks)}\n"
+                f"🎯 *Entry:* `{display_filename(dest_script.name)}`\n"
+                f"🔧 *Framework:* {get_platform_label(frameworks)}\n"
                 f"📋 *Plan:* {plan.upper()}\n"
                 f"📅 *Expires:* `{expire_str}`\n"
                 f"🆔 *ID:* `{deployment_db_id}`",
@@ -5108,7 +5175,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             start_script = deploy_folder / "start.sh"
             start_script.write_text(
                 f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-                f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+                f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
             start_script.chmod(0o755)
         
         # Start the bot
@@ -5346,7 +5413,7 @@ def delete_deployment(deployment_id, user_id, chat_id):
         
         if proc_pid:
             try:
-                os.kill(proc_pid, signal.SIGTERM)
+                kill_deployment_process(proc_pid)
                 sleep(1)
             except:
                 pass
@@ -5459,7 +5526,7 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
         # Kill any stale process
         if proc_pid:
             try:
-                os.kill(proc_pid, signal.SIGTERM)
+                kill_deployment_process(proc_pid)
                 sleep(1)
             except Exception:
                 pass
@@ -5481,7 +5548,7 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
         start_script = deploy_folder / "start.sh"
         start_script.write_text(
             f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
         start_script.chmod(0o755)
 
         subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
@@ -5583,7 +5650,7 @@ def stop_deployment(deployment_id):
     row = c.fetchone()
     if row and row[0]:
         try:
-            os.kill(row[0], signal.SIGTERM)
+            kill_deployment_process(row[0])
         except:
             pass
     c.execute("UPDATE deployments SET status = 'stopped', proc_pid = NULL WHERE deployment_id = ?", (deployment_id,))
@@ -6205,6 +6272,108 @@ def get_env_keyboard(env_count):
     }
 
 # ==================== ADMIN PANEL ====================
+def scan_orphaned_processes():
+    """
+    Find processes that clearly belong to this hosting platform (their
+    command line references a path under DEPLOYMENTS_DIR) but aren't the
+    currently-tracked proc_pid for any active deployment. These are almost
+    always leftovers from before process-group isolation was added — a
+    stopped/restarted/redeployed bot's actual process, orphaned because
+    only its launcher's single PID was ever killed, not the whole tree.
+    Deliberately conservative: only matches on the DEPLOYMENTS_DIR path
+    appearing in the process's own command line, never touches anything
+    else, and always excludes this very process.
+    """
+    conn = sqlite3.connect(DATABASE_FILE)
+    c = conn.cursor()
+    c.execute("SELECT proc_pid FROM deployments WHERE proc_pid IS NOT NULL")
+    tracked_pids = {row[0] for row in c.fetchall()}
+    conn.close()
+
+    own_pid = os.getpid()
+    orphans = []
+    deployments_dir_str = str(DEPLOYMENTS_DIR)
+
+    try:
+        pid_dirs = [d for d in os.listdir('/proc') if d.isdigit()]
+    except Exception:
+        return []
+
+    for pid_str in pid_dirs:
+        pid = int(pid_str)
+        if pid in tracked_pids or pid == own_pid:
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                cmdline = f.read().replace(b'\x00', b' ').decode(errors='ignore').strip()
+        except Exception:
+            continue
+        if deployments_dir_str not in cmdline:
+            continue
+
+        ram_mb = 0
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        ram_mb = int(line.split()[1]) / 1024
+                        break
+        except Exception:
+            pass
+
+        orphans.append({'pid': pid, 'cmdline': cmdline[:120], 'ram_mb': ram_mb})
+
+    return orphans
+
+
+def admin_scan_orphans_view(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    edit_message(chat_id, message_id, "🧹 Scanning for orphaned processes...")
+
+    orphans = scan_orphaned_processes()
+
+    if not orphans:
+        edit_message(chat_id, message_id,
+            "✅ No orphaned processes found — nothing to clean up.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_resources"}]]})
+        return
+
+    total_ram = sum(o['ram_mb'] for o in orphans)
+    text = (f"🧹 *Found {len(orphans)} orphaned process(es)* using "
+            f"~`{total_ram:.0f}MB` RAM combined:\n\n")
+    for o in orphans[:15]:
+        text += f"• PID `{o['pid']}` — `{o['ram_mb']:.0f}MB`\n  `{o['cmdline'][:70]}`\n"
+    if len(orphans) > 15:
+        text += f"\n… and {len(orphans) - 15} more"
+    text += ("\n\nThese are process trees left behind by stop/restart/redeploy actions "
+             "from before process-group isolation was in place. Safe to kill — they're "
+             "not attached to any currently-tracked deployment.")
+
+    edit_message(chat_id, message_id, text,
+        {"inline_keyboard": [
+            [{"text": f"🗑️ Kill All {len(orphans)} Orphans", "callback_data": "admin_kill_orphans"}],
+            [{"text": "🔙 Back", "callback_data": "admin_resources"}]]})
+
+
+def admin_kill_orphans_action(chat_id, message_id, user_id):
+    if not is_admin(user_id):
+        return
+    orphans = scan_orphaned_processes()
+    killed = 0
+    for o in orphans:
+        try:
+            kill_deployment_process(o['pid'], signal.SIGKILL)
+            killed += 1
+        except Exception:
+            pass
+
+    edit_message(chat_id, message_id,
+        f"✅ Killed {killed}/{len(orphans)} orphaned process(es).\n\n"
+        f"Give it a few seconds, then check *📊 Resource Usage* again.",
+        {"inline_keyboard": [[{"text": "📊 Resource Usage", "callback_data": "admin_resources"}]]})
+
+
 def admin_resources_view(chat_id, message_id, user_id):
     if not is_admin(user_id):
         return
@@ -6251,13 +6420,14 @@ def admin_resources_view(chat_id, message_id, user_id):
         text += f"\n*Top RAM usage by deployment:*\n"
         for dep_id, owner_id, fname, ram_mb, cpu_pct in per_deploy[:10]:
             cpu_str = f"{cpu_pct:.1f}%" if cpu_pct is not None else "n/a"
-            text += f"• #{dep_id} `{fname[:25]}` — `{ram_mb:.0f}MB` / CPU `{cpu_str}`\n"
+            text += f"• #{dep_id} `{display_filename(fname)[:25]}` — `{ram_mb:.0f}MB` / CPU `{cpu_str}`\n"
 
     if sys_res['source'] == 'proc':
         text += f"\n_ℹ️ Per-deployment CPU% unavailable without psutil (RAM still accurate)_"
 
     edit_message(chat_id, message_id, text,
         {"inline_keyboard": [
+            [{"text": "🧹 Scan for Orphaned Processes", "callback_data": "admin_scan_orphans"}],
             [{"text": "🔄 Refresh", "callback_data": "admin_resources"}],
             [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
 
@@ -7336,6 +7506,20 @@ def handle_callback(callback):
     if data == "admin_resources":
         if is_admin(user_id):
             admin_resources_view(chat_id, message_id, user_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+
+    if data == "admin_scan_orphans":
+        if is_admin(user_id):
+            admin_scan_orphans_view(chat_id, message_id, user_id)
+        else:
+            edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+
+    if data == "admin_kill_orphans":
+        if is_admin(user_id):
+            admin_kill_orphans_action(chat_id, message_id, user_id)
         else:
             edit_message(chat_id, message_id, "🔒 Unauthorized!")
         return
@@ -8855,7 +9039,7 @@ def deployment_expiry_monitor():
             for dep_id, uid, proc_pid, is_free, plan, folder_name_val in expired:
                 if proc_pid:
                     try:
-                        os.kill(proc_pid, signal.SIGTERM)
+                        kill_deployment_process(proc_pid)
                     except Exception:
                         pass
 
@@ -9010,7 +9194,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         start_script = deploy_folder / "start.sh"
         start_script.write_text(
             f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
         start_script.chmod(0o755)
 
     subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
