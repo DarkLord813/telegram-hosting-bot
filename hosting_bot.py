@@ -5816,7 +5816,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
                 [{"text": "🔄 Restart (Free 24h)", "callback_data": f"restart_deploy_{dep_id}"}])
         else:
             keyboard["inline_keyboard"].append(
-                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"},
+                [{"text": "⭐ Reactivate Premium",   "callback_data": f"reactivate_premium_{dep_id}"},
                  {"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
 
     elif status in ("stopped", "failed"):
@@ -5826,7 +5826,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         else:
             # Premium deployment stopped — offer both paths
             keyboard["inline_keyboard"].append(
-                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"}])
+                [{"text": "⭐ Reactivate Premium",   "callback_data": f"reactivate_premium_{dep_id}"}])
             keyboard["inline_keyboard"].append(
                 [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
     
@@ -7638,6 +7638,21 @@ def handle_callback(callback):
     if data == "subscribe_premium":
         show_premium_menu(chat_id, user_id, message_id)
         return
+
+    if data.startswith("reactivate_premium_"):
+        dep_id = int(data.split("_")[2])
+        if is_user_premium(user_id):
+            # Already premium (renewed elsewhere, or never actually lapsed) —
+            # reactivate immediately, no reason to send them through a
+            # purchase flow for something they already have.
+            restart_deployment(dep_id, user_id, chat_id)
+            view_deployment(chat_id, message_id, user_id, dep_id)
+        else:
+            # Not currently premium — send to the purchase flow. Once
+            # payment completes, activate_premium() already auto-resumes
+            # the user's most recent stopped/paused premium deployment.
+            show_premium_menu(chat_id, user_id, message_id)
+        return
     
     if data == "premium_monthly_stars":
         purchase_premium_stars(chat_id, user_id, "monthly", 30, PRICE_MONTHLY_STARS)
@@ -9073,7 +9088,7 @@ def deployment_expiry_monitor():
                             f"• ⭐ Reactivate Premium — bot resumes immediately with full history\n"
                             f"• 🆓 Continue as Free — bot runs 24h more, database preserved",
                             {"inline_keyboard": [
-                                [{"text": "⭐ Reactivate Premium",   "callback_data": "subscribe_premium"}],
+                                [{"text": "⭐ Reactivate Premium",   "callback_data": f"reactivate_premium_{dep_id}"}],
                                 [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}],
                                 [{"text": "📦 My Deployments",       "callback_data": "my_deployments"}],
                             ]})
