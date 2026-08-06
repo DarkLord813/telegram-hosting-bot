@@ -137,6 +137,43 @@ GITHUB_ENABLED      = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_REPO_NA
 # Timeout settings
 PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
 
+# ── Per-deployment resource limits ──────────────────────────────────────────
+# CPU: nice only affects PRIORITY under contention, never caps throughput —
+# if a core is idle, a "niced" process still runs at full speed. This is
+# deliberately NOT a hard CPU quota (like cgroups/cpulimit), which would
+# throttle a bot even when the CPU has spare capacity and risks breaking
+# time-sensitive operations (webhook responses, polling latency). Range is
+# 0 (normal priority) to 19 (lowest); higher just means "yield to other
+# processes first when they're competing for the same core."
+DEPLOYMENT_NICE_LEVEL = int(os.environ.get("DEPLOYMENT_NICE_LEVEL", 10))
+
+# RAM: unlike CPU, there's no soft equivalent — this IS a hard ceiling
+# (enforced via `ulimit -v`, kernel-level). Default is deliberately generous:
+# most simple Telegram/Discord bots run well under 100MB even with several
+# dependencies loaded, so 512MB gives large headroom for legitimate use while
+# still stopping any single runaway/leaking process from silently consuming
+# gigabytes and starving every other deployment. A bot that genuinely needs
+# more (heavy data processing, ML libraries) will hit the limit, exit
+# cleanly, and get picked up by the existing crash-auto-restart — which
+# surfaces as a visible notification rather than silent resource exhaustion,
+# so raising this for that specific case is an informed decision, not a
+# guess. Set to 0 to disable the cap entirely.
+DEPLOYMENT_MEMORY_LIMIT_MB = int(os.environ.get("DEPLOYMENT_MEMORY_LIMIT_MB", 512))
+
+def _ulimit_line() -> str:
+    """
+    Shell line that caps virtual memory for this process and everything it
+    subsequently spawns (ulimit is inherited across fork/exec, same as env
+    vars). Empty string disables the cap entirely when
+    DEPLOYMENT_MEMORY_LIMIT_MB is 0. Must run BEFORE the deployment is
+    backgrounded — a limit set in the current shell applies to all its
+    children, including ones started later with setsid/nohup/&.
+    """
+    if DEPLOYMENT_MEMORY_LIMIT_MB <= 0:
+        return ""
+    limit_kb = DEPLOYMENT_MEMORY_LIMIT_MB * 1024
+    return f"ulimit -v {limit_kb} 2>/dev/null\n"
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LAST_UPDATE_ID = 0
 
@@ -406,7 +443,8 @@ def init_db():
                         ("github_repo", "TEXT"),
                         ("github_branch","TEXT DEFAULT 'main'"),
                         ("crash_restart_count", "INTEGER DEFAULT 0"),
-                        ("last_crash_restart", "TEXT")]:
+                        ("last_crash_restart", "TEXT"),
+                        ("telegram_file_id", "TEXT")]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}")
         except Exception:
@@ -1720,38 +1758,61 @@ def resume_paused_deployments(user_id):
                 deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(dep_id)
             dest_script = deploy_folder / file_name
             
-            if dest_script.exists():
-                env_vars = json.loads(env_vars_json) if env_vars_json else {}
-                env = os.environ.copy()
-                for k, v in env_vars.items():
-                    env[k] = v
-                
-                launcher_script = deploy_folder / "run.py"
-                log_file_path = deploy_folder / "output.log"
-                with open(log_file_path, "a") as log_f:
-                    if launcher_script.exists():
-                        proc = subprocess.Popen(
-                            [sys.executable, str(launcher_script)],
-                            cwd=str(deploy_folder),
-                            env=env,
-                            stdout=log_f,
-                            stderr=subprocess.STDOUT
-                        )
-                    else:
-                        proc = subprocess.Popen(
-                            [sys.executable, str(dest_script)],
-                            cwd=str(deploy_folder),
-                            env=env,
-                            stdout=log_f,
-                            stderr=subprocess.STDOUT
-                        )
-                
+            if not dest_script.exists():
+                continue
+
+            env_vars = json.loads(env_vars_json) if env_vars_json else {}
+
+            # Branch on file type exactly like every other launch path — a
+            # Node.js deployment must NOT be run via `python3`, which is
+            # what this function unconditionally did before, guaranteed to
+            # fail outright for any .js/.ts file.
+            ext = dest_script.suffix.lower()
+            is_node = ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+
+            if is_node:
+                start_script, _ = create_node_launcher_script(
+                    deploy_folder, dest_script, env_vars, lambda x: None)
+            else:
+                try:
+                    code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
+                except Exception:
+                    code_content = ""
+                launcher_script, _ = create_enhanced_launcher_script(
+                    deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+
+                env_file = deploy_folder / ".env"
+                env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+
+                start_script = deploy_folder / "start.sh"
+                start_script.write_text(
+                    f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+                    f'{_ulimit_line()}'
+                    f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+                start_script.chmod(0o755)
+
+            # Launch via start.sh (setsid + nice + ulimit) instead of a raw
+            # subprocess.Popen — matches every other launch path, so this
+            # deployment gets the same process-group isolation (no orphans
+            # on a future stop/restart) and resource limits as any other.
+            subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+            sleep(2)
+
+            pid_file = deploy_folder / "pid.txt"
+            new_pid = None
+            if pid_file.exists():
+                try:
+                    new_pid = int(pid_file.read_text().strip())
+                except Exception:
+                    pass
+
+            if new_pid:
                 c.execute('''UPDATE deployments SET status = 'active', is_paused = 0, proc_pid = ? 
-                             WHERE deployment_id = ?''', (proc.pid, dep_id))  # FIX: store proc.pid not proc
+                             WHERE deployment_id = ?''', (new_pid, dep_id))
                 resumed_count += 1
-                
+
                 with deployment_lock:
-                    active_deployments[dep_id] = proc.pid  # FIX: store PID integer
+                    active_deployments[dep_id] = new_pid
         
         conn.commit()
         conn.close()
@@ -3868,11 +3929,13 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         # node process (a child, once npx/ts-node execs or forks) running
         # forever as an orphan, or worse, a bare killpg here would risk
         # taking down unrelated processes that share the inherited group.
+        # nice deprioritizes CPU only under contention — never throttles
+        # below what the deployment would get on an otherwise-idle core.
         run_cmd = (
             f'if command -v npx &>/dev/null; then\n'
-            f'    setsid npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
+            f'    setsid nice -n {DEPLOYMENT_NICE_LEVEL} npx --yes tsx "{dest_script}" >> output.log 2>&1 &\n'
             f'elif command -v ts-node &>/dev/null; then\n'
-            f'    setsid ts-node "{dest_script}" >> output.log 2>&1 &\n'
+            f'    setsid nice -n {DEPLOYMENT_NICE_LEVEL} ts-node "{dest_script}" >> output.log 2>&1 &\n'
             f'else\n'
             f'    echo "❌ No TypeScript runner found (install tsx or ts-node)" >> output.log\n'
             f'    exit 1\n'
@@ -3880,10 +3943,10 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         )
         framework = ['typescript']
     elif ext in ('.mjs',):
-        run_cmd = f'setsid node --input-type=module "{dest_script}" >> output.log 2>&1 &'
+        run_cmd = f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} node --input-type=module "{dest_script}" >> output.log 2>&1 &'
         framework = ['node_esm']
     else:
-        run_cmd = f'setsid node "{dest_script}" >> output.log 2>&1 &'
+        run_cmd = f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} node "{dest_script}" >> output.log 2>&1 &'
         framework = ['node']
 
     # Detect framework from content
@@ -3928,6 +3991,7 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         f'export PYTHONUNBUFFERED=1\n'
         f'{env_lines}\n\n'
         f'{npm_install}\n\n'
+        f'{_ulimit_line()}'
         f'{run_cmd}\n'
         f'echo $! > pid.txt\n'
     )
@@ -4728,6 +4792,11 @@ _MAIN_FILE_CANDIDATES = [
     'index.py', 'server.py', 'handler.py', '__main__.py',
 ]
 
+_NODE_MAIN_FILE_CANDIDATES = [
+    'index.js', 'bot.js', 'app.js', 'main.js', 'server.js', 'start.js',
+    'index.mjs', 'index.ts', 'bot.ts', 'app.ts', 'main.ts',
+]
+
 def find_main_file(folder: Path) -> list[Path]:
     """
     Return a ranked list of Python file candidates for the bot entry point.
@@ -4756,6 +4825,40 @@ def find_main_file(folder: Path) -> list[Path]:
     for p in sorted(folder.glob('*.py')):
         if p not in found:
             found.append(p)
+
+    return found
+
+
+def find_node_main_file(folder: Path) -> list[Path]:
+    """
+    Same idea as find_main_file, but for Node.js/TypeScript repos.
+    Priority: package.json's own "main" field (the most authoritative
+    signal a real Node project can give) → known entry-point names →
+    any remaining top-level .js/.mjs/.ts files.
+    """
+    found = []
+
+    pkg_json = folder / 'package.json'
+    if pkg_json.exists():
+        try:
+            pkg_data = json.loads(pkg_json.read_text(errors='ignore'))
+            main_field = pkg_data.get('main')
+            if main_field:
+                p = folder / main_field
+                if p.exists():
+                    found.append(p)
+        except Exception:
+            pass
+
+    for name in _NODE_MAIN_FILE_CANDIDATES:
+        p = folder / name
+        if p.exists() and p not in found:
+            found.append(p)
+
+    for ext in ('*.js', '*.mjs', '*.ts'):
+        for p in sorted(folder.glob(ext)):
+            if p not in found:
+                found.append(p)
 
     return found
 
@@ -4817,22 +4920,41 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                                       {"text": "🏠 Menu",       "callback_data": "main_menu"}]]})
             return False
 
-        # ── Install all requirement sources ──────────────────────────
-        update_logs("📦 Installing all dependencies (VPS mode)...")
-        _installed_from_manifests = install_from_repo_requirements(deploy_folder, update_logs)
-
-        # ── Detect main file ─────────────────────────────────────────
+        # ── Detect main file (Python first, then Node.js/TS) ───────────
         if main_file_name:
             dest_script = deploy_folder / main_file_name
         else:
             candidates = find_main_file(deploy_folder)
+            if not candidates:
+                candidates = find_node_main_file(deploy_folder)
             dest_script = candidates[0] if candidates else None
 
         if not dest_script or not dest_script.exists():
-            update_logs("❌ No main Python file found — cannot launch")
+            update_logs("❌ No main Python or Node.js file found — cannot launch")
+            edit_message(chat_id, status_message_id,
+                "❌ *No entry point found in this repo.*\n\n"
+                "Looked for common Python names (main.py, bot.py, app.py, ...) "
+                "and Node.js names (index.js, bot.js, app.js, ...), plus "
+                "package.json's own \"main\" field. None matched.",
+                {"inline_keyboard": [[{"text": "🔄 Try Again", "callback_data": "github_deploy"},
+                                      {"text": "🏠 Menu",       "callback_data": "main_menu"}]]})
             return False
 
+        _entry_ext = dest_script.suffix.lower()
+        _is_node = _entry_ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+
         update_logs(f"🎯 Entry point: {dest_script.relative_to(deploy_folder)}")
+
+        # ── Install dependencies ────────────────────────────────────────
+        # Node.js: npm install happens inside the generated start.sh itself
+        # (it needs package.json already sitting in deploy_folder from the
+        # repo clone, which it is) — nothing Python-specific applies here.
+        if _is_node:
+            update_logs("📦 Node.js project detected — npm install will run at launch")
+            _installed_from_manifests = []
+        else:
+            update_logs("📦 Installing all dependencies (VPS mode)...")
+            _installed_from_manifests = install_from_repo_requirements(deploy_folder, update_logs)
 
         # ── Security scan of the main file ───────────────────────────
         try:
@@ -4860,29 +4982,26 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             code_content = ""
 
         # ── Fill any gaps between what's actually imported and what the
-        # repo's manifest files declared ──────────────────────────────
-        # A repo's requirements.txt (or lack of one) is very often
-        # incomplete — e.g. `from dotenv import load_dotenv` with no
-        # matching line anywhere, because it "just works" locally from
-        # whatever's already installed globally. install_from_repo_requirements
-        # only reads explicit manifest files; it has no equivalent of the
-        # upload path's import-scanning fallback. Add one here too.
-        try:
-            _gh_already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower()
-                           for r in (_installed_from_manifests or [])}
-            _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
-            _gh_gap = [a for a in _gh_auto
-                       if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in _gh_already]
-            if _gh_gap:
-                update_logs(f"📦 Filling {len(_gh_gap)} import(s) missing from repo manifests: "
-                            f"{', '.join(_gh_gap)}")
-                _gh_packages_dir = deploy_folder / 'packages'
-                _gh_tmp_reqs = deploy_folder / '_autodetect_gap_reqs.txt'
-                _gh_tmp_reqs.write_text('\n'.join(_gh_gap))
-                install_dependencies_enhanced(_gh_tmp_reqs, update_logs, _gh_packages_dir)
-                _gh_tmp_reqs.unlink(missing_ok=True)
-        except Exception as _gh_gap_err:
-            update_logs(f"⚠️ Gap-fill dependency scan error: {_gh_gap_err}")
+        # repo's manifest files declared (Python only — meaningless for
+        # Node.js/TS syntax, and npm install already runs at launch time
+        # against whatever package.json actually says) ──────────────────
+        if not _is_node:
+            try:
+                _gh_already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower()
+                               for r in (_installed_from_manifests or [])}
+                _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+                _gh_gap = [a for a in _gh_auto
+                           if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in _gh_already]
+                if _gh_gap:
+                    update_logs(f"📦 Filling {len(_gh_gap)} import(s) missing from repo manifests: "
+                                f"{', '.join(_gh_gap)}")
+                    _gh_packages_dir = deploy_folder / 'packages'
+                    _gh_tmp_reqs = deploy_folder / '_autodetect_gap_reqs.txt'
+                    _gh_tmp_reqs.write_text('\n'.join(_gh_gap))
+                    install_dependencies_enhanced(_gh_tmp_reqs, update_logs, _gh_packages_dir)
+                    _gh_tmp_reqs.unlink(missing_ok=True)
+            except Exception as _gh_gap_err:
+                update_logs(f"⚠️ Gap-fill dependency scan error: {_gh_gap_err}")
 
         file_size = dest_script.stat().st_size
 
@@ -4901,16 +5020,24 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
         # ── Create launcher ──────────────────────────────────────────
         update_logs("🔧 Creating launcher...")
-        launcher_script, frameworks = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
-            packages_dir=packages_dir)
+        if _is_node:
+            start_script, frameworks = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, update_logs)
+            # create_node_launcher_script already writes a complete start.sh
+            # of its own (including npm install + the memory/nice-wrapped
+            # run command) — nothing further to build here.
+        else:
+            launcher_script, frameworks = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
+                packages_dir=packages_dir)
 
-        # ── Start script ─────────────────────────────────────────────
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
-            f"setsid nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
-        start_script.chmod(0o755)
+            # ── Start script ─────────────────────────────────────────────
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
+                f"{_ulimit_line()}"
+                f"setsid nice -n {DEPLOYMENT_NICE_LEVEL} nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
+            start_script.chmod(0o755)
 
         update_logs("🚀 Starting bot...")
         subprocess.run([str(start_script)], cwd=str(deploy_folder),
@@ -5175,7 +5302,8 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             start_script = deploy_folder / "start.sh"
             start_script.write_text(
                 f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-                f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+                f'{_ulimit_line()}'
+                f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
             start_script.chmod(0o755)
         
         # Start the bot
@@ -5228,15 +5356,16 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
+            _stored_file_id = get_user_step(user_id).get('telegram_file_id')
             c.execute('''INSERT INTO deployments 
                 (user_id, file_name, file_size, requirements, env_vars, plan, payment_method, cost_coins, cost_stars, 
-                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused, framework, dependencies_installed, folder_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 start_time, expire_time, status, proc_pid, install_log, deploy_log, is_free, is_paused, framework, dependencies_installed, folder_name, telegram_file_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (user_id, dest_script.name, file_size, requirements_text or "", json.dumps(env_vars_dict),
                  plan, payment_method, cost_coins, cost_stars,
                  start_time.isoformat(), expire_time.isoformat() if expire_time else None, "active", proc_pid,
                  "\n".join(logs[-100:]), "Bot running", 1 if is_free else 0, 0,
-                 ', '.join(frameworks), json.dumps(requirements_list), str(deploy_id)))
+                 ', '.join(frameworks), json.dumps(requirements_list), str(deploy_id), _stored_file_id))
             deployment_db_id = c.lastrowid
             conn.commit()
             conn.close()
@@ -5533,23 +5662,35 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
 
         env_vars = json.loads(env_vars_json) if env_vars_json else {}
 
-        try:
-            code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            code_content = ""
+        # Branch on file type exactly like the deploy paths do — a Node.js
+        # deployment must NOT be regenerated through the Python launcher, or
+        # its start.sh gets silently overwritten with a script that tries to
+        # run a .js file via `python3`, which fails outright.
+        _ext = dest_script.suffix.lower()
+        _is_node = _ext in ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
 
-        launcher_script, _ = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+        if _is_node:
+            start_script, _ = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars, lambda x: None)
+        else:
+            try:
+                code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
+            except Exception:
+                code_content = ""
 
-        # Rewrite .env and start.sh to ensure they're fresh
-        env_file = deploy_folder / ".env"
-        env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+            launcher_script, _ = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars, code_content, lambda x: None)
 
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-        start_script.chmod(0o755)
+            # Rewrite .env and start.sh to ensure they're fresh
+            env_file = deploy_folder / ".env"
+            env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+                f'{_ulimit_line()}'
+                f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            start_script.chmod(0o755)
 
         subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
         sleep(4)
@@ -8906,6 +9047,7 @@ def handle_message(message):
 
             set_user_step(user_id, 'awaiting_reqs',
                          temp_file=str(temp_file),
+                         telegram_file_id=file_id,
                          plan=user_step.get('plan'),
                          duration=user_step.get('duration'),
                          cost_coins=user_step.get('cost_coins'),
@@ -9126,7 +9268,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
     c = conn.cursor()
     c.execute("""SELECT user_id, file_name, is_paused, env_vars, status,
                         start_time, expire_time, is_free, plan,
-                        crash_restart_count, last_crash_restart
+                        crash_restart_count, last_crash_restart, telegram_file_id
                  FROM deployments WHERE deployment_id=?""", (deployment_id,))
     row = c.fetchone()
     if not row:
@@ -9135,7 +9277,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
 
     (owner_id, file_name, is_paused, env_vars_json, status,
      start_time_str, expire_time_str, is_free, plan,
-     crash_count, last_crash_str) = row
+     crash_count, last_crash_str, telegram_file_id) = row
     crash_count = crash_count or 0
 
     # Never resurrect a deployment whose time is genuinely up.
@@ -9168,21 +9310,53 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
 
     if not deploy_folder.exists() or not dest_script.exists():
         # Files are gone — almost always means the host's disk was wiped on a
-        # redeploy (see PERSISTENT_DISK_PATH). Nothing to relaunch from.
-        c.execute("UPDATE deployments SET status='stopped', proc_pid=NULL WHERE deployment_id=?",
-                  (deployment_id,))
-        conn.commit()
-        conn.close()
+        # redeploy (see PERSISTENT_DISK_PATH). If we saved the original
+        # Telegram file_id at upload time, try to recover automatically by
+        # re-downloading it — Telegram keeps bot-uploaded files accessible
+        # indefinitely, so this works even long after the original upload.
+        recovered = False
+        if telegram_file_id:
+            try:
+                file_info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": telegram_file_id})
+                if file_info and file_info.get('ok'):
+                    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info['result']['file_path']}"
+                    with urllib.request.urlopen(file_url, timeout=60) as resp:
+                        file_bytes = resp.read()
+                    deploy_folder.mkdir(parents=True, exist_ok=True)
+                    dest_script.write_bytes(file_bytes)
+                    recovered = True
+                    print(f"✅ Recovered deployment {deployment_id} from saved Telegram file_id")
+            except Exception as _re:
+                print(f"⚠️ Recovery download failed for deployment {deployment_id}: {_re}")
+
+        if not recovered:
+            c.execute("UPDATE deployments SET status='stopped', proc_pid=NULL WHERE deployment_id=?",
+                      (deployment_id,))
+            conn.commit()
+            conn.close()
+            try:
+                send_message(owner_id,
+                    f"⚠️ *Bot #{deployment_id} could not be restarted*\n\n"
+                    f"Its files are missing on disk (most likely lost during a host "
+                    f"restart/redeploy), and automatic recovery wasn't possible "
+                    f"(no saved upload to restore from — this applies to GitHub "
+                    f"deployments and anything deployed before auto-recovery was "
+                    f"added). Please redeploy this bot — your account data and "
+                    f"coin balance are unaffected.",
+                    {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+            except Exception:
+                pass
+            return "files_missing"
+
+        # Recovered — notify the owner and fall through to the normal
+        # relaunch logic below exactly as if the files had been there all along.
         try:
             send_message(owner_id,
-                f"⚠️ *Bot #{deployment_id} could not be restarted*\n\n"
-                f"Its files are missing on disk (most likely lost during a host "
-                f"restart/redeploy). Please redeploy this bot — your account "
-                f"data and coin balance are unaffected.",
-                {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+                f"🔄 *Bot #{deployment_id} auto-recovered*\n\n"
+                f"Its files were lost during a host restart, but were "
+                f"automatically restored from your original upload. Relaunching now...")
         except Exception:
             pass
-        return "files_missing"
 
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
 
@@ -9209,7 +9383,8 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         start_script = deploy_folder / "start.sh"
         start_script.write_text(
             f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            f'{_ulimit_line()}'
+                f'setsid nice -n {DEPLOYMENT_NICE_LEVEL} nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
         start_script.chmod(0o755)
 
     subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
