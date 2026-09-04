@@ -134,6 +134,13 @@ GITHUB_BACKUP_BRANCH= os.environ.get("GITHUB_BACKUP_BRANCH", "main")
 GITHUB_BACKUP_PATH  = os.environ.get("GITHUB_BACKUP_PATH", "backups/hosting_bot.db")
 GITHUB_ENABLED      = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_REPO_NAME)
 
+# ── Deployment Files Repo (separate from DB backup repo) ─────────────────
+# Set GITHUB_FILES_REPO_NAME to a different private repo to keep user bot
+# files separate from the DB backup.  Falls back to the same repo if unset.
+GITHUB_FILES_REPO_NAME  = os.environ.get("GITHUB_FILES_REPO_NAME", GITHUB_REPO_NAME)
+GITHUB_FILES_BRANCH     = os.environ.get("GITHUB_FILES_BRANCH", "main")
+GITHUB_FILES_ENABLED    = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_FILES_REPO_NAME)
+
 # Timeout settings
 PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
 
@@ -950,9 +957,297 @@ _last_backup_time   = 0.0
 _MIN_BACKUP_INTERVAL = 30          # minimum seconds between consecutive backups
 
 def _gh_api(method, path, payload=None):
-    """Raw GitHub Contents API call. Returns (http_status, response_dict)."""
+    """Raw GitHub Contents API call for the DB-backup repo."""
     url     = (f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/"
                f"{GITHUB_REPO_NAME}/contents/{path}")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept":        "application/vnd.github+json",
+        "Content-Type":  "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = json.dumps(payload).encode() if payload else None
+    req  = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:    return e.code, json.loads(e.read())
+        except: return e.code, {}
+    except Exception as ex:
+        return 0, {"error": str(ex)}
+
+
+# ==================== DEPLOYMENT FILES GITHUB STORAGE ====================
+
+def _gh_files_api(method, path, payload=None):
+    """
+    GitHub Contents API call for the deployment-files repo.
+    Uses GITHUB_FILES_REPO_NAME (may be the same repo as the DB backup).
+    """
+    url = (f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/"
+           f"{GITHUB_FILES_REPO_NAME}/contents/{path}")
+    headers = {
+        "Authorization":        f"Bearer {GITHUB_TOKEN}",
+        "Accept":               "application/vnd.github+json",
+        "Content-Type":         "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = json.dumps(payload).encode() if payload else None
+    req  = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:    return e.code, json.loads(e.read())
+        except: return e.code, {}
+    except Exception as ex:
+        return 0, {"error": str(ex)}
+
+
+def _gh_files_put(repo_path: str, content_bytes: bytes, message: str) -> bool:
+    """Create or update a single file in the deployment files repo."""
+    # Fetch current SHA if file exists (required for update)
+    sha = None
+    status, resp = _gh_files_api("GET", repo_path)
+    if status == 200:
+        sha = resp.get("sha")
+    elif status not in (200, 404):
+        print(f"⚠️  GHFiles GET {repo_path}: HTTP {status}")
+
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode(),
+        "branch":  GITHUB_FILES_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    status, resp = _gh_files_api("PUT", repo_path, payload)
+    if status in (200, 201):
+        return True
+    print(f"⚠️  GHFiles PUT {repo_path}: HTTP {status} — {resp.get('message','')}")
+    return False
+
+
+def _gh_files_delete(repo_path: str, message: str) -> bool:
+    """Delete a single file from the deployment files repo."""
+    status, resp = _gh_files_api("GET", repo_path)
+    if status == 404:
+        return True   # already gone
+    if status != 200:
+        return False
+    sha = resp.get("sha", "")
+    payload = {"message": message, "sha": sha, "branch": GITHUB_FILES_BRANCH}
+    status, _ = _gh_files_api("DELETE", repo_path, payload)
+    return status in (200, 204)
+
+
+def _dep_prefix(user_id, dep_id) -> str:
+    """Repo path prefix for all files belonging to one deployment."""
+    return f"deployments/{user_id}/{dep_id}"
+
+
+def save_deployment_files_to_github(dep_id, user_id, file_name,
+                                    file_content: bytes,
+                                    requirements_text: str,
+                                    env_vars_dict: dict,
+                                    extra_meta: dict = None) -> bool:
+    """
+    Upload all deployment artefacts to GitHub so they survive server restarts.
+
+    Folder layout inside the repo:
+        deployments/{user_id}/{dep_id}/
+            {file_name}           ← the user's bot file
+            requirements.txt      ← if any requirements were provided
+            .env                  ← KEY=VALUE pairs for every env var
+            meta.json             ← deployment metadata (plan, frameworks, …)
+
+    Returns True only when every file uploaded successfully.
+    """
+    if not GITHUB_FILES_ENABLED:
+        return False
+
+    prefix  = _dep_prefix(user_id, dep_id)
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    ok_all  = True
+
+    # 1. Bot file
+    ok_all &= _gh_files_put(
+        f"{prefix}/{file_name}", file_content,
+        f"deploy: save bot file for dep#{dep_id} ({ts})")
+
+    # 2. requirements.txt (only if non-empty)
+    if requirements_text and requirements_text.strip():
+        ok_all &= _gh_files_put(
+            f"{prefix}/requirements.txt",
+            requirements_text.strip().encode('utf-8'),
+            f"deploy: save requirements for dep#{dep_id} ({ts})")
+
+    # 3. .env — every env var the user set, one KEY=VALUE per line
+    #    We intentionally exclude hosting-bot vars; env_vars_dict contains
+    #    only what the user configured at deploy time.
+    if env_vars_dict:
+        env_lines = '\n'.join(f"{k}={v}" for k, v in env_vars_dict.items())
+        ok_all &= _gh_files_put(
+            f"{prefix}/.env",
+            env_lines.encode('utf-8'),
+            f"deploy: save env vars for dep#{dep_id} ({ts})")
+
+    # 4. meta.json — everything needed to reconstruct the deployment
+    meta = {
+        "dep_id":    dep_id,
+        "user_id":   user_id,
+        "file_name": file_name,
+        "saved_at":  ts,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    ok_all &= _gh_files_put(
+        f"{prefix}/meta.json",
+        json.dumps(meta, indent=2).encode('utf-8'),
+        f"deploy: save meta for dep#{dep_id} ({ts})")
+
+    if ok_all:
+        print(f"✅ Dep #{dep_id} files saved to GitHub ({prefix}/)")
+    else:
+        print(f"⚠️  Dep #{dep_id} partial save to GitHub — some files may be missing")
+    return ok_all
+
+
+def restore_deployment_files_from_github(dep_id, user_id, deploy_folder: Path) -> dict:
+    """
+    Download all files for a deployment from GitHub and write them to
+    deploy_folder.  Returns a dict with:
+        {
+          'ok':           bool,
+          'file_name':    str | None,
+          'env_vars':     dict,      # parsed from .env
+          'requirements': str,       # raw requirements.txt content
+          'meta':         dict,      # parsed meta.json
+        }
+    Returns {'ok': False} when GitHub files storage is not configured or the
+    folder doesn't exist in the repo.
+    """
+    result = {'ok': False, 'file_name': None, 'env_vars': {}, 'requirements': '', 'meta': {}}
+
+    if not GITHUB_FILES_ENABLED:
+        return result
+
+    prefix = _dep_prefix(user_id, dep_id)
+
+    # List all files in the deployment folder
+    status, listing = _gh_files_api("GET", prefix)
+    if status != 200 or not isinstance(listing, list):
+        print(f"⚠️  Restore dep#{dep_id}: folder not found in GitHub ({prefix}/)")
+        return result
+
+    deploy_folder = Path(deploy_folder)
+    deploy_folder.mkdir(parents=True, exist_ok=True)
+
+    env_vars  = {}
+    req_text  = ''
+    meta      = {}
+    file_name = None
+
+    for item in listing:
+        item_path = item.get('path', '')
+        item_name = item.get('name', '')
+        dl_url    = item.get('download_url') or item.get('url', '')
+
+        if not dl_url:
+            continue
+
+        # Download the file content
+        try:
+            req_obj = urllib.request.Request(dl_url, headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "User-Agent":    "BotHostingPlatform/1.0",
+            })
+            with urllib.request.urlopen(req_obj, timeout=30) as r:
+                raw_content = r.read()
+        except Exception as e:
+            print(f"⚠️  Restore dep#{dep_id}: download {item_name} failed: {e}")
+            continue
+
+        # Write to local deploy folder
+        local_path = deploy_folder / item_name
+        try:
+            local_path.write_bytes(raw_content)
+        except Exception as e:
+            print(f"⚠️  Restore dep#{dep_id}: write {item_name} failed: {e}")
+            continue
+
+        # Parse special files
+        if item_name == '.env':
+            text = raw_content.decode('utf-8', errors='ignore')
+            for line in text.splitlines():
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, _, v = line.partition('=')
+                    env_vars[k.strip()] = v.strip()
+
+        elif item_name == 'requirements.txt':
+            req_text = raw_content.decode('utf-8', errors='ignore')
+
+        elif item_name == 'meta.json':
+            try:
+                meta = json.loads(raw_content.decode('utf-8'))
+                if 'file_name' in meta:
+                    file_name = meta['file_name']
+            except Exception:
+                pass
+
+        elif item_name not in ('meta.json', '.env', 'requirements.txt'):
+            # Assume any other file is the bot file
+            if file_name is None:
+                file_name = item_name
+
+    restored = file_name and (deploy_folder / file_name).exists()
+    if restored:
+        print(f"✅ Dep #{dep_id} files restored from GitHub → {deploy_folder.name}/")
+    else:
+        print(f"⚠️  Dep #{dep_id} restore incomplete — bot file not found in GitHub")
+
+    result.update({
+        'ok':           restored,
+        'file_name':    file_name,
+        'env_vars':     env_vars,
+        'requirements': req_text,
+        'meta':         meta,
+    })
+    return result
+
+
+def delete_deployment_files_from_github(dep_id, user_id) -> bool:
+    """
+    Remove all files for a deployment from GitHub.
+    GitHub API has no folder-delete; we list and delete each file individually.
+    """
+    if not GITHUB_FILES_ENABLED:
+        return False
+
+    prefix = _dep_prefix(user_id, dep_id)
+    status, listing = _gh_files_api("GET", prefix)
+    if status == 404:
+        return True   # nothing to delete
+    if status != 200 or not isinstance(listing, list):
+        print(f"⚠️  GHFiles delete dep#{dep_id}: list failed (HTTP {status})")
+        return False
+
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    all_ok  = True
+    for item in listing:
+        ok = _gh_files_delete(
+            item['path'],
+            f"delete: remove dep#{dep_id} ({ts})")
+        if not ok:
+            print(f"⚠️  GHFiles: failed to delete {item['path']}")
+            all_ok = False
+
+    if all_ok:
+        print(f"✅ Dep #{dep_id} files deleted from GitHub ({prefix}/)")
+    return all_ok
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept":        "application/vnd.github+json",
@@ -4994,6 +5289,29 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 ]})
 
             async_backup(f"github_deploy_{deployment_db_id}")
+
+            # ── Save deployment files to GitHub ───────────────────────────
+            if GITHUB_FILES_ENABLED:
+                def _bg_save_gh(did=deployment_db_id, uid=user_id,
+                                fn=dest_script.name, fp=dest_script,
+                                ev=dict(env_vars_dict),
+                                fw=list(frameworks), pl=plan,
+                                ow=owner, rp=repo, br=branch):
+                    try:
+                        file_bytes = Path(fp).read_bytes()
+                        req_path = Path(fp).parent / 'requirements.txt'
+                        rt = req_path.read_text(errors='ignore') if req_path.exists() else ''
+                        save_deployment_files_to_github(
+                            did, uid, fn, file_bytes, rt, ev,
+                            extra_meta={"plan": pl, "frameworks": fw,
+                                        "source": "github",
+                                        "github_repo": f"{ow}/{rp}",
+                                        "github_branch": br})
+                    except Exception as e:
+                        print(f"⚠️  GHFiles save failed for dep#{did}: {e}")
+                threading.Thread(target=_bg_save_gh, daemon=True,
+                                 name=f"GHSave-{deployment_db_id}").start()
+
             return True
         else:
             err_tail = ""
@@ -5282,6 +5600,26 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                     active_deployments[deployment_db_id] = proc_pid
 
             async_backup(f"deployment_{deployment_db_id}")
+
+            # ── Save deployment files to GitHub ───────────────────────────
+            # Run in background so it doesn't slow down the response.
+            if GITHUB_FILES_ENABLED:
+                def _bg_save_files(did=deployment_db_id, uid=user_id,
+                                   fn=dest_script.name, fp=dest_script,
+                                   rt=requirements_text or "",
+                                   ev=dict(env_vars_dict),
+                                   fw=list(frameworks), pl=plan):
+                    try:
+                        file_bytes = Path(fp).read_bytes()
+                        save_deployment_files_to_github(
+                            did, uid, fn, file_bytes, rt, ev,
+                            extra_meta={"plan": pl, "frameworks": fw,
+                                        "source": "upload"})
+                    except Exception as e:
+                        print(f"⚠️  GHFiles save failed for dep#{did}: {e}")
+                threading.Thread(target=_bg_save_files, daemon=True,
+                                 name=f"GHSave-{deployment_db_id}").start()
+
             return True
         else:
             # Read the TAIL of the log — that's where the error actually is
@@ -5421,7 +5759,14 @@ def delete_deployment(deployment_id, user_id, chat_id):
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
         if deploy_folder.exists():
             shutil.rmtree(deploy_folder)
-        
+
+        # ── Remove files from GitHub deployment-files repo ────────────
+        if GITHUB_FILES_ENABLED:
+            threading.Thread(
+                target=delete_deployment_files_from_github,
+                args=(deployment_id, owner_id),
+                daemon=True, name=f"GHDel-{deployment_id}").start()
+
         c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
         conn.commit()
         conn.close()
@@ -5512,6 +5857,55 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
 
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
         dest_script   = deploy_folder / file_name
+
+        # ── Restore from GitHub if local files are missing ─────────────────
+        if GITHUB_FILES_ENABLED and (not deploy_folder.exists() or not dest_script.exists()):
+            send_message(chat_id, "🔄 Local files missing — restoring from GitHub…")
+            try:
+                restored = restore_deployment_files_from_github(
+                    deployment_id, owner_id, deploy_folder)
+                if restored['ok']:
+                    # Merge restored env vars with whatever is in the DB
+                    # (DB wins for any key present in both)
+                    db_env = {}
+                    if env_vars_json:
+                        try: db_env = json.loads(env_vars_json)
+                        except: pass
+                    merged_env = {**restored['env_vars'], **db_env}
+                    # Rewrite .env with the merged, correct vars
+                    env_file = deploy_folder / '.env'
+                    env_file.write_text(
+                        '\n'.join(f"{k}={v}" for k, v in merged_env.items()) + '\n')
+                    # If DB had no env_vars stored, update with restored ones
+                    if not db_env and merged_env:
+                        c.execute("UPDATE deployments SET env_vars=? WHERE deployment_id=?",
+                                  (json.dumps(merged_env), deployment_id))
+                        conn.commit()
+                    send_message(chat_id, f"✅ Files restored — continuing restart…")
+                    # Refresh dest_script path in case file_name changed
+                    if restored.get('file_name') and restored['file_name'] != file_name:
+                        file_name = restored['file_name']
+                        dest_script = deploy_folder / file_name
+                        c.execute("UPDATE deployments SET file_name=? WHERE deployment_id=?",
+                                  (file_name, deployment_id))
+                        conn.commit()
+                    else:
+                        dest_script = deploy_folder / file_name
+                else:
+                    conn.close()
+                    send_message(chat_id,
+                        "❌ Could not restore files from GitHub.\n\n"
+                        "Please deploy your bot again.",
+                        {"inline_keyboard": [
+                            [{"text": "🚀 Deploy New Bot", "callback_data": "deploy_new"}],
+                            [{"text": "🐙 Deploy from GitHub", "callback_data": "github_deploy"}],
+                        ]})
+                    return False
+            except Exception as restore_err:
+                print(f"⚠️  GitHub restore failed for dep#{deployment_id}: {restore_err}")
+                conn.close()
+                send_message(chat_id, "❌ Deployment folder missing — please create a new deployment.")
+                return False
 
         if not deploy_folder.exists():
             conn.close()
@@ -9380,6 +9774,82 @@ def reconcile_deployments_on_startup():
         print(f"⚠️  {counts['files_missing']} deployment(s) lost their files on this restart. "
               f"This means BASE_DIR is not on a real persistent disk — set the "
               f"PERSISTENT_DISK_PATH env var to a mounted Render Disk to fix this permanently.")
+
+
+def reconcile_deployments_on_startup():
+    """
+    Called once at startup AFTER init_db() and github_restore_db().
+
+    For every deployment marked 'active' or 'paused' in the DB, check whether
+    its local folder + bot file exist.  If not — and GitHub files storage is
+    configured — download them from the repo so restart_deployment() can
+    succeed immediately without asking the user to re-deploy.
+
+    This is the key function that makes deployments survive server restarts
+    (e.g. Render's daily free-tier recycles).
+    """
+    if not GITHUB_FILES_ENABLED:
+        print("ℹ️  GitHub files storage not configured — skipping reconciliation")
+        return
+
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        c = conn.cursor()
+        c.execute("""SELECT deployment_id, user_id, file_name, env_vars
+                     FROM deployments
+                     WHERE status IN ('active','paused')""")
+        rows = c.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  reconcile_deployments_on_startup DB error: {e}")
+        return
+
+    if not rows:
+        print("ℹ️  No active/paused deployments to reconcile")
+        return
+
+    print(f"🔄 Reconciling {len(rows)} deployment(s) against GitHub files repo…")
+    restored = missing = already_ok = 0
+
+    for dep_id, uid, file_name, env_vars_json in rows:
+        deploy_folder = get_deploy_folder(uid, dep_id)
+        dest_script   = deploy_folder / file_name if file_name else None
+
+        if dest_script and dest_script.exists():
+            already_ok += 1
+            continue   # files present — nothing to do
+
+        missing += 1
+        print(f"   ⬇️  dep#{dep_id} (user {uid}) — restoring from GitHub…")
+        result = restore_deployment_files_from_github(dep_id, uid, deploy_folder)
+
+        if result['ok']:
+            restored += 1
+            # Merge env vars: DB takes priority over .env file
+            db_env = {}
+            if env_vars_json:
+                try: db_env = json.loads(env_vars_json)
+                except: pass
+            merged_env = {**result['env_vars'], **db_env}
+            if merged_env:
+                env_file = deploy_folder / '.env'
+                env_file.write_text(
+                    '\n'.join(f"{k}={v}" for k, v in merged_env.items()) + '\n')
+            # Update DB if file_name changed (rare but possible)
+            if result.get('file_name') and result['file_name'] != file_name:
+                try:
+                    conn2 = sqlite3.connect(DATABASE_FILE, timeout=10)
+                    conn2.execute("UPDATE deployments SET file_name=? WHERE deployment_id=?",
+                                  (result['file_name'], dep_id))
+                    conn2.commit()
+                    conn2.close()
+                except Exception:
+                    pass
+        else:
+            print(f"   ⚠️  dep#{dep_id} not found in GitHub — will need re-deploy")
+
+    print(f"✅ Reconciliation done: {already_ok} ok, {restored} restored, "
+          f"{missing - restored} not found in GitHub")
 
 
 def main():
