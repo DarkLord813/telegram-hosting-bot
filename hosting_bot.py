@@ -379,7 +379,24 @@ def init_db():
         reward_given INTEGER DEFAULT 0
     )''')
 
-    c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_status ON bug_reports(status)')
+    c.execute('''CREATE TABLE IF NOT EXISTS security_reviews (
+        review_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL,
+        chat_id       INTEGER NOT NULL,
+        file_name     TEXT NOT NULL,
+        file_path     TEXT,
+        critical_json TEXT,
+        warnings_json TEXT,
+        report_text   TEXT,
+        source        TEXT DEFAULT 'upload',
+        status        TEXT DEFAULT 'pending',
+        reviewed_by   INTEGER,
+        created_at    TEXT,
+        reviewed_at   TEXT,
+        user_step_json TEXT
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sec_reviews_status ON security_reviews(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sec_reviews_user   ON security_reviews(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_bug_reports_user   ON bug_reports(user_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)')
     
@@ -411,6 +428,12 @@ def init_db():
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}")
         except Exception:
             pass
+
+    # security_reviews — backfill user_step_json for older DBs
+    try:
+        c.execute("ALTER TABLE security_reviews ADD COLUMN user_step_json TEXT")
+    except Exception:
+        pass
     
     conn.commit()
     conn.close()
@@ -4763,7 +4786,8 @@ def find_main_file(folder: Path) -> list[Path]:
 def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                        env_vars_dict, plan, duration,
                        cost_coins, cost_stars, payment_method,
-                       is_free=False, main_file_name=None):
+                       is_free=False, main_file_name=None,
+                       skip_security=False):
     """
     Full deployment flow for a GitHub repo:
     download → detect requirements → install → launch.
@@ -4835,23 +4859,82 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         update_logs(f"🎯 Entry point: {dest_script.relative_to(deploy_folder)}")
 
         # ── Security scan of the main file ───────────────────────────
-        try:
+        if skip_security:
+            update_logs("⏭️  Security scan skipped (admin-approved deployment)")
+        else:
+          try:
             scan_bytes = dest_script.read_bytes()
             blocked, crit, scan_w, scan_report = run_security_scan(scan_bytes, dest_script.name)
             if blocked:
                 update_logs(f"🚫 SECURITY BLOCK: {len(crit)} critical issue(s)")
                 for c in crit[:5]:
                     update_logs(f"  • {c}")
+
+                # Persist blocked file for admin review
+                try:
+                    pending_path = BASE_DIR / f"pending_review_{user_id}_{dest_script.name}"
+                    pending_path.write_bytes(dest_script.read_bytes())
+                except Exception:
+                    pending_path = None
+
+                gh_step_json = json.dumps({
+                    "source": "github", "owner": owner, "repo": repo,
+                    "branch": branch, "token": token or "",
+                    "env_vars": env_vars_dict, "plan": plan,
+                    "duration": duration, "cost_coins": cost_coins,
+                    "cost_stars": cost_stars, "payment_method": payment_method,
+                    "is_free": is_free,
+                })
+                conn_r = sqlite3.connect(DATABASE_FILE, timeout=10)
+                c_r = conn_r.cursor()
+                c_r.execute("""INSERT INTO security_reviews
+                    (user_id, chat_id, file_name, file_path, critical_json,
+                     warnings_json, report_text, source, status, created_at, user_step_json)
+                    VALUES (?,?,?,?,?,?,'github_deploy_blocked','github','pending',?,?)""",
+                    (user_id, chat_id, dest_script.name,
+                     str(pending_path) if pending_path else '',
+                     json.dumps(crit), json.dumps(scan_w),
+                     datetime.now().isoformat(), gh_step_json))
+                review_id = c_r.lastrowid
+                conn_r.commit()
+                conn_r.close()
+
                 edit_message(chat_id, status_message_id,
-                    f"🚫 *GitHub Deployment Blocked — Security*\n\n"
-                    f"{scan_report}\n\n"
-                    "Remove the flagged patterns from the repo and retry.",
+                    f"🔒 *Security Review Required*\n\n"
+                    f"Repo `{owner}/{repo}` triggered security checks.\n"
+                    f"An admin will review and approve or reject deployment.\n"
+                    f"🆔 Review ID: `{review_id}`",
                     {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+
+                admin_text = (
+                    f"🚨 *SECURITY REVIEW #{review_id}* (GitHub)\n\n"
+                    f"👤 User: `{user_id}`\n"
+                    f"🐙 Repo: `{owner}/{repo}@{branch}`\n"
+                    f"📁 File: `{safe_md(dest_script.name)}`\n"
+                    f"⚠️ Critical: `{len(crit)}`\n\n"
+                    + '\n'.join(f"• {safe_md(c[:120])}" for c in crit[:8])
+                    + (f"\n_...and {len(crit)-8} more_" if len(crit) > 8 else "")
+                )
+                admin_kb = {"inline_keyboard": [
+                    [{"text": "✅ Approve & Deploy",
+                      "callback_data": f"sec_approve_{review_id}"},
+                     {"text": "⚠️ Approve (warn user)",
+                      "callback_data": f"sec_approve_warn_{review_id}"}],
+                    [{"text": "❌ Reject",
+                      "callback_data": f"sec_reject_{review_id}"}],
+                    [{"text": "📋 View Full Report",
+                      "callback_data": f"sec_report_{review_id}"}],
+                ]}
+                for admin_id in ADMIN_IDS:
+                    try:
+                        send_message(admin_id, admin_text, admin_kb)
+                    except Exception:
+                        pass
                 return False
             elif scan_w:
                 update_logs(f"⚠️ Security scan: {len(scan_w)} warning(s) — proceeding")
-        except Exception as se:
-            update_logs(f"⚠️ Security scan error: {se} — proceeding anyway")
+          except Exception as se:
+              update_logs(f"⚠️ Security scan error: {se} — proceeding anyway")
 
         # ── Read code for framework detection ────────────────────────
         try:
@@ -6658,19 +6741,32 @@ def show_admin_panel(chat_id, message_id):
     )
 
     open_badge = f" ({open_bugs})" if open_bugs else ""
+
+    # Count pending security reviews
+    sec_pending = 0
+    try:
+        conn_sp = sqlite3.connect(DATABASE_FILE, timeout=5)
+        sec_pending = conn_sp.execute(
+            "SELECT COUNT(*) FROM security_reviews WHERE status='pending'").fetchone()[0]
+        conn_sp.close()
+    except Exception:
+        pass
+    sec_badge = f" ({sec_pending})" if sec_pending else ""
+
     keyboard = {
         "inline_keyboard": [
-            [{"text": f"🐛 Bug Reports{open_badge}", "callback_data": "admin_bug_reports"},
-             {"text": "👥 Referral Stats",           "callback_data": "admin_referral_stats"}],
-            [{"text": "📢 Broadcast",                "callback_data": "admin_broadcast"}],
-            [{"text": "🎫 Create Redeem Code",       "callback_data": "admin_create_code"}],
-            [{"text": "🪙 Add Coins",                "callback_data": "admin_add_coins"}],
-            [{"text": "📋 List Redeem Codes",        "callback_data": "admin_list_codes"}],
-            [{"text": "👥 List Users",               "callback_data": "admin_list_users"}],
-            [{"text": "📊 View Subscriptions",       "callback_data": "admin_subscriptions"}],
-            [{"text": "💾 Database Backup",          "callback_data": "admin_database"}],
-            [{"text": "📊 Resource Usage",           "callback_data": "admin_resources"}],
-            [{"text": "🔙 Back to Main Menu",        "callback_data": "main_menu"}]
+            [{"text": f"🔒 Security Reviews{sec_badge}", "callback_data": "admin_sec_reviews"},
+             {"text": f"🐛 Bug Reports{open_badge}",     "callback_data": "admin_bug_reports"}],
+            [{"text": "👥 Referral Stats",               "callback_data": "admin_referral_stats"},
+             {"text": "📢 Broadcast",                    "callback_data": "admin_broadcast"}],
+            [{"text": "🎫 Create Redeem Code",           "callback_data": "admin_create_code"}],
+            [{"text": "🪙 Add Coins",                    "callback_data": "admin_add_coins"}],
+            [{"text": "📋 List Redeem Codes",            "callback_data": "admin_list_codes"}],
+            [{"text": "👥 List Users",                   "callback_data": "admin_list_users"}],
+            [{"text": "📊 View Subscriptions",           "callback_data": "admin_subscriptions"}],
+            [{"text": "💾 Database Backup",              "callback_data": "admin_database"}],
+            [{"text": "📊 Resource Usage",               "callback_data": "admin_resources"}],
+            [{"text": "🔙 Back to Main Menu",            "callback_data": "main_menu"}]
         ]
     }
 
@@ -7193,7 +7289,7 @@ def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
         send_message(chat_id, msg, kb)
 
 
-def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
+def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_security=False):
     """Final step: kick off the actual GitHub deployment."""
     owner  = step.get('temp_github_owner', '')
     repo   = step.get('temp_github_repo', '')
@@ -7243,7 +7339,8 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None):
         plan=plan, duration=duration,
         cost_coins=cost_coins, cost_stars=cost_stars,
         payment_method=payment_method,
-        is_free=is_free, main_file_name=main_file_name)
+        is_free=is_free, main_file_name=main_file_name,
+        skip_security=skip_security)
 
 
 # ==================== BROADCAST SYSTEM ====================
@@ -8186,6 +8283,194 @@ def handle_callback(callback):
             daemon=True, name="Broadcast").start()
         return
 
+    # ========== SECURITY REVIEW (admin approve / reject) ==========
+    if data.startswith("sec_approve_") or data.startswith("sec_approve_warn_") \
+            or data.startswith("sec_reject_") or data.startswith("sec_report_"):
+
+        if not is_admin(user_id):
+            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
+            return
+
+        # Parse action and review_id from callback data
+        if data.startswith("sec_approve_warn_"):
+            action     = "approve_warn"
+            review_id  = int(data[len("sec_approve_warn_"):])
+        elif data.startswith("sec_approve_"):
+            action    = "approve"
+            review_id = int(data[len("sec_approve_"):])
+        elif data.startswith("sec_reject_"):
+            action    = "reject"
+            review_id = int(data[len("sec_reject_"):])
+        else:
+            action    = "report"
+            review_id = int(data[len("sec_report_"):])
+
+        # Fetch review from DB
+        conn_rv = sqlite3.connect(DATABASE_FILE, timeout=10)
+        c_rv = conn_rv.cursor()
+        c_rv.execute("""SELECT user_id, chat_id, file_name, file_path,
+                               critical_json, warnings_json, report_text,
+                               source, status, user_step_json
+                        FROM security_reviews WHERE review_id=?""", (review_id,))
+        row = c_rv.fetchone()
+
+        if not row:
+            conn_rv.close()
+            edit_message(chat_id, message_id,
+                f"❌ Review `#{review_id}` not found.",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+            return
+
+        (rv_user_id, rv_chat_id, rv_file_name, rv_file_path,
+         rv_crit_json, rv_warn_json, rv_report,
+         rv_source, rv_status, rv_step_json) = row
+
+        # Show full report
+        if action == "report":
+            conn_rv.close()
+            try:
+                crits = json.loads(rv_crit_json or "[]")
+                warns = json.loads(rv_warn_json or "[]")
+            except Exception:
+                crits, warns = [], []
+            full = (
+                f"📋 *Full Security Report — Review #{review_id}*\n\n"
+                f"*Critical ({len(crits)}):*\n"
+                + '\n'.join(f"• `{safe_md(c[:150])}`" for c in crits)
+                + (f"\n\n*Warnings ({len(warns)}):*\n"
+                   + '\n'.join(f"• {safe_md(w[:150])}" for w in warns[:10])
+                   if warns else "")
+            )
+            send_message(chat_id, full[:4000],
+                {"inline_keyboard": [
+                    [{"text": "✅ Approve & Deploy",   "callback_data": f"sec_approve_{review_id}"},
+                     {"text": "⚠️ Approve (warn)",      "callback_data": f"sec_approve_warn_{review_id}"}],
+                    [{"text": "❌ Reject",              "callback_data": f"sec_reject_{review_id}"}],
+                ]})
+            return
+
+        # Already actioned?
+        if rv_status != "pending":
+            conn_rv.close()
+            edit_message(chat_id, message_id,
+                f"ℹ️ Review `#{review_id}` is already *{rv_status}*.",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+            return
+
+        # ── REJECT ──────────────────────────────────────────────────────
+        if action == "reject":
+            c_rv.execute(
+                "UPDATE security_reviews SET status='rejected', reviewed_by=?, reviewed_at=? WHERE review_id=?",
+                (user_id, datetime.now().isoformat(), review_id))
+            conn_rv.commit()
+            conn_rv.close()
+            # Clean up pending file
+            try:
+                if rv_file_path and Path(rv_file_path).exists():
+                    Path(rv_file_path).unlink()
+            except Exception:
+                pass
+            # Tell the user
+            send_message(rv_chat_id,
+                f"❌ *Deployment Rejected*\n\n"
+                f"An admin reviewed file `{safe_md(rv_file_name)}` "
+                f"and decided it cannot be deployed due to security concerns.\n\n"
+                f"Please review the security issues and try again with a clean file.\n"
+                f"🆔 Review `#{review_id}`",
+                {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+            # Update admin message
+            edit_message(chat_id, message_id,
+                f"✅ Review `#{review_id}` — *Rejected*\n"
+                f"User `{rv_user_id}` has been notified.",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+            return
+
+        # ── APPROVE (with or without warning) ──────────────────────────
+        c_rv.execute(
+            "UPDATE security_reviews SET status=?, reviewed_by=?, reviewed_at=? WHERE review_id=?",
+            (action, user_id, datetime.now().isoformat(), review_id))
+        conn_rv.commit()
+        conn_rv.close()
+
+        # Notify user of approval
+        warn_note = (
+            "\n\n⚠️ *Note:* This file triggered security warnings. "
+            "Use it responsibly — misuse may result in account suspension."
+            if action == "approve_warn" else ""
+        )
+        send_message(rv_chat_id,
+            f"✅ *Deployment Approved!*\n\n"
+            f"Admin approved `{safe_md(rv_file_name)}`."
+            f"{warn_note}\n\n"
+            f"🚀 Starting deployment now…",
+            {"inline_keyboard": [[{"text": "⏳ Deploying…", "callback_data": "main_menu"}]]})
+
+        # Update admin message immediately
+        edit_message(chat_id, message_id,
+            f"✅ Review `#{review_id}` — *Approved*\n"
+            f"Deploying for user `{rv_user_id}`…",
+            {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+
+        # Run the actual deployment in a background thread
+        def _run_approved_deployment(
+                rv_id=review_id, rv_uid=rv_user_id, rv_cid=rv_chat_id,
+                rv_fn=rv_file_name, rv_fp=rv_file_path,
+                rv_src=rv_source, rv_step=rv_step_json):
+            try:
+                step = json.loads(rv_step) if rv_step else {}
+
+                if rv_src == "github":
+                    # Re-run GitHub deployment without the security block
+                    from pathlib import Path as _P
+                    _launch_github_deploy(
+                        rv_cid, rv_uid, step,
+                        main_file_name=rv_fn,
+                        skip_security=True)
+
+                else:
+                    # File-upload path — read saved pending file
+                    pending = _P(rv_fp) if rv_fp else None
+                    if not pending or not pending.exists():
+                        send_message(rv_cid,
+                            "❌ Approved file no longer on disk.\n"
+                            "Please upload your file again.",
+                            {"inline_keyboard": [[{"text": "🏠 Menu",
+                                                   "callback_data": "main_menu"}]]})
+                        return
+                    # Save to temp path the normal deploy flow expects
+                    temp_path = BASE_DIR / f"temp_{rv_uid}_{rv_fn}"
+                    temp_path.write_bytes(pending.read_bytes())
+                    pending.unlink(missing_ok=True)
+
+                    # Restore the user's step state so the deploy flow has
+                    # plan / duration / payment_method etc.
+                    set_user_step(rv_uid, 'awaiting_reqs',
+                                  temp_file=str(temp_path),
+                                  plan=step.get('plan'),
+                                  duration=step.get('duration'),
+                                  cost_coins=step.get('cost_coins'),
+                                  cost_stars=step.get('cost_stars'),
+                                  payment_method=step.get('payment_method'),
+                                  env_vars=step.get('env_vars', {}))
+
+                    # Proceed directly to deployment (requirements auto-detect)
+                    deploy_free_bot_with_logs(
+                        rv_cid, rv_uid,
+                        str(temp_path),
+                        step.get('requirements', ''),
+                        step.get('env_vars', {}))
+
+            except Exception as e:
+                print(f"❌ Approved deployment failed (review #{rv_id}): {e}")
+                send_message(rv_cid,
+                    f"❌ Deployment failed after approval:\n`{e}`\n\n"
+                    "Please try deploying your file again.",
+                    {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+
+        threading.Thread(target=_run_approved_deployment, daemon=True,
+                         name=f"SecApprove-{review_id}").start()
+        return
+
     # ========== BUG REPORT (user) ==========
     if data == "report_bug":
         if not is_user_verified(user_id):
@@ -8203,6 +8488,49 @@ def handle_callback(callback):
         return
 
     # ========== ADMIN BUG REPORTS ==========
+    if data == "admin_sec_reviews":
+        if not is_admin(user_id):
+            return
+        try:
+            conn_sr = sqlite3.connect(DATABASE_FILE, timeout=10)
+            c_sr = conn_sr.cursor()
+            c_sr.execute("""SELECT review_id, user_id, file_name, source,
+                                   status, created_at
+                            FROM security_reviews
+                            ORDER BY created_at DESC LIMIT 20""")
+            reviews = c_sr.fetchall()
+            pending_count = conn_sr.execute(
+                "SELECT COUNT(*) FROM security_reviews WHERE status='pending'").fetchone()[0]
+            conn_sr.close()
+        except Exception as e:
+            send_message(chat_id, f"❌ DB error: {e}")
+            return
+
+        if not reviews:
+            edit_message(chat_id, message_id,
+                "📋 *Security Reviews*\n\nNo reviews yet.",
+                {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
+            return
+
+        icons = {"pending": "⏳", "approve": "✅", "approve_warn": "⚠️", "rejected": "❌"}
+        text = f"🔒 *Security Reviews* ({pending_count} pending)\n\n"
+        buttons = []
+        for rv_id, rv_uid, rv_fn, rv_src, rv_status, rv_at in reviews:
+            icon = icons.get(rv_status, "❓")
+            dt   = datetime.fromisoformat(rv_at).strftime("%d/%m %H:%M") if rv_at else "?"
+            src_icon = "🐙" if rv_src == "github" else "📤"
+            text += f"{icon} *#{rv_id}* {src_icon} `{safe_md(rv_fn[:30])}` — user `{rv_uid}` — {dt}\n"
+            if rv_status == "pending":
+                buttons.append([
+                    {"text": f"✅ #{rv_id}",  "callback_data": f"sec_approve_{rv_id}"},
+                    {"text": f"⚠️ #{rv_id}",  "callback_data": f"sec_approve_warn_{rv_id}"},
+                    {"text": f"❌ #{rv_id}",  "callback_data": f"sec_reject_{rv_id}"},
+                ])
+
+        buttons.append([{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}])
+        edit_message(chat_id, message_id, text[:3900], {"inline_keyboard": buttons})
+        return
+
     if data == "admin_bug_reports":
         if is_admin(user_id):
             show_admin_bug_reports(chat_id, user_id, message_id)
@@ -8870,27 +9198,70 @@ def handle_message(message):
                 file_bytes_content, file_name)
 
             if blocked:
-                report_text = (
-                    f"🚫 *FILE REJECTED*\n\n"
+                # Save blocked file to disk so admin can approve and deploy it later
+                pending_path = BASE_DIR / f"pending_review_{user_id}_{file_name}"
+                try:
+                    pending_path.write_bytes(file_bytes_content)
+                except Exception:
+                    pending_path = None
+
+                # Store review record in DB
+                current_step_json = json.dumps(user_step)
+                conn_r = sqlite3.connect(DATABASE_FILE, timeout=10)
+                c_r = conn_r.cursor()
+                c_r.execute("""INSERT INTO security_reviews
+                    (user_id, chat_id, file_name, file_path, critical_json,
+                     warnings_json, report_text, source, status, created_at, user_step_json)
+                    VALUES (?,?,?,?,?,?,?,'upload','pending',?,?)""",
+                    (user_id, chat_id, file_name,
+                     str(pending_path) if pending_path else '',
+                     json.dumps(critical), json.dumps(scan_warnings),
+                     report, datetime.now().isoformat(), current_step_json))
+                review_id = c_r.lastrowid
+                conn_r.commit()
+                conn_r.close()
+
+                # Tell the user their file is under review
+                review_text = (
+                    f"🔒 *SECURITY REVIEW REQUIRED*\n\n"
+                    f"Your file `{safe_md(file_name)}` triggered security checks:\n\n"
                     f"{report}\n\n"
-                    "Your file was *not accepted* due to critical security issues.\n"
-                    "Remove the flagged patterns and try again."
+                    f"Your file has been sent to an admin for review.\n"
+                    f"You'll be notified once a decision is made.\n"
+                    f"🆔 Review ID: `{review_id}`"
                 )
                 if scan_msg_id:
-                    edit_message(chat_id, scan_msg_id, report_text,
+                    edit_message(chat_id, scan_msg_id, review_text,
                                  {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
                 else:
-                    send_message(chat_id, report_text,
+                    send_message(chat_id, review_text,
                                  {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
-                # Notify admins
+
+                # Notify every admin with Approve / Reject / Approve with Warning buttons
+                admin_text = (
+                    f"🚨 *SECURITY REVIEW #{review_id}*\n\n"
+                    f"👤 User: `{user_id}`\n"
+                    f"📁 File: `{safe_md(file_name)}`\n"
+                    f"⚠️ Critical issues: `{len(critical)}`\n"
+                    f"🔔 Warnings: `{len(scan_warnings)}`\n\n"
+                    f"*Issues found:*\n"
+                    + '\n'.join(f"• {safe_md(c[:120])}" for c in critical[:8])
+                    + (f"\n_...and {len(critical)-8} more_" if len(critical) > 8 else "")
+                    + f"\n\n*What would you like to do?*"
+                )
+                admin_kb = {"inline_keyboard": [
+                    [{"text": "✅ Approve & Deploy",
+                      "callback_data": f"sec_approve_{review_id}"},
+                     {"text": "⚠️ Approve (warn user)",
+                      "callback_data": f"sec_approve_warn_{review_id}"}],
+                    [{"text": "❌ Reject",
+                      "callback_data": f"sec_reject_{review_id}"}],
+                    [{"text": "📋 View Full Report",
+                      "callback_data": f"sec_report_{review_id}"}],
+                ]}
                 for admin_id in ADMIN_IDS:
                     try:
-                        send_message(admin_id,
-                            f"🚨 *Security block*\n"
-                            f"User: `{user_id}`\n"
-                            f"File: `{file_name}`\n"
-                            f"Issues: {len(critical)}\n\n"
-                            + '\n'.join(f'• {c}' for c in critical[:5]))
+                        send_message(admin_id, admin_text, admin_kb)
                     except Exception:
                         pass
                 return
