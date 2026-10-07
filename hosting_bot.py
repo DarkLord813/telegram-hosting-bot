@@ -1042,9 +1042,40 @@ def github_restore_db():
             print("⚠️  GitHub backup is too small — skipping restore (corrupt?)")
             return False
 
+        # Validate it is really a SQLite database before touching the live one
+        if not db_bytes.startswith(b"SQLite format 3\x00"):
+            print("⚠️  GitHub backup is not a valid SQLite file — skipping restore")
+            return False
+
         DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(DATABASE_FILE, "wb") as f:
+
+        # Write to a temp file first and run an integrity check on it
+        _tmp_restore = DATABASE_FILE.parent / (DATABASE_FILE.name + ".restore_tmp")
+        with open(_tmp_restore, "wb") as f:
             f.write(db_bytes)
+        try:
+            _chk = sqlite3.connect(_tmp_restore)
+            _ok = _chk.execute("PRAGMA integrity_check").fetchone()
+            _chk.close()
+            if not _ok or _ok[0] != "ok":
+                print(f"⚠️  GitHub backup failed integrity check ({_ok}) — skipping restore")
+                _tmp_restore.unlink(missing_ok=True)
+                return False
+        except Exception as _ie:
+            print(f"⚠️  GitHub backup unreadable ({_ie}) — skipping restore")
+            _tmp_restore.unlink(missing_ok=True)
+            return False
+
+        # Keep a safety copy of any existing live database before overwriting
+        if DATABASE_FILE.exists() and DATABASE_FILE.stat().st_size > 0:
+            try:
+                _safety = DATABASE_FILE.parent / (
+                    f"pre_github_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+                shutil.copy2(DATABASE_FILE, _safety)
+            except Exception as _se:
+                print(f"⚠️  Could not create safety copy before restore: {_se}")
+
+        os.replace(_tmp_restore, DATABASE_FILE)
 
         size_kb = len(db_bytes) / 1024
         print(f"✅ Database restored from GitHub ({size_kb:.1f} KB)")
@@ -1380,6 +1411,184 @@ def get_deployment_resource_usage(proc_pid):
     return None
 
 
+# ==================== PER-USER RESOURCE QUOTAS ====================
+# The host's total resource pool is split equally between all registered
+# (non-admin) users: e.g. 30 GB pool / 10 users = 3 GB each. Admins are not
+# limited and do not count towards the divisor.
+#   RESOURCE_POOL_GB   total pool in GB (default: 90% of the host's RAM)
+#   QUOTA_ENFORCE      1 = stop a user's biggest bot after sustained overuse
+#   QUOTA_STRIKES      consecutive 60 s checks over quota before stopping (3)
+RESOURCE_POOL_GB = os.environ.get("RESOURCE_POOL_GB", "").strip()
+QUOTA_ENFORCE    = os.environ.get("QUOTA_ENFORCE", "1") == "1"
+QUOTA_STRIKES    = int(os.environ.get("QUOTA_STRIKES", 3))
+_quota_strikes   = {}
+
+
+def get_resource_pool_mb() -> float:
+    """Total shareable pool in MB (RESOURCE_POOL_GB, else 90% of host RAM)."""
+    if RESOURCE_POOL_GB:
+        try:
+            return max(64.0, float(RESOURCE_POOL_GB) * 1024)
+        except ValueError:
+            pass
+    total_mb, _, _ = _read_proc_meminfo()
+    if not total_mb and _psutil:
+        try:
+            total_mb = _psutil.virtual_memory().total / (1024 * 1024)
+        except Exception:
+            total_mb = 0
+    return max(256.0, total_mb * 0.9) if total_mb else 1024.0
+
+
+def count_quota_users() -> int:
+    """Number of users the pool is divided between (non-admins, minimum 1)."""
+    try:
+        admin_list = list(ADMIN_IDS)
+        if admin_list:
+            q = ("SELECT COUNT(*) FROM users WHERE user_id NOT IN (%s)"
+                 % ",".join("?" * len(admin_list)))
+            row = db_execute(q, tuple(admin_list), fetch='one')
+        else:
+            row = db_execute("SELECT COUNT(*) FROM users", (), fetch='one')
+        return max(1, int(row[0]) if row and row[0] else 1)
+    except Exception:
+        return 1
+
+
+def get_user_quota_mb(user_id) -> float:
+    """This user's share of the pool in MB (admins get the whole pool)."""
+    pool = get_resource_pool_mb()
+    if is_admin(user_id):
+        return pool
+    return pool / count_quota_users()
+
+
+def format_resource(mb: float) -> str:
+    return f"{mb / 1024:.2f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+
+def get_process_tree_ram_mb(pid) -> float:
+    """RSS (MB) of a deployment's launcher AND everything it spawned."""
+    if not pid:
+        return 0.0
+    if _psutil:
+        try:
+            p = _psutil.Process(pid)
+            total = p.memory_info().rss
+            for ch in p.children(recursive=True):
+                try:
+                    total += ch.memory_info().rss
+                except Exception:
+                    pass
+            return total / (1024 * 1024)
+        except Exception:
+            return 0.0
+    # /proc fallback: deployments run under setsid, so pgid == launcher pid
+    try:
+        pgid = os.getpgid(pid)
+        own_pgid = os.getpgid(os.getpid())
+    except Exception:
+        return 0.0
+    only_self = (pgid == own_pgid)   # legacy un-isolated process: just itself
+    total_kb = 0
+    try:
+        candidates = [d for d in os.listdir('/proc') if d.isdigit()]
+    except Exception:
+        return 0.0
+    for d in candidates:
+        cpid = int(d)
+        if only_self and cpid != pid:
+            continue
+        try:
+            if not only_self and os.getpgid(cpid) != pgid:
+                continue
+            with open(f'/proc/{cpid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        total_kb += int(line.split()[1])
+                        break
+        except Exception:
+            continue
+    return total_kb / 1024
+
+
+def get_user_resource_usage_mb(user_id) -> float:
+    rows = db_execute("SELECT proc_pid FROM deployments WHERE user_id = ? "
+                      "AND status = 'active' AND proc_pid IS NOT NULL",
+                      (user_id,), fetch='all') or []
+    return sum(get_process_tree_ram_mb(r[0]) for r in rows)
+
+
+def check_user_quota(user_id):
+    """Returns (ok, used_mb, quota_mb). ok=False when the user has no headroom."""
+    quota = get_user_quota_mb(user_id)
+    if is_admin(user_id):
+        return True, get_user_resource_usage_mb(user_id), quota
+    used = get_user_resource_usage_mb(user_id)
+    return used < quota, used, quota
+
+
+def quota_exceeded_text(used_mb, quota_mb) -> str:
+    return (f"⚠️ *Resource limit reached*\n\n"
+            f"You are using `{format_resource(used_mb)}` of your "
+            f"`{format_resource(quota_mb)}` share.\n"
+            f"The host's resources are split equally between all users, so your "
+            f"share shrinks as more people join.\n\n"
+            f"Stop or delete a bot to free up resources, then try again.")
+
+
+def quota_monitor():
+    """Every 60 s: warn users over their share, stop their biggest bot if sustained."""
+    sleep(90)
+    print("✅ Resource quota monitor started")
+    while True:
+        try:
+            rows = db_execute("SELECT DISTINCT user_id FROM deployments "
+                              "WHERE status = 'active' AND proc_pid IS NOT NULL",
+                              (), fetch='all') or []
+            for (uid,) in rows:
+                if is_admin(uid):
+                    continue
+                quota = get_user_quota_mb(uid)
+                used = get_user_resource_usage_mb(uid)
+                if used <= quota:
+                    _quota_strikes.pop(uid, None)
+                    continue
+
+                strikes = _quota_strikes.get(uid, 0) + 1
+                _quota_strikes[uid] = strikes
+                if strikes == 1:
+                    try:
+                        send_message(uid,
+                            f"⚠️ *Over your resource share*\n\n"
+                            f"Using `{format_resource(used)}` of `{format_resource(quota)}`.\n"
+                            f"Reduce usage or your largest bot will be stopped in "
+                            f"~{QUOTA_STRIKES} min.")
+                    except Exception:
+                        pass
+                if QUOTA_ENFORCE and strikes >= QUOTA_STRIKES:
+                    dep_rows = db_execute("SELECT deployment_id, proc_pid FROM deployments "
+                                          "WHERE user_id = ? AND status = 'active' "
+                                          "AND proc_pid IS NOT NULL",
+                                          (uid,), fetch='all') or []
+                    if dep_rows:
+                        biggest = max(dep_rows, key=lambda r: get_process_tree_ram_mb(r[1]))
+                        stop_deployment(biggest[0])
+                        print(f"🛑 Quota: stopped deployment {biggest[0]} (user {uid})")
+                        try:
+                            send_message(uid,
+                                f"🛑 *Bot #{biggest[0]} stopped*\n\n"
+                                f"You stayed over your `{format_resource(quota)}` share.",
+                                {"inline_keyboard": [[{"text": "📦 My Deployments",
+                                                       "callback_data": "my_deployments"}]]})
+                        except Exception:
+                            pass
+                    _quota_strikes[uid] = 0
+        except Exception as e:
+            print(f"❌ Quota monitor error: {e}")
+        sleep(60)
+
+
 def get_user_balances(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -1451,6 +1660,64 @@ def is_user_premium(user_id):
         return False
     except Exception:
         return False
+
+def _wait_for_launch(deploy_folder, timeout=15, settle=3):
+    """
+    Poll pid.txt instead of sleeping a fixed time. Returns once the process
+    named in pid.txt has been alive for `settle` seconds (so an immediate
+    crash is still caught), or when `timeout` seconds have passed. Slow hosts
+    that need >5s to start Python no longer produce false "failed" results.
+    """
+    pid_file = Path(deploy_folder) / "pid.txt"
+    deadline = datetime.now().timestamp() + timeout
+    alive_since = None
+    while datetime.now().timestamp() < deadline:
+        pid = None
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+            except Exception:
+                pid = None
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except Exception:
+                alive = False
+        if alive:
+            if alive_since is None:
+                alive_since = datetime.now().timestamp()
+            elif datetime.now().timestamp() - alive_since >= settle:
+                return True
+        else:
+            alive_since = None
+        sleep(0.5)
+    return False
+
+def premium_covers_plan(user_id, plan) -> bool:
+    """
+    Whether the user's CURRENT premium tier includes a free deployment of
+    `plan`. A monthly premium subscription covers monthly deployments only;
+    a yearly subscription covers monthly and yearly. Admins cover everything.
+    """
+    if is_admin(user_id):
+        return True
+    if not is_user_premium(user_id):
+        return False
+    if plan in ("free", None):
+        return True
+    if plan == "lifetime":
+        return False  # admin-only
+    try:
+        row = db_execute("SELECT premium_plan FROM users WHERE user_id = ?",
+                         (user_id,), fetch='one')
+        tier = (row[0] if row and row[0] else "monthly").lower()
+    except Exception:
+        tier = "monthly"
+    if tier == "yearly":
+        return plan in ("monthly", "yearly")
+    return plan == "monthly"
 
 def get_free_deployment_used_count(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -1543,7 +1810,7 @@ def resume_premium_deployment(user_id, duration_days):
     # Re-run the bot
     result = subprocess.run([str(start_script)], cwd=str(deploy_folder),
                             capture_output=True, text=True)
-    sleep(5)
+    _wait_for_launch(deploy_folder, timeout=15)
 
     pid_file  = deploy_folder / "pid.txt"
     new_pid   = None
@@ -1608,7 +1875,7 @@ def continue_deployment_as_free(deployment_id, user_id, chat_id):
             pass
 
     subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
-    sleep(5)
+    _wait_for_launch(deploy_folder, timeout=15)
 
     pid_file = deploy_folder / "pid.txt"
     new_pid  = None
@@ -1790,7 +2057,13 @@ def notify_admin(message):
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
+# Records the last Telegram HTTP error code seen by send_message() on this
+# thread, so callers (e.g. broadcast) can tell a 429 rate-limit (worth
+# retrying with backoff) from a 403 "bot was blocked" (not worth retrying).
+_send_err = threading.local()
+
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
+    _send_err.code = None
     url  = f"{TELEGRAM_API}/sendMessage"
     text = str(text or '')[:4096]
     data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
@@ -1805,6 +2078,7 @@ def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
                 result = json.loads(resp.read().decode('utf-8'))
                 return result
         except urllib.error.HTTPError as e:
+            _send_err.code = e.code
             if e.code == 429:          # rate limit
                 sleep(2 * (_attempt + 1))
                 continue
@@ -2022,6 +2296,32 @@ def escape_md_v1(text: str) -> str:
     return re.sub(r'([_*`\[])', r'\\\1', str(text))
 
 
+def safe_md(text) -> str:
+    """
+    Make arbitrary text (file names, scanner findings) safe to embed in a
+    Telegram legacy-Markdown message, including inside `backtick` spans.
+    Backticks and backslashes are the only characters that can break out of
+    (or be mangled inside) a code span, so they are neutralised; any other
+    stray markup is still covered by send_message()/edit_message()'s
+    plain-text fallback on "can't parse entities".
+    """
+    if text is None:
+        return ''
+    s = str(text).replace('\\', '/').replace('`', "'")
+    return s
+
+
+def sanitize_upload_filename(name: str, default: str = "upload") -> str:
+    """
+    Reduce a user-supplied file name to a safe basename: no directories,
+    no '..', no control characters, only [A-Za-z0-9._-]. Prevents path
+    traversal when the name is used to build a path under BASE_DIR.
+    """
+    name = os.path.basename(str(name or '').replace('\\', '/'))
+    name = re.sub(r'[^A-Za-z0-9._-]', '_', name).lstrip('.')
+    return name[:120] or default
+
+
 def format_file_size(size_bytes):
     if size_bytes == 0:
         return "0 B"
@@ -2103,10 +2403,11 @@ def check_channel_membership(user_id) -> bool:
             if attempt < 2:
                 sleep(1)
 
-    # All 3 attempts failed (network issue) → let user through
-    # Better to let a user in than to permanently lock them out
-    print(f"⚠️  getChatMember failed after 3 attempts for {user_id} — auto-passing")
-    return True
+    # All 3 attempts failed (network issue) → fail CLOSED. A transient outage
+    # must not let everyone through the channel gate; the user can simply
+    # press VERIFY again. (Bot-permission/config errors are handled above.)
+    print(f"⚠️  getChatMember failed after 3 attempts for {user_id} — denying (retry later)")
+    return False
 
 
 def mark_channel_joined(user_id):
@@ -4796,6 +5097,12 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
         return False
 
+    _q_ok, _q_used, _q_total = check_user_quota(user_id)
+    if not _q_ok:
+        send_message(chat_id, quota_exceeded_text(_q_used, _q_total),
+                     {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+        return False
+
     status_msg = send_message(chat_id, "```\n🐙 GITHUB DEPLOYMENT STARTING\n```", None)
     status_message_id = status_msg.get('result', {}).get('message_id') if status_msg else None
     logs = []
@@ -4872,7 +5179,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
                 # Persist blocked file for admin review
                 try:
-                    pending_path = BASE_DIR / f"pending_review_{user_id}_{dest_script.name}"
+                    pending_path = BASE_DIR / f"pending_review_{user_id}_{sanitize_upload_filename(dest_script.name)}"
                     pending_path.write_bytes(dest_script.read_bytes())
                 except Exception:
                     pending_path = None
@@ -5106,6 +5413,13 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
     # function got called — never trust the caller alone for this check.
     if plan == "lifetime" and not is_admin(user_id):
         send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return False
+
+    _q_ok, _q_used, _q_total = check_user_quota(user_id)
+    if not _q_ok:
+        send_message(chat_id, quota_exceeded_text(_q_used, _q_total),
+                     {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+        Path(temp_file).unlink(missing_ok=True)
         return False
 
     status_msg = send_message(chat_id, "```\n🚀 STARTING DEPLOYMENT\n```", None)
@@ -5454,8 +5768,17 @@ def deploy_paid_bot(chat_id, user_id, temp_file, requirements_text, env_vars, pl
         send_verification_required(chat_id, user_id, "User", None)
         return False
     
-    if is_user_premium(user_id) or is_admin(user_id):
-        send_message(chat_id, 
+    # Central guard: lifetime is admin-only on EVERY entry point (stars, coins,
+    # premium-free), and only known plans are accepted.
+    if plan == "lifetime" and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return False
+    if plan not in ("monthly", "yearly", "lifetime"):
+        send_message(chat_id, "❌ Invalid deployment plan.")
+        return False
+
+    if premium_covers_plan(user_id, plan):
+        send_message(chat_id,
             f"*✨ PREMIUM BENEFIT ACTIVE!*\n\n"
             f"As a premium user, your {plan.upper()} deployment is *FREE*!\n\n"
             f"Proceeding with deployment...")
@@ -5605,6 +5928,15 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
             send_message(chat_id,
                 f"❌ Bot file `{file_name}` missing.\n\nPlease delete this deployment and create a new one.")
             return False
+
+        # A bot that is NOT currently running needs fresh headroom to start
+        if status != 'active':
+            _q_ok, _q_used, _q_total = check_user_quota(owner_id)
+            if not _q_ok:
+                conn.close()
+                send_message(chat_id, quota_exceeded_text(_q_used, _q_total),
+                             {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+                return False
 
         # Kill any stale process
         if proc_pid:
@@ -5944,6 +6276,65 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
     edit_message(chat_id, message_id, text, keyboard)
 
 # ========== HANDLERS ==========
+def build_main_menu_text(user_id, first_name=None) -> str:
+    """Default main-menu header: name, plan, resources, coins, projects."""
+    row = db_execute("SELECT username, first_name, premium_plan, premium_expires "
+                     "FROM users WHERE user_id = ?", (user_id,), fetch='one')
+    username, db_first, premium_plan, premium_expires = row if row else (None, None, None, None)
+    display = f"@{username}" if username else (first_name or db_first or "User")
+    display = escape_md_v1(display)
+
+    # Plan
+    if is_admin(user_id):
+        plan_line = "👑 ADMIN (unlimited)"
+    elif is_user_premium(user_id):
+        days_left = ""
+        try:
+            d = (datetime.fromisoformat(premium_expires) - datetime.now()).days
+            days_left = f" · {max(0, d)}d left"
+        except Exception:
+            pass
+        plan_line = f"⭐ PREMIUM ({(premium_plan or 'monthly').capitalize()}){days_left}"
+    else:
+        used_free = get_free_deployment_used_count(user_id)
+        plan_line = f"🆓 FREE ({used_free}/{FREE_USER_MAX_DEPLOYMENTS} slots)"
+
+    # Resources
+    used_mb = get_user_resource_usage_mb(user_id)
+    quota_mb = get_user_quota_mb(user_id)
+    pct = min(100.0, (used_mb / quota_mb * 100) if quota_mb else 0)
+    filled = int(pct / 100 * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    n_users = count_quota_users()
+    share_note = ("whole pool" if is_admin(user_id)
+                  else f"pool {format_resource(get_resource_pool_mb())} ÷ {n_users} user(s)")
+
+    # Coins & projects
+    bal = get_user_balances(user_id)
+    counts = {}
+    for status, n in (db_execute("SELECT status, COUNT(*) FROM deployments "
+                                 "WHERE user_id = ? GROUP BY status",
+                                 (user_id,), fetch='all') or []):
+        counts[status] = n
+    total_proj = sum(counts.values())
+    active = counts.get('active', 0)
+    other = total_proj - active
+
+    return (
+        f"*🤖 BOT HOSTING*\n\n"
+        f"👤 *{display}*\n"
+        f"🎫 Plan: {plan_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 *Resources:* `{format_resource(used_mb)} / {format_resource(quota_mb)}`\n"
+        f"`{bar}` {pct:.0f}%\n"
+        f"_{share_note}_\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 Coins: `{bal['coins']}`   ⭐ Stars: `{bal['stars']}`\n"
+        f"📦 Projects: `{total_proj}` (🟢 `{active}` running · ⏸️ `{other}` stopped/paused)\n\n"
+        f"Choose an option:"
+    )
+
+
 def handle_start(chat_id, user_id, username, first_name, start_param=""):
     is_new = False
     conn = sqlite3.connect(DATABASE_FILE)
@@ -5986,47 +6377,7 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
             show_tos_prompt(chat_id, user_id)
             return
 
-        balances = get_user_balances(user_id)
-        is_premium = is_user_premium(user_id)
-        used_free = get_free_deployment_used_count(user_id)
-        free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
-        
-        stats = get_system_stats()
-        server_start = stats.get('server_start_time')
-        uptime = 0
-        if server_start:
-            start_time = datetime.fromisoformat(server_start)
-            uptime = (datetime.now() - start_time).total_seconds()
-        
-        premium_badge = "⭐ PREMIUM ⭐" if is_premium else "🆓 FREE"
-        
-        conn = sqlite3.connect(DATABASE_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM deployments WHERE user_id = ? AND status = 'paused'", (user_id,))
-        paused_count = c.fetchone()[0] or 0
-        conn.close()
-        
-        welcome = (
-            f"*🤖 BOT HOSTING SERVICE*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Welcome *{first_name}*!\n"
-            f"🪙 Coins: `{balances['coins']}`\n"
-            f"⭐ Stars: `{balances['stars']}`\n"
-            f"🎫 Status: {premium_badge}\n"
-            f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
-            f"⏸️ Paused: `{paused_count}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🖥️ *Server:* Uptime `{format_uptime(uptime)}`\n"
-            f"💱 Exchange: `1⭐ = {STARS_PER_COIN}🪙`\n\n"
-            f"*⭐ Premium Benefits:*\n"
-            f"• Unlimited free deployments (24h)\n"
-            f"• FREE Monthly/Yearly deployments\n"
-            f"• Auto-resume paused bots\n\n"
-            f"💰 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
-            f"💰 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`\n"
-            f"📦 Max file size: `{MAX_FILE_SIZE_MB}MB`\n\n"
-            f"Choose an option:"
-        )
+        welcome = build_main_menu_text(user_id, first_name)
         send_message(chat_id, welcome, get_main_menu(user_id))
     else:
         send_verification_required(chat_id, user_id, first_name)
@@ -6111,6 +6462,16 @@ def handle_free_deployment(chat_id, user_id, message_id=None):
                 {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
         return
     
+    _q_ok, _q_used, _q_total = check_user_quota(user_id)
+    if not _q_ok:
+        _qt = quota_exceeded_text(_q_used, _q_total)
+        _qkb = {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]}
+        if message_id:
+            edit_message(chat_id, message_id, _qt, _qkb)
+        else:
+            send_message(chat_id, _qt, _qkb)
+        return
+
     set_user_step(user_id, 'awaiting_file', plan='free', duration=FREE_DEPLOYMENT_DURATION_HOURS,
                   cost_coins=0, cost_stars=0, payment_method='none')
     
@@ -6142,6 +6503,12 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
         send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
         return
     
+    _q_ok, _q_used, _q_total = check_user_quota(user_id)
+    if not _q_ok:
+        edit_message(chat_id, message_id, quota_exceeded_text(_q_used, _q_total),
+                     {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}]]})
+        return
+
     set_user_step(user_id, 'awaiting_file', plan=plan, duration=duration,
                   cost_coins=cost_coins, cost_stars=cost_stars, payment_method=None)
     
@@ -6157,7 +6524,7 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
             f"• Environment variables (KEY=VALUE, one per line)\n\n"
             f"*Note:* All environment variables will be available via os.environ.get('KEY')"
         )
-    elif is_user_premium(user_id) or is_admin(user_id):
+    elif premium_covers_plan(user_id, plan):
         text = (
             f"*✨ PREMIUM BENEFIT!*\n\n"
             f"Your {plan.upper()} deployment is *FREE* as a premium member!\n\n"
@@ -6306,16 +6673,23 @@ def get_main_menu(user_id):
 
 def get_deploy_menu(user_id):
     is_premium = is_user_premium(user_id)
-    
-    if is_premium or is_admin(user_id):
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "📅 Monthly (30 days) - FREE for Premium", "callback_data": "plan_monthly"}],
-                [{"text": "🌟 Yearly (365 days) - FREE for Premium", "callback_data": "plan_yearly"}],
-                [{"text": "🆓 Free Deployment (24h)", "callback_data": "free_deployment"}],
-                [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
-            ]
-        }
+    covers_monthly = premium_covers_plan(user_id, "monthly")
+    covers_yearly  = premium_covers_plan(user_id, "yearly")
+
+    if covers_monthly or covers_yearly:
+        monthly_label = ("📅 Monthly (30 days) - FREE for Premium" if covers_monthly
+                         else f"📅 Monthly (30 days) - {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
+        yearly_label  = ("🌟 Yearly (365 days) - FREE for Premium" if covers_yearly
+                         else f"🌟 Yearly (365 days) - {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
+        rows = [
+            [{"text": monthly_label, "callback_data": "plan_monthly"}],
+            [{"text": yearly_label,  "callback_data": "plan_yearly"}],
+            [{"text": "🆓 Free Deployment (24h)", "callback_data": "free_deployment"}],
+        ]
+        if not covers_yearly:
+            rows.append([{"text": "⭐ Upgrade to Yearly Premium", "callback_data": "subscribe_premium"}])
+        rows.append([{"text": "🔙 Back to Menu", "callback_data": "main_menu"}])
+        keyboard = {"inline_keyboard": rows}
     else:
         keyboard = {
             "inline_keyboard": [
@@ -7380,6 +7754,7 @@ def _tg_send_media(chat_id, media_type, file_id, caption, keyboard=None):
         print(f"❌ _tg_send_media: file_id is empty for {media_type}")
         return None
 
+    _send_err.code = None
     payload = {"chat_id": chat_id, field: file_id, "parse_mode": "Markdown"}
     if caption:
         payload["caption"] = str(caption)[:1024]
@@ -7395,6 +7770,7 @@ def _tg_send_media(chat_id, media_type, file_id, caption, keyboard=None):
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
+            _send_err.code = e.code
             if e.code == 429:
                 sleep(3 * (attempt + 1))
                 continue
@@ -7460,16 +7836,30 @@ def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
             continue
 
         try:
-            if btype == 'photo' and file_id:
-                result = _tg_send_media(uid, 'photo', file_id, caption, kb)
-            elif btype == 'video' and file_id:
-                result = _tg_send_media(uid, 'video', file_id, caption, kb)
-            else:
-                text_to_send = (caption or '').strip()
-                if not text_to_send:
-                    skipped += 1
+            text_to_send = (caption or '').strip()
+            if btype == 'text' and not text_to_send:
+                skipped += 1
+                continue
+
+            def _send_once():
+                if btype == 'photo' and file_id:
+                    return _tg_send_media(uid, 'photo', file_id, caption, kb)
+                if btype == 'video' and file_id:
+                    return _tg_send_media(uid, 'video', file_id, caption, kb)
+                return send_message(uid, text_to_send, kb)
+
+            # Exponential backoff with jitter, but only when the failure was
+            # a 429 rate-limit / transient error — never for blocked users.
+            result = None
+            for _try in range(5):
+                result = _send_once()
+                if isinstance(result, dict) and result.get('ok'):
+                    break
+                _code = getattr(_send_err, 'code', None)
+                if result is None and (_code == 429 or _code is None) and _try < 4:
+                    sleep(min(60, (2 ** _try)) + random.uniform(0, 1))
                     continue
-                result = send_message(uid, text_to_send, kb)
+                break
 
             # Both send_message and _tg_send_media return {'ok': True/False, ...}
             if isinstance(result, dict) and result.get('ok'):
@@ -7531,7 +7921,7 @@ def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
     if plan == 'free':
         set_user_step(user_id, None)
         deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements, env_vars)
-    elif is_user_premium(user_id) or is_admin(user_id):
+    elif premium_covers_plan(user_id, plan):
         set_user_step(user_id, None)
         deploy_paid_bot(chat_id, user_id, temp_file, requirements, env_vars,
                         plan, duration, 0, 0, 'premium_free')
@@ -7561,8 +7951,7 @@ def handle_callback(callback):
     # ========== MAIN MENU ==========
     if data == "main_menu":
         if is_user_verified(user_id):
-            balances = get_user_balances(user_id)
-            welcome = f"*🤖 BOT HOSTING*\n\n🪙 `{balances['coins']}` | ⭐ `{balances['stars']}`\n\nChoose:"
+            welcome = build_main_menu_text(user_id, callback['from'].get('first_name'))
             edit_message(chat_id, message_id, welcome, get_main_menu(user_id))
         else:
             user_info = get_user_info(user_id)
@@ -7875,10 +8264,20 @@ def handle_callback(callback):
                                       {"text": "🔙 Back", "callback_data": "deploy_new"}]]})
             return
         
+        if plan == "lifetime" and not is_admin(user_id):
+            send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+            return
+        if plan not in ("monthly", "yearly", "lifetime"):
+            return
+
         update_user_coins(user_id, -cost_coins, "deployment", f"plan_{plan}")
-        deploy_paid_bot(chat_id, user_id, user_step.get('temp_file'),
+        _deployed = deploy_paid_bot(chat_id, user_id, user_step.get('temp_file'),
                         user_step.get('requirements'), user_step.get('env_vars', {}),
                         plan, user_step.get('duration'), cost_coins, user_step.get('cost_stars'), 'coins')
+        if not _deployed and not premium_covers_plan(user_id, plan):
+            # Deployment failed after coins were charged — refund them.
+            update_user_coins(user_id, cost_coins, "deployment_refund", f"plan_{plan}")
+            send_message(chat_id, f"↩️ Deployment failed — `{cost_coins}🪙` refunded.")
         return
     
     # ========== REQUIREMENTS HANDLING ==========
@@ -8438,7 +8837,7 @@ def handle_callback(callback):
                                                    "callback_data": "main_menu"}]]})
                         return
                     # Save to temp path the normal deploy flow expects
-                    temp_path = BASE_DIR / f"temp_{rv_uid}_{rv_fn}"
+                    temp_path = BASE_DIR / f"temp_{rv_uid}_{sanitize_upload_filename(rv_fn)}"
                     temp_path.write_bytes(pending.read_bytes())
                     pending.unlink(missing_ok=True)
 
@@ -9094,7 +9493,7 @@ def handle_message(message):
     # Handle file upload
     if 'document' in message:
         doc = message['document']
-        file_name = doc.get('file_name', 'unknown')
+        file_name = sanitize_upload_filename(doc.get('file_name', 'unknown'), default='unknown')
         file_size = doc.get('file_size', 0)
         print(f"📁 File: {file_name} ({format_file_size(file_size)})")
 
@@ -9855,8 +10254,101 @@ def reconcile_deployments_on_startup():
               f"PERSISTENT_DISK_PATH env var to a mounted Render Disk to fix this permanently.")
 
 
+def setup_memory_compression():
+    """
+    Best-effort RAM compression via zram (compressed swap held in RAM).
+
+    Needs Linux, root, and a kernel with the zram module. Inside most managed
+    containers (Render, Heroku, Choreo, Android) this is simply not permitted,
+    so every step is guarded and failure is reported once, never raised.
+    Controlled by env:
+      ZRAM_ENABLE=1|0        (default 1)
+      ZRAM_PERCENT=50        zram device size as % of total RAM
+      ZRAM_ALGO=zstd         zstd | lz4 | lzo-rle
+    On hosts where this can't run, the same effect is achieved from outside
+    the app (e.g. the `zram-tools` package on a VPS, or simply more RAM).
+    """
+    if os.environ.get("ZRAM_ENABLE", "1") != "1":
+        return False
+    if platform.system() != "Linux" or IS_ANDROID:
+        return False
+    try:
+        if os.geteuid() != 0:
+            print("ℹ️  zram skipped: not running as root")
+            return False
+    except AttributeError:
+        return False
+
+    try:
+        # Already active? Don't stack a second device.
+        with open('/proc/swaps') as f:
+            if any(line.startswith('/dev/zram') for line in f):
+                print("✅ zram already active")
+                return True
+
+        percent = max(10, min(100, int(os.environ.get("ZRAM_PERCENT", 50))))
+        algo = os.environ.get("ZRAM_ALGO", "zstd")
+        total_mb, _, _ = _read_proc_meminfo()
+        if not total_mb:
+            return False
+        size_bytes = int(total_mb * 1024 * 1024 * percent / 100)
+
+        def _sh(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            return r.returncode == 0
+
+        if not os.path.exists('/sys/block/zram0'):
+            if not _sh(['modprobe', 'zram', 'num_devices=1']):
+                print("ℹ️  zram skipped: kernel module unavailable")
+                return False
+        if not os.path.exists('/sys/block/zram0'):
+            print("ℹ️  zram skipped: /sys/block/zram0 not present")
+            return False
+
+        # Device must be reset before (re)configuring
+        try:
+            with open('/sys/block/zram0/reset', 'w') as f:
+                f.write('1')
+        except Exception:
+            pass
+
+        try:
+            with open('/sys/block/zram0/comp_algorithm', 'w') as f:
+                f.write(algo)
+        except Exception:
+            pass  # unsupported algorithm → kernel default is fine
+        with open('/sys/block/zram0/disksize', 'w') as f:
+            f.write(str(size_bytes))
+
+        if not _sh(['mkswap', '/dev/zram0']):
+            print("ℹ️  zram skipped: mkswap failed")
+            return False
+        # High priority so it is preferred over any disk swap
+        if not _sh(['swapon', '-p', '100', '/dev/zram0']):
+            print("ℹ️  zram skipped: swapon failed")
+            return False
+
+        # zram is cheap, so let the kernel prefer it over dropping page cache
+        try:
+            with open('/proc/sys/vm/swappiness', 'w') as f:
+                f.write('100')
+            with open('/proc/sys/vm/page-cluster', 'w') as f:
+                f.write('0')
+        except Exception:
+            pass
+
+        print(f"✅ zram enabled: {size_bytes/1024/1024:.0f} MB ({algo}), swappiness=100")
+        return True
+    except Exception as e:
+        print(f"ℹ️  zram setup skipped: {e}")
+        return False
+
+
 def main():
     global LAST_UPDATE_ID
+
+    # Try to enable compressed RAM (no-op where the host doesn't allow it)
+    setup_memory_compression()
     
     if (IS_RENDER or IS_HEROKU or IS_CHOREO) and not USING_PERSISTENT_DISK:
         print("=" * 70)
@@ -9890,6 +10382,7 @@ def main():
     threading.Thread(target=_periodic_backup_thread,    daemon=True, name="PeriodicBackup").start()
     threading.Thread(target=_self_ping_thread,          daemon=True, name="KeepAlive").start()
     threading.Thread(target=_hosted_bot_watchdog,       daemon=True, name="BotWatchdog").start()
+    threading.Thread(target=quota_monitor,              daemon=True, name="QuotaMonitor").start()
     
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
