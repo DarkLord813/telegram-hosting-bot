@@ -5118,7 +5118,9 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
     try:
         # ── Free-tier GitHub deployment limit: 1 concurrent slot ────
-        if not is_user_premium(user_id) and not is_admin(user_id):
+        # Applies only to FREE-plan deployments; a paid monthly/yearly plan
+        # (or premium) is not limited to one GitHub bot.
+        if is_free and not is_user_premium(user_id) and not is_admin(user_id):
             active_gh = count_github_deployments(user_id)
             if active_gh >= 1:
                 send_message(chat_id,
@@ -7635,23 +7637,65 @@ def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
     except Exception:
         lang = ''; stars = 0
 
-    # Save state and move to env vars step
-    set_user_step(user_id, 'awaiting_env_vars',
+    summary = (
+        f"Repo:   `{owner}/{repo}`\n"
+        f"Branch: `{branch}`\n"
+        + (f"Lang:   `{lang}` | ⭐ {stars}\n" if lang else "")
+        + description
+    )
+
+    # Save state and let the user pick a plan (same choices as a file upload)
+    set_user_step(user_id, 'awaiting_github_plan',
                   temp_github_owner=owner,
                   temp_github_repo=repo,
                   temp_github_branch=branch,
                   temp_github_token=token or '',
-                  temp_plan='free',
-                  temp_duration=str(FREE_DEPLOYMENT_DURATION_HOURS),
-                  temp_source='github')
+                  temp_source='github',
+                  temp_gh_summary=summary)
+    _show_github_plan_menu(chat_id, user_id, message_id, summary)
 
+
+def _gh_plan_prices(plan):
+    """Returns (duration_days_or_0, cost_coins, cost_stars) for a paid plan."""
+    if plan == 'monthly':
+        return 30, PRICE_MONTHLY_COINS, PRICE_MONTHLY_STARS
+    if plan == 'yearly':
+        return 365, PRICE_YEARLY_COINS, PRICE_YEARLY_STARS
+    return 0, 0, 0
+
+
+def _show_github_plan_menu(chat_id, user_id, message_id, summary):
+    """Plan picker for GitHub deployments: 24h free / monthly / yearly / lifetime (admin)."""
+    def _label(plan, title, days):
+        if premium_covers_plan(user_id, plan):
+            return f"{title} ({days}) - FREE for Premium"
+        _, coins, stars = _gh_plan_prices(plan)
+        return f"{title} ({days}) - {stars}⭐ / {coins}🪙"
+
+    rows = [
+        [{"text": f"🆓 Free ({FREE_DEPLOYMENT_DURATION_HOURS}h)", "callback_data": "gh_plan_free"}],
+        [{"text": _label('monthly', '📅 Monthly', '30 days'), "callback_data": "gh_plan_monthly"}],
+        [{"text": _label('yearly',  '🌟 Yearly',  '365 days'), "callback_data": "gh_plan_yearly"}],
+    ]
+    if is_admin(user_id):
+        rows.append([{"text": "♾️ Lifetime (never expires) — ADMIN", "callback_data": "gh_plan_lifetime"}])
+    rows.append([{"text": "❌ Cancel", "callback_data": "main_menu"}])
+
+    msg = f"*🐙 REPO CONFIRMED*\n\n{summary}\n*💰 Choose a deployment plan:*"
+    kb = {"inline_keyboard": rows}
+    if message_id:
+        edit_message(chat_id, message_id, msg, kb)
+    else:
+        send_message(chat_id, msg, kb)
+
+
+def _ask_github_env_vars(chat_id, message_id, summary, plan):
+    plan_label = {'free': f"Free ({FREE_DEPLOYMENT_DURATION_HOURS}h)", 'monthly': "Monthly (30 days)",
+                  'yearly': "Yearly (365 days)", 'lifetime': "Lifetime (never expires)"}.get(plan, plan)
     msg = (
-        f"*🐙 REPO CONFIRMED*\n\n"
-        f"Repo:   `{owner}/{repo}`\n"
-        f"Branch: `{branch}`\n"
-        + (f"Lang:   `{lang}` | ⭐ {stars}\n" if lang else "")
-        + (description)
-        + f"\n✅ Now send environment variables (one per line):\n"
+        f"*🐙 REPO CONFIRMED*\n\n{summary}"
+        f"📋 Plan: *{plan_label}*\n\n"
+        f"✅ Now send environment variables (one per line):\n"
         f"`BOT_TOKEN=xxxx`\n`OTHER_VAR=value`\n\n"
         f"Or send a dot `.` to skip:"
     )
@@ -7663,7 +7707,8 @@ def _start_github_deploy(chat_id, user_id, message_id, step, token=None):
         send_message(chat_id, msg, kb)
 
 
-def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_security=False):
+def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_security=False,
+                          paid_method=None):
     """Final step: kick off the actual GitHub deployment."""
     owner  = step.get('temp_github_owner', '')
     repo   = step.get('temp_github_repo', '')
@@ -7682,31 +7727,52 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_secu
     if token:
         env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token
 
-    # Determine plan & cost from user's subscription status
-    if is_admin(user_id):
-        plan           = 'lifetime'
-        duration       = 0
-        cost_coins     = 0
-        cost_stars     = 0
-        payment_method = 'premium_free'
-        is_free        = False
-    elif is_user_premium(user_id):
-        plan           = 'monthly'
-        duration       = 30
-        cost_coins     = 0
-        cost_stars     = 0
-        payment_method = 'premium_free'
-        is_free        = False
+    # Plan chosen by the user in the plan picker (default: free)
+    plan = step.get('temp_plan') or 'free'
+    if plan not in ('free', 'monthly', 'yearly', 'lifetime'):
+        plan = 'free'
+
+    if plan == 'lifetime' and not is_admin(user_id):
+        send_message(chat_id, "⛔ Lifetime deployments are admin-only.")
+        return False
+
+    cost_coins = cost_stars = 0
+    if plan == 'free':
+        can_deploy, reason = can_use_free_deployment(user_id)
+        if not can_deploy:
+            send_message(chat_id,
+                f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}\n\nUpgrade to Premium for unlimited deployments!",
+                {"inline_keyboard": [[{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
+            return False
+        duration, payment_method, is_free = FREE_DEPLOYMENT_DURATION_HOURS, 'free', True
     else:
-        plan           = 'free'
-        duration       = FREE_DEPLOYMENT_DURATION_HOURS
-        cost_coins     = 0
-        cost_stars     = 0
-        payment_method = 'free'
-        is_free        = True
+        duration, price_coins, price_stars = _gh_plan_prices(plan)
+        is_free = False
+        if plan == 'lifetime' or premium_covers_plan(user_id, plan):
+            payment_method = 'premium_free'
+        elif paid_method in ('coins', 'stars'):
+            payment_method = paid_method
+            cost_coins = price_coins if paid_method == 'coins' else 0
+            cost_stars = price_stars if paid_method == 'stars' else 0
+        else:
+            # Needs payment first — persist everything collected so far and ask.
+            set_user_step(user_id, 'awaiting_github_payment',
+                          temp_env_vars=env_raw,
+                          temp_main_file=main_file_name or '',
+                          temp_plan=plan)
+            send_message(chat_id,
+                f"*💰 Choose Payment Method*\n\n"
+                f"Repo: `{owner}/{repo}`\n"
+                f"Plan: *{plan.upper()}* ({duration} days)\n\n"
+                f"Cost: `{price_stars}⭐` or `{price_coins}🪙`",
+                {"inline_keyboard": [
+                    [{"text": f"⭐ Pay {price_stars} Stars", "callback_data": "gh_pay_stars"}],
+                    [{"text": f"🪙 Pay {price_coins} Coins", "callback_data": "gh_pay_coins"}],
+                    [{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+            return False
 
     set_user_step(user_id, None)
-    deploy_from_github(
+    ok = deploy_from_github(
         chat_id, user_id,
         owner, repo, branch, token,
         env_vars_dict,
@@ -7715,6 +7781,11 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_secu
         payment_method=payment_method,
         is_free=is_free, main_file_name=main_file_name,
         skip_security=skip_security)
+
+    if not ok and paid_method == 'coins' and cost_coins:
+        update_user_coins(user_id, cost_coins, "deployment_refund", f"github_{plan}")
+        send_message(chat_id, f"↩️ Deployment didn't complete — `{cost_coins}🪙` refunded.")
+    return ok
 
 
 # ==================== BROADCAST SYSTEM ====================
@@ -8534,6 +8605,111 @@ def handle_callback(callback):
             {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
         return
 
+    # ---- GitHub: plan picker (free 24h / monthly / yearly / lifetime-admin) ----
+    if data.startswith("gh_plan_"):
+        plan = data[len("gh_plan_"):]
+        if plan not in ('free', 'monthly', 'yearly', 'lifetime'):
+            return
+        step = get_user_step(user_id)
+        if step.get('step') != 'awaiting_github_plan':
+            return   # stale button
+        if plan == 'lifetime' and not is_admin(user_id):
+            answer_callback(callback_id, "⛔ Admins only", show_alert=True)
+            return
+        # Resource quota is checked BEFORE any payment is offered, so nobody
+        # pays (especially with non-refundable Stars) for a deployment that
+        # would then be refused for lack of resources.
+        _q_ok, _q_used, _q_total = check_user_quota(user_id)
+        if not _q_ok:
+            edit_message(chat_id, message_id, quota_exceeded_text(_q_used, _q_total),
+                {"inline_keyboard": [[{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
+                                     [{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+            return
+        if plan == 'free':
+            can_deploy, reason = can_use_free_deployment(user_id)
+            if not can_deploy:
+                edit_message(chat_id, message_id,
+                    f"❌ *FREE DEPLOYMENT LIMIT REACHED*\n\n{reason}\n\nPick another plan or upgrade to Premium.",
+                    {"inline_keyboard": [
+                        [{"text": "🔙 Choose Plan", "callback_data": "github_replan"}],
+                        [{"text": "💰 Get Premium", "callback_data": "subscribe_premium"}]]})
+                return
+        set_user_step(user_id, 'awaiting_env_vars', temp_plan=plan, temp_source='github')
+        _ask_github_env_vars(chat_id, message_id, step.get('temp_gh_summary') or '', plan)
+        return
+
+    if data == "github_replan":
+        step = get_user_step(user_id)
+        if step.get('temp_github_owner'):
+            set_user_step(user_id, 'awaiting_github_plan')
+            _show_github_plan_menu(chat_id, user_id, message_id, step.get('temp_gh_summary') or '')
+        return
+
+    # ---- GitHub: pay for a monthly/yearly plan with coins ----
+    if data == "gh_pay_coins":
+        step = get_user_step(user_id)
+        plan = step.get('temp_plan')
+        if step.get('step') != 'awaiting_github_payment' or plan not in ('monthly', 'yearly'):
+            return
+        _days, price_coins, _stars = _gh_plan_prices(plan)
+        bal = get_user_balances(user_id)
+        if bal['coins'] < price_coins:
+            edit_message(chat_id, message_id,
+                f"❌ *INSUFFICIENT COINS*\n\nRequired: `{price_coins}🪙`\n"
+                f"Your balance: `{bal['coins']}🪙`\n\nUse a redeem code or pay with Stars!",
+                {"inline_keyboard": [[{"text": "⭐ Pay with Stars", "callback_data": "gh_pay_stars"},
+                                      {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
+            return
+        # Lock the step so a double-tap can't charge twice
+        set_user_step(user_id, 'github_paying')
+        update_user_coins(user_id, -price_coins, "deployment", f"github_{plan}")
+        edit_message(chat_id, message_id, "🪙 Payment received — starting deployment…", None)
+        _launch_github_deploy(chat_id, user_id, step,
+                              main_file_name=step.get('temp_main_file') or None,
+                              paid_method='coins')
+        return
+
+    # ---- GitHub: pay for a monthly/yearly plan with Telegram Stars ----
+    if data == "gh_pay_stars":
+        step = get_user_step(user_id)
+        plan = step.get('temp_plan')
+        if step.get('step') != 'awaiting_github_payment' or plan not in ('monthly', 'yearly'):
+            return
+        days, price_coins, price_stars = _gh_plan_prices(plan)
+        payload = f"ghdeploy_{plan}_{user_id}_{int(datetime.now().timestamp())}"
+        saved = json.dumps({k: step.get(k) for k in (
+            'temp_github_owner', 'temp_github_repo', 'temp_github_branch',
+            'temp_github_token', 'temp_env_vars', 'temp_main_file', 'temp_plan')})
+        db_execute('''INSERT INTO pending_deployments
+            (user_id, chat_id, message_id, temp_file, requirements, env_vars, plan, duration,
+             cost_coins, cost_stars, payment_method, payload, created_at, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (user_id, chat_id, message_id, 'github', saved, '{}', plan, days,
+             price_coins, price_stars, 'stars', payload, datetime.now().isoformat(), 'pending'))
+        invoice = {
+            "chat_id": chat_id,
+            "title": f"GitHub Deployment - {plan.capitalize()} Plan",
+            "description": f"Deploy {step.get('temp_github_owner')}/{step.get('temp_github_repo')} for {days} days",
+            "payload": payload, "currency": "XTR",
+            "prices": [{"label": f"{plan.capitalize()} plan", "amount": price_stars}],
+        }
+        try:
+            req = urllib.request.Request(f"{TELEGRAM_API}/sendInvoice",
+                data=json.dumps(invoice).encode('utf-8'),
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read().decode('utf-8'))
+            if res.get('ok'):
+                edit_message(chat_id, message_id,
+                    f"*⭐ STARS PAYMENT REQUIRED*\n\nPlan: {plan.capitalize()}\n"
+                    f"Cost: {price_stars}⭐\n\nComplete the payment above — your repo deploys automatically afterwards.",
+                    {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "main_menu"}]]})
+            else:
+                send_message(chat_id, f"❌ Failed: {res.get('description')}")
+        except Exception as e:
+            send_message(chat_id, f"❌ Failed to create invoice: {e}")
+        return
+
     if data == "github_public":
         step = get_user_step(user_id)
         _start_github_deploy(chat_id, user_id, message_id, step, token=None)
@@ -8821,9 +8997,21 @@ def handle_callback(callback):
                 if rv_src == "github":
                     # Re-run GitHub deployment without the security block
                     from pathlib import Path as _P
-                    _launch_github_deploy(
-                        rv_cid, rv_uid, step,
-                        main_file_name=rv_fn,
+                    # `step` was stored by deploy_from_github itself (owner/repo/
+                    # branch/plan/...), not the temp_* keys _launch_github_deploy
+                    # reads, so call deploy_from_github directly with them.
+                    deploy_from_github(
+                        rv_cid, rv_uid,
+                        step.get('owner', ''), step.get('repo', ''),
+                        step.get('branch') or 'main', step.get('token') or None,
+                        step.get('env_vars') or {},
+                        plan=step.get('plan') or 'free',
+                        duration=step.get('duration') or FREE_DEPLOYMENT_DURATION_HOURS,
+                        cost_coins=step.get('cost_coins') or 0,
+                        cost_stars=step.get('cost_stars') or 0,
+                        payment_method=step.get('payment_method') or 'free',
+                        is_free=bool(step.get('is_free')),
+                        main_file_name=None,
                         skip_security=True)
 
                 else:
@@ -9745,10 +9933,36 @@ def handle_successful_payment(message):
                 activate_premium(user_id, "yearly", total_amount, total_amount * STARS_PER_COIN, 365)
                 send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\nYearly plan active for 365 days!\nThank you! 🙏")
             return
-        
+
+        # ── Paid GitHub deployment ───────────────────────────────────
+        if invoice_payload.startswith("ghdeploy_"):
+            row = db_execute('''SELECT requirements FROM pending_deployments
+                                WHERE user_id = ? AND payload = ? AND status = 'pending'
+                                ORDER BY id DESC LIMIT 1''', (user_id, invoice_payload), fetch='one')
+            if not row:
+                send_message(chat_id, "⚠️ Payment received but the deployment details were not found. "
+                                      "Please contact an admin.")
+                return
+            db_execute("UPDATE pending_deployments SET status = 'completed' WHERE payload = ?",
+                       (invoice_payload,))
+            db_execute('''INSERT INTO star_transactions
+                (user_id, amount, transaction_type, source, reference_id, timestamp, status, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, -total_amount, "deployment_payment", "telegram_stars",
+                 None, datetime.now().isoformat(), 'completed', invoice_payload))
+            try:
+                gh_step = json.loads(row[0])
+            except Exception:
+                gh_step = {}
+            _launch_github_deploy(chat_id, user_id, gh_step,
+                                  main_file_name=gh_step.get('temp_main_file') or None,
+                                  paid_method='stars')
+            async_backup(f"stars_github_{user_id}")
+            return
+
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
-        c.execute('''SELECT temp_file, requirements, env_vars, plan, duration, cost_coins, cost_stars, payment_method 
+        c.execute('''SELECT temp_file, requirements, env_vars, plan, duration, cost_coins, cost_stars, payment_method
                      FROM pending_deployments 
                      WHERE user_id = ? AND payload = ? AND status = 'pending'
                      ORDER BY id DESC LIMIT 1''', (user_id, invoice_payload))
