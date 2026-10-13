@@ -20,6 +20,7 @@ import hashlib
 import base64
 import tempfile
 import random
+import queue
 
 # ========== CONFIGURATION ==========
 # Get configuration from environment variables (SECURE)
@@ -57,6 +58,49 @@ def is_admin(user_id) -> bool:
 # Channel verification settings (configure via env)
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@NCK_Dev")
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/NCK_Dev")
+
+# Extra channels every user must ALSO join (in addition to REQUIRED_CHANNEL above).
+_EXTRA_FORCE_JOIN = [
+    ("@ERRORX404E",   "https://t.me/ERRORX404E"),
+    ("@NCKDEVFreeSC", "https://t.me/NCKDEVFreeSC"),
+]
+
+
+def _build_required_channels():
+    """
+    The full force-join list: REQUIRED_CHANNEL (may itself be comma-separated) followed by
+    the extra channels. If REQUIRED_CHANNEL is blank/None/false/0 the gate is deliberately
+    OFF and stays off — the extras never switch it back on by themselves.
+    Returns [{"id": "@handle-or-numeric-id", "link": "https://t.me/..."}, ...]
+    """
+    primary = [p.strip() for p in (REQUIRED_CHANNEL or '').split(',')]
+    primary = [p for p in primary if p and p not in ('None', 'false', '0')]
+    if not primary:
+        return []
+    out, seen = [], set()
+
+    def add(handle, link=''):
+        handle = handle.strip()
+        if not handle.startswith('@') and not handle.lstrip('-').isdigit():
+            handle = '@' + handle
+        if handle.lower() in seen:
+            return
+        seen.add(handle.lower())
+        if not link and handle.startswith('@'):
+            link = f"https://t.me/{handle[1:]}"
+        out.append({"id": handle, "link": (link or '').strip()})
+
+    for i, h in enumerate(primary):
+        add(h, CHANNEL_LINK if i == 0 else '')
+    for h, l in _EXTRA_FORCE_JOIN:
+        add(h, l)
+    return out
+
+
+REQUIRED_CHANNELS = _build_required_channels()
+# Identifies WHICH set of channels a user verified against. When the list changes (as it just
+# did), everyone's stored signature stops matching and they are asked to verify once more.
+CHANNEL_SIGNATURE = ','.join(sorted(c["id"].lower() for c in REQUIRED_CHANNELS))
 
 # Platform detection
 IS_RENDER = os.environ.get("RENDER") == "true"
@@ -134,6 +178,31 @@ GITHUB_BACKUP_BRANCH= os.environ.get("GITHUB_BACKUP_BRANCH", "main")
 GITHUB_BACKUP_PATH  = os.environ.get("GITHUB_BACKUP_PATH", "backups/hosting_bot.db")
 GITHUB_ENABLED      = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_REPO_NAME)
 
+# ── GitHub FILES repo (every user's deployment files) ─────────────────────────
+# A second, separate repository (same owner/token/branch as the DB backup) that
+# stores, per deployment:  main file · requirements.txt / package.json · .env
+# · the bot's own .db file(s) · manifest.json.  It MUST be a PRIVATE repo — the
+# .env files hold users' bot tokens — and the bot refuses to write to a public one.
+GITHUB_FILES_REPO_NAME = os.environ.get("GITHUB_FILES_REPO_NAME", "").strip()
+FILES_REPO_ENABLED     = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_FILES_REPO_NAME)
+
+# Tuning constants (deliberately not env vars — the env surface stays as documented)
+GITHUB_API_BASE         = "https://api.github.com"
+FILES_REPO_ROOT         = "deployments"   # repo layout: deployments/<user_id>/<deployment_id>/…
+FILES_MAX_DB_MB         = 50              # per .db file   (GitHub warns >50 MB, refuses >100 MB)
+FILES_MAX_SRC_FILE_MB   = 5               # per source/data file
+FILES_MAX_TOTAL_MB      = 40              # per deployment, everything combined
+FILES_SYNC_INTERVAL_SEC = 1800            # periodic push of changed files (30 min)
+FILES_BACKUP_CHUNK      = 20              # deployments per commit during "backup all"
+FILES_REPO_SQUASH_EVERY = 50              # collapse history every N commits so DB snapshots
+                                          # can't bloat the repo forever (0 = keep full history)
+
+# Relaunch queue (restarts run one-at-a-time so RAM is not spiked)
+RELAUNCH_WORKERS        = 1
+RELAUNCH_STAGGER_SEC    = 3               # pause between two relaunches
+RELAUNCH_MIN_FREE_MB    = 256             # wait for this much free RAM before starting the next bot
+RELAUNCH_MEM_WAIT_MAX   = 120             # …but never wait longer than this (seconds)
+
 # Timeout settings
 PIP_INSTALL_TIMEOUT = int(os.environ.get("PIP_INSTALL_TIMEOUT", 600))
 
@@ -161,6 +230,18 @@ print(f"💰 Yearly: {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
 print(f"🆓 Free Tier: {FREE_USER_MAX_DEPLOYMENTS} x {FREE_DEPLOYMENT_DURATION_HOURS}h")
 print(f"📦 Max File Size: {MAX_FILE_SIZE_MB}MB")
 print(f"🐍 Python Version: {platform.python_version()}")
+# PYTHON_VERSION is the version the host (Render etc.) is told to build with. Bots' packages
+# are installed with THIS interpreter, so a mismatch means restored deployments may be
+# rebuilt against a different Python than the one the host config promises.
+_WANT_PY = os.environ.get("PYTHON_VERSION", "").strip()
+if _WANT_PY:
+    _have_py = platform.python_version()
+    _want_parts = _WANT_PY.split(".")
+    if _have_py.split(".")[:len(_want_parts)] == _want_parts:
+        print(f"✅ PYTHON_VERSION={_WANT_PY} matches the running interpreter")
+    else:
+        print(f"⚠️  PYTHON_VERSION={_WANT_PY} but the running interpreter is {_have_py} — "
+              f"the host is not using the version you configured")
 print("=" * 70)
 print("✨ ENHANCED FEATURES:")
 print("   ✓ Supports ANY Python bot (Telegram, Discord, Flask, FastAPI, etc.)")
@@ -407,6 +488,7 @@ def init_db():
         ("referred_by",    "INTEGER"),
         ("total_referrals","INTEGER DEFAULT 0"),
         ("pending_json",   "TEXT DEFAULT '{}'"),
+        ("channels_verified", "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}" if _col == "folder_name"
@@ -1174,6 +1256,941 @@ def _periodic_backup_thread():
         sleep(1800)   # 30 minutes
 
 
+# ==================== GITHUB FILES REPO (per-deployment storage) ====================
+#
+# Layout inside GITHUB_FILES_REPO_NAME (branch = GITHUB_BACKUP_BRANCH):
+#
+#   deployments/<user_id>/<deployment_id>/bot.py             main file (whatever the user called it)
+#   deployments/<user_id>/<deployment_id>/requirements.txt   …or package.json for Node bots
+#   deployments/<user_id>/<deployment_id>/.env              this deployment's env vars (paired by folder)
+#   deployments/<user_id>/<deployment_id>/bot.db             the bot's own SQLite file(s), consistent snapshot
+#   deployments/<user_id>/<deployment_id>/manifest.json      what is what (main file, runtime, plan, expiry…)
+#
+# Everything is written with the Git Data API, so one deployment (or a whole chunk of
+# them) is a SINGLE commit, and only files whose content actually changed are uploaded.
+
+_files_lock         = threading.RLock()     # serialises every write to the files repo
+_files_remote       = {}                    # (uid, dep) -> {repo_path: blob_sha}  (our view of the repo)
+_files_commit_count = 0
+_files_repo_state   = {"checked": 0.0, "ok": False, "reason": "not checked yet"}
+_files_public_warned = False
+
+_NODE_EXTS = ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
+_DB_SUFFIXES = {'.db', '.sqlite', '.sqlite3', '.db3'}
+_FILES_SKIP_DIRS = {'packages', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
+                    '.cache', '.npm', '.pnpm-store', 'site-packages', '.idea', '.vscode'}
+_FILES_SKIP_NAMES = {'start.sh', 'pid.txt', 'output.log', 'nohup.out', '.env', '.DS_Store'}
+_FILES_SKIP_SUFFIXES = {'.pyc', '.pyo', '.log', '.pid', '.lock', '.tmp', '.swp'}
+_FILES_SKIP_ENDINGS = ('-wal', '-shm', '-journal')          # SQLite side files (merged by the snapshot)
+_DEP_MANIFEST_NAMES = {'requirements.txt', 'requirements-dev.txt', 'requirements_prod.txt',
+                       'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+                       'pyproject.toml', 'Pipfile', 'Pipfile.lock', 'runtime.txt'}
+
+
+def _gh_files_api(method, path="", payload=None, timeout=60):
+    """GitHub REST call against the FILES repo. Retries rate limits / 5xx. -> (status, json)."""
+    base = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_FILES_REPO_NAME}"
+    url = base + (("/" + path.lstrip("/")) if path else "")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "BotHostingPlatform/1.0",
+    }
+    body = json.dumps(payload).encode() if payload is not None else None
+    last = (0, {"error": "no attempt made"})
+    for attempt in range(4):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as e:
+            try:
+                data = json.loads(e.read() or b"{}")
+            except Exception:
+                data = {}
+            last = (e.code, data)
+            msg = str(data.get("message", "")).lower()
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            transient = (e.code in (429, 500, 502, 503, 504)
+                         or (e.code == 403 and ("rate limit" in msg or "abuse" in msg)))
+            if transient and attempt < 3:
+                wait = min(60, int(retry_after)) if retry_after and str(retry_after).isdigit() else 2 ** (attempt + 1)
+                sleep(wait + random.uniform(0, 1))
+                continue
+            return last
+        except Exception as ex:
+            last = (0, {"error": str(ex)})
+            if attempt < 3:
+                sleep(2 ** attempt)
+                continue
+            return last
+    return last
+
+
+def _files_repo_ready(force=False) -> bool:
+    """
+    True only when the files repo exists, the token can reach it, and it is PRIVATE.
+    A public repo is refused outright: it would publish every user's .env (bot tokens,
+    API keys) and databases to the internet.
+    """
+    global _files_public_warned
+    if not FILES_REPO_ENABLED:
+        return False
+    st = _files_repo_state
+    now = datetime.now().timestamp()
+    if not force:
+        if st["ok"] and now - st["checked"] < 600:
+            return True
+        if not st["ok"] and now - st["checked"] < 60:
+            return False
+    status, repo = _gh_files_api("GET")
+    st["checked"] = now
+    if status == 200:
+        if repo.get("private") is True:
+            st.update(ok=True, reason="ok (private repo)")
+            return True
+        st.update(ok=False, reason="repository is PUBLIC — refusing to store .env files and databases in it")
+        print(f"🚫 {GITHUB_REPO_OWNER}/{GITHUB_FILES_REPO_NAME} is PUBLIC — files backup disabled. "
+              f"Make the repository private.")
+        if not _files_public_warned:
+            _files_public_warned = True
+            try:
+                notify_admin(f"🚫 *Files repo is PUBLIC*\n\n`{GITHUB_REPO_OWNER}/{GITHUB_FILES_REPO_NAME}` "
+                             f"is public, so deployment backups are *disabled* (they contain users' "
+                             f"`.env` secrets). Set the repository to *private* and they resume automatically.")
+            except Exception:
+                pass
+        return False
+    reasons = {
+        404: "repository not found — create it (private) and give the token access to it",
+        401: "GitHub token rejected (401)",
+        403: "GitHub token has no access to the files repository (403)",
+    }
+    st.update(ok=False, reason=reasons.get(status, f"GitHub HTTP {status}: {repo.get('message', repo.get('error', ''))}"))
+    print(f"⚠️  Files repo not usable: {st['reason']}")
+    return False
+
+
+def _files_prefix(user_id, deployment_id) -> str:
+    return f"{FILES_REPO_ROOT}/{int(user_id)}/{int(deployment_id)}"
+
+
+def _git_blob_sha(data: bytes) -> str:
+    """The SHA GitHub would assign to this content as a git blob (lets us diff without downloading)."""
+    return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+
+
+def _files_list_remote(prefix: str) -> dict:
+    """{repo_path: blob_sha} for every file under `prefix` (Contents API, recursive). Raises on API errors."""
+    out, stack = {}, [prefix]
+    ref = urllib.parse.quote(GITHUB_BACKUP_BRANCH, safe="")
+    while stack:
+        d = stack.pop()
+        status, items = _gh_files_api("GET", f"contents/{urllib.parse.quote(d)}?ref={ref}")
+        if status == 404:
+            continue
+        if status != 200 or not isinstance(items, list):
+            raise RuntimeError(f"listing {d} failed (HTTP {status})")
+        for it in items:
+            if it.get("type") == "dir":
+                stack.append(it["path"])
+            elif it.get("type") == "file":
+                out[it["path"]] = it["sha"]
+    return out
+
+
+def _files_fetch_blob(sha: str):
+    status, data = _gh_files_api("GET", f"git/blobs/{sha}", timeout=120)
+    if status != 200:
+        return None
+    try:
+        if data.get("encoding") == "base64":
+            return base64.b64decode(data.get("content", ""))
+        return str(data.get("content", "")).encode()
+    except Exception:
+        return None
+
+
+def _files_ensure_branch():
+    """Return the head commit SHA of the backup branch, creating the branch / initialising an empty repo."""
+    ref_path = "git/ref/heads/" + urllib.parse.quote(GITHUB_BACKUP_BRANCH)
+    status, ref = _gh_files_api("GET", ref_path)
+    if status == 200:
+        return ref["object"]["sha"]
+    status, repo = _gh_files_api("GET")
+    default = (repo or {}).get("default_branch", "main") if status == 200 else "main"
+    status, dref = _gh_files_api("GET", "git/ref/heads/" + urllib.parse.quote(default))
+    if status != 200:
+        # Completely empty repository: the Git Data API refuses to work until it has a first commit.
+        _gh_files_api("PUT", "contents/README.md", {
+            "message": "init: deployment storage",
+            "content": base64.b64encode(
+                b"# Deployment storage\n\nManaged automatically by the hosting bot. "
+                b"Do not edit by hand. Keep this repository PRIVATE.\n").decode(),
+        })
+        status, dref = _gh_files_api("GET", "git/ref/heads/" + urllib.parse.quote(default))
+        if status != 200:
+            print(f"⚠️  Files repo: could not initialise (HTTP {status})")
+            return None
+    sha = dref["object"]["sha"]
+    if default == GITHUB_BACKUP_BRANCH:
+        return sha
+    status, _ = _gh_files_api("POST", "git/refs", {"ref": f"refs/heads/{GITHUB_BACKUP_BRANCH}", "sha": sha})
+    return sha if status in (200, 201) else None
+
+
+def _files_squash():
+    """Replace the branch history with one commit of the current tree (keeps the repo small)."""
+    head = _files_ensure_branch()
+    if not head:
+        return False
+    status, commit = _gh_files_api("GET", f"git/commits/{head}")
+    if status != 200:
+        return False
+    status, new = _gh_files_api("POST", "git/commits", {
+        "message": f"squash history — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "tree": commit["tree"]["sha"], "parents": []})
+    if status not in (200, 201):
+        return False
+    status, _ = _gh_files_api("PATCH", "git/refs/heads/" + urllib.parse.quote(GITHUB_BACKUP_BRANCH),
+                              {"sha": new["sha"], "force": True})
+    if status == 200:
+        print("🗜️  Files repo history squashed")
+    return status == 200
+
+
+def _files_commit(changes: dict, message: str) -> bool:
+    """
+    Apply {repo_path: bytes | None} as ONE commit (None = delete the path).
+    Callers hold _files_lock. Retries if the branch moved underneath us.
+    """
+    global _files_commit_count
+    if not changes:
+        return True
+    for _attempt in range(3):
+        head = _files_ensure_branch()
+        if not head:
+            return False
+        status, commit = _gh_files_api("GET", f"git/commits/{head}")
+        if status != 200:
+            return False
+        entries = []
+        for path, data in changes.items():
+            if data is None:
+                entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+                continue
+            status, blob = _gh_files_api("POST", "git/blobs", {
+                "content": base64.b64encode(data).decode(), "encoding": "base64"}, timeout=180)
+            if status not in (200, 201):
+                print(f"⚠️  Files repo: blob upload failed for {path} (HTTP {status})")
+                return False
+            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+        status, tree = _gh_files_api("POST", "git/trees", {"base_tree": commit["tree"]["sha"], "tree": entries})
+        if status not in (200, 201):
+            print(f"⚠️  Files repo: tree failed (HTTP {status}: {tree.get('message', '')})")
+            return False
+        status, new = _gh_files_api("POST", "git/commits", {
+            "message": message[:200], "tree": tree["sha"], "parents": [head]})
+        if status not in (200, 201):
+            return False
+        status, _ = _gh_files_api("PATCH", "git/refs/heads/" + urllib.parse.quote(GITHUB_BACKUP_BRANCH),
+                                  {"sha": new["sha"], "force": False})
+        if status == 200:
+            _files_commit_count += 1
+            if FILES_REPO_SQUASH_EVERY and _files_commit_count >= FILES_REPO_SQUASH_EVERY:
+                if _files_squash():
+                    _files_commit_count = 0
+            return True
+        if status != 422:       # 422 = branch moved; anything else is a real failure
+            return False
+    return False
+
+
+def _is_platform_launcher(p: Path) -> bool:
+    """run.py written by the platform (not the user's own run.py)."""
+    try:
+        if p.stat().st_size > 1_000_000:
+            return False
+        return b"_HOSTING_BOT_KEYS" in p.read_bytes()
+    except Exception:
+        return False
+
+
+def _looks_like_sqlite(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except Exception:
+        return False
+
+
+def _sqlite_consistent_bytes(p: Path) -> bytes:
+    """Snapshot a possibly-in-use SQLite file via SQLite's own backup API (WAL-safe, never torn)."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        src = sqlite3.connect(f"{p.resolve().as_uri()}?mode=ro", uri=True, timeout=15)
+        try:
+            dst = sqlite3.connect(tmp)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        return Path(tmp).read_bytes()
+    except Exception as e:
+        print(f"⚠️  SQLite snapshot of {p.name} failed ({e}) — using a raw copy")
+        return p.read_bytes()
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _env_dict_to_text(env_vars: dict) -> str:
+    return ''.join(f"{k}={v}\n" for k, v in (env_vars or {}).items())
+
+
+def _parse_env_text(text: str) -> dict:
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, _, v = line.partition('=')
+        k = k.strip()
+        if k:
+            out[k] = v.strip()
+    return out
+
+
+def _files_snapshot(deployment_id):
+    """
+    Build what should live in the repo for this deployment from local disk + the platform DB.
+    Returns None when there is nothing trustworthy to save (no row, no folder, or main file
+    missing — a wiped folder must never be allowed to delete the repo copy).
+    """
+    row = db_execute("""SELECT user_id, file_name, env_vars, plan, is_free, start_time, expire_time,
+                               folder_name, source_type, github_repo, github_branch
+                        FROM deployments WHERE deployment_id = ?""", (deployment_id,), fetch='one')
+    if not row:
+        return None
+    (uid, file_name, env_json, plan, is_free, start_time, expire_time,
+     folder_name, source_type, gh_repo, gh_branch) = row
+    folder = get_deploy_folder(uid, deployment_id)
+    main_rel = (file_name or "").replace("\\", "/")
+    if not folder.exists() or not main_rel or not (folder / main_rel).exists():
+        return None
+    try:
+        env_vars = json.loads(env_json) if env_json else {}
+        if not isinstance(env_vars, dict):
+            env_vars = {}
+    except Exception:
+        env_vars = {}
+
+    candidates = []   # (priority, size, rel, path)
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in _FILES_SKIP_DIRS]
+        for name in names:
+            p = Path(root) / name
+            rel = p.relative_to(folder).as_posix()
+            if (name in _FILES_SKIP_NAMES or p.suffix.lower() in _FILES_SKIP_SUFFIXES
+                    or name.endswith(_FILES_SKIP_ENDINGS) or p.is_symlink()):
+                continue
+            if name == 'run.py' and _is_platform_launcher(p):
+                continue
+            try:
+                size = p.stat().st_size
+            except Exception:
+                continue
+            is_db = p.suffix.lower() in _DB_SUFFIXES and _looks_like_sqlite(p)
+            if rel == main_rel:
+                prio = 0
+            elif name in _DEP_MANIFEST_NAMES:
+                prio = 1
+            elif is_db:
+                prio = 2
+            else:
+                prio = 3
+            candidates.append((prio, size, rel, p, is_db))
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+
+    files, skipped, total = {}, [], 0
+    db_files, dep_files = [], []
+    for prio, size, rel, p, is_db in candidates:
+        limit = (FILES_MAX_DB_MB if is_db else FILES_MAX_SRC_FILE_MB) * 1024 * 1024
+        if size > limit or total + size > FILES_MAX_TOTAL_MB * 1024 * 1024:
+            skipped.append(rel)
+            continue
+        try:
+            data = _sqlite_consistent_bytes(p) if is_db else p.read_bytes()
+        except Exception:
+            skipped.append(rel)
+            continue
+        files[rel] = data
+        total += len(data)
+        if is_db:
+            db_files.append(rel)
+        if p.name in _DEP_MANIFEST_NAMES:
+            dep_files.append(rel)
+
+    files['.env'] = _env_dict_to_text(env_vars).encode()
+    is_node = Path(main_rel).suffix.lower() in _NODE_EXTS
+    manifest = {
+        "version": 1, "deployment_id": int(deployment_id), "user_id": int(uid),
+        "file_name": main_rel, "folder_name": folder_name,
+        "runtime": "node" if is_node else "python",
+        "plan": plan, "is_free": bool(is_free),
+        "start_time": start_time, "expire_time": expire_time,
+        "source_type": source_type, "github_repo": gh_repo, "github_branch": gh_branch,
+        "dependency_files": sorted(dep_files), "db_files": sorted(db_files),
+        "env_keys": sorted(env_vars.keys()),
+        "truncated": bool(skipped), "skipped": skipped[:50],
+    }
+    files['manifest.json'] = json.dumps(manifest, indent=2, sort_keys=True).encode()
+    return {"uid": int(uid), "deployment_id": int(deployment_id), "files": files,
+            "skipped": skipped, "manifest": manifest}
+
+
+def _files_plan(deployment_id):
+    """Diff the local snapshot against the repo. Returns a plan dict, or None if nothing to save."""
+    snap = _files_snapshot(deployment_id)
+    if not snap:
+        return None
+    key = (snap["uid"], snap["deployment_id"])
+    prefix = _files_prefix(*key)
+    remote = _files_remote.get(key)
+    if remote is None:
+        remote = _files_list_remote(prefix)
+        _files_remote[key] = remote
+    changes, new_remote = {}, {}
+    for rel, data in snap["files"].items():
+        path = f"{prefix}/{rel}"
+        sha = _git_blob_sha(data)
+        new_remote[path] = sha
+        if remote.get(path) != sha:
+            changes[path] = data
+    keep = {f"{prefix}/{s}" for s in snap["skipped"]}   # too big to upload now → keep the last good copy
+    for path, sha in remote.items():
+        if path in new_remote:
+            continue
+        if path in keep:
+            new_remote[path] = sha
+        else:
+            changes[path] = None
+    return {"key": key, "changes": changes, "new_remote": new_remote, "skipped": snap["skipped"]}
+
+
+def files_repo_save_deployment(deployment_id, reason="auto") -> dict:
+    """Push one deployment (changed files only) to the files repo. Never raises."""
+    res = {"ok": False, "changed": 0, "skipped": [], "error": None}
+    if not _files_repo_ready():
+        res["error"] = _files_repo_state["reason"]
+        return res
+    with _files_lock:
+        try:
+            plan = _files_plan(deployment_id)
+            if plan is None:
+                res["error"] = "nothing to save (deployment or its main file is missing)"
+                return res
+            if plan["changes"] and not _files_commit(
+                    plan["changes"], f"deployment {deployment_id} (user {plan['key'][0]}): {reason}"):
+                res["error"] = "commit to GitHub failed"
+                _files_remote.pop(plan["key"], None)     # re-list next time rather than trust a stale view
+                return res
+            _files_remote[plan["key"]] = plan["new_remote"]
+            res.update(ok=True, changed=len(plan["changes"]), skipped=plan["skipped"])
+            if plan["skipped"]:
+                print(f"⚠️  dep#{deployment_id}: {len(plan['skipped'])} file(s) over the size caps were not saved")
+        except Exception as e:
+            res["error"] = str(e)
+            print(f"⚠️  files_repo_save_deployment({deployment_id}): {e}")
+    return res
+
+
+def files_repo_backup(deployment_ids, reason="backup", progress=None, refresh=False) -> dict:
+    """
+    Save many deployments, batching them into few commits.
+    progress(i, total, stats) is called after each deployment.
+    refresh=True forgets our cached view of the repo and re-reads it from GitHub, so a
+    repo that was wiped or edited outside the bot is fully re-populated (used by the
+    manual admin backup — "already up to date" must mean up to date on GitHub itself).
+    """
+    ids = list(deployment_ids)
+    stats = {"total": len(ids), "saved": 0, "unchanged": 0, "failed": 0,
+             "no_files": 0, "oversized": 0, "error": None}
+    if not _files_repo_ready(force=refresh):
+        stats["error"] = _files_repo_state["reason"]
+        return stats
+    with _files_lock:
+        if refresh:
+            _files_remote.clear()
+        batch_changes, batch_plans, batch_bytes = {}, [], 0
+
+        def flush():
+            nonlocal batch_changes, batch_plans, batch_bytes
+            if not batch_plans:
+                return
+            ok = _files_commit(batch_changes, f"{reason}: {len(batch_plans)} deployment(s)")
+            for p in batch_plans:
+                if ok:
+                    _files_remote[p["key"]] = p["new_remote"]
+                    stats["saved"] += 1
+                else:
+                    _files_remote.pop(p["key"], None)
+                    stats["failed"] += 1
+            batch_changes, batch_plans, batch_bytes = {}, [], 0
+
+        for i, dep in enumerate(ids, 1):
+            try:
+                plan = _files_plan(dep)
+            except Exception as e:
+                print(f"⚠️  backup dep#{dep}: {e}")
+                stats["failed"] += 1
+                plan = False
+            if plan is None:
+                stats["no_files"] += 1
+            elif plan:
+                stats["oversized"] += len(plan["skipped"])
+                if not plan["changes"]:
+                    _files_remote[plan["key"]] = plan["new_remote"]
+                    stats["unchanged"] += 1
+                else:
+                    batch_plans.append(plan)
+                    batch_changes.update(plan["changes"])
+                    batch_bytes += sum(len(v) for v in plan["changes"].values() if v)
+                    if len(batch_plans) >= FILES_BACKUP_CHUNK or batch_bytes >= 64 * 1024 * 1024:
+                        flush()
+            if progress:
+                try:
+                    progress(i, len(ids), stats)
+                except Exception:
+                    pass
+        flush()
+    return stats
+
+
+def files_repo_delete_deployment(user_id, deployment_id) -> bool:
+    """Remove a deployment's folder from the files repo (one commit). True when it is gone."""
+    if not _files_repo_ready():
+        return False
+    with _files_lock:
+        try:
+            remote = _files_list_remote(_files_prefix(user_id, deployment_id))
+            ok = True
+            if remote:
+                ok = _files_commit({p: None for p in remote},
+                                   f"delete deployment {deployment_id} (user {user_id})")
+            if ok:
+                _files_remote.pop((int(user_id), int(deployment_id)), None)
+            return ok
+        except Exception as e:
+            print(f"⚠️  files_repo_delete_deployment({deployment_id}): {e}")
+            return False
+
+
+def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log=print):
+    """
+    Download a deployment's files from the repo into dest_folder.
+    Returns {"files": n, "manifest": {...}} or None (nothing stored / any download failed).
+    """
+    if not _files_repo_ready():
+        return None
+    prefix = _files_prefix(user_id, deployment_id)
+    with _files_lock:
+        try:
+            remote = _files_list_remote(prefix)
+        except Exception as e:
+            log(f"⚠️ Could not list the backup: {e}")
+            return None
+        if not remote:
+            return None
+        dest_folder = Path(dest_folder)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        manifest, written = {}, 0
+        for path, sha in sorted(remote.items()):
+            rel = path[len(prefix) + 1:]
+            parts = rel.split('/')
+            if not rel or rel.startswith('/') or '..' in parts or '' in parts:
+                log(f"⚠️ Skipping unsafe path in backup: {path!r}")
+                continue
+            data = _files_fetch_blob(sha)
+            if data is None:
+                log(f"❌ Could not download {rel} — aborting restore")
+                return None          # all-or-nothing: a half-restored bot must not look complete
+            target = dest_folder / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            written += 1
+            if rel == 'manifest.json':
+                try:
+                    manifest = json.loads(data.decode('utf-8', 'ignore'))
+                except Exception:
+                    manifest = {}
+        _files_remote[(int(user_id), int(deployment_id))] = remote
+        log(f"♻️ Restored {written} file(s) from the GitHub backup")
+        return {"files": written, "manifest": manifest}
+
+
+def _install_deps_for_folder(deploy_folder: Path, dest_script: Path, log=print, only_if_missing=False) -> bool:
+    """
+    (Re)install what the deployment needs, from the manifests/code now on disk:
+      Python → requirements.txt / pyproject / Pipfile, then any import the manifests missed
+      Node   → package.json (auto-generated from require()/import when absent) via npm/yarn/pnpm/bun
+    only_if_missing=True skips the work when dependencies are already in place.
+    """
+    deploy_folder, dest_script = Path(deploy_folder), Path(dest_script)
+    try:
+        code = dest_script.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        code = ""
+    try:
+        if dest_script.suffix.lower() in _NODE_EXTS:
+            pkg = deploy_folder / 'package.json'
+            if not pkg.exists():
+                js = scan_js_requires(code)
+                if js:
+                    build_package_json(deploy_folder, js, dest_script.name, log)
+            if not pkg.exists():
+                return True
+            if only_if_missing and (deploy_folder / 'node_modules').exists():
+                return True
+            return bool(_install_npm(deploy_folder, log))
+
+        packages_dir = deploy_folder / 'packages'
+        if only_if_missing:
+            has_manifest = any((deploy_folder / f).exists()
+                               for f in ('requirements.txt', 'pyproject.toml', 'Pipfile'))
+            populated = packages_dir.exists() and any(packages_dir.iterdir())
+            if populated or not has_manifest:
+                return True
+        packages_dir.mkdir(exist_ok=True)
+        installed = install_from_repo_requirements(deploy_folder, log) or []
+        already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower() for r in installed}
+        auto = UniversalDependencyInstaller.scan_imports(code, log)
+        gap = [a for a in auto if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in already]
+        if gap:
+            log(f"📦 Installing {len(gap)} import(s) not covered by the manifests: {', '.join(gap)}")
+            tmp = deploy_folder / '_autodetect_gap_reqs.txt'
+            tmp.write_text('\n'.join(gap))
+            try:
+                install_dependencies_enhanced(tmp, log, packages_dir)
+            finally:
+                tmp.unlink(missing_ok=True)
+        return True
+    except Exception as e:
+        log(f"⚠️ Dependency install error: {e}")
+        return False
+
+
+def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, dest_script: Path, log=print):
+    """
+    Pull a deployment whose files are gone from the files repo and reinstall its dependencies.
+    Returns (ok, env_dict_or_None).
+    """
+    if not FILES_REPO_ENABLED:
+        return False, None
+    existed = deploy_folder.exists()
+    try:
+        info = files_repo_restore_deployment(owner_id, deployment_id, deploy_folder, log)
+    except Exception as e:
+        log(f"⚠️ Restore error: {e}")
+        info = None
+    if not info or not dest_script.exists():
+        if not existed:
+            shutil.rmtree(deploy_folder, ignore_errors=True)   # never leave a half-restored folder behind
+        return False, None
+    if (info.get("manifest") or {}).get("truncated"):
+        log("⚠️ This backup was truncated (some files exceeded the size caps)")
+    _install_deps_for_folder(deploy_folder, dest_script, log)
+    env = None
+    try:
+        env = _parse_env_text((deploy_folder / '.env').read_text(errors='replace'))
+    except Exception:
+        pass
+    return True, env
+
+
+# ---- background worker so saves/deletes never block the bot ------------------
+_files_jobs         = queue.Queue()
+_files_jobs_pending = set()
+_files_jobs_lock    = threading.Lock()
+_files_worker_on    = False
+
+
+def _files_init_tables():
+    db_execute("""CREATE TABLE IF NOT EXISTS files_repo_pending_delete (
+                    user_id INTEGER, deployment_id INTEGER, created_at TEXT,
+                    PRIMARY KEY (user_id, deployment_id))""")
+
+
+def _files_worker():
+    while True:
+        job = _files_jobs.get()
+        try:
+            if job[0] == 'save':
+                files_repo_save_deployment(job[1], job[2])
+            elif job[0] == 'delete':
+                if files_repo_delete_deployment(job[1], job[2]):
+                    db_execute("DELETE FROM files_repo_pending_delete WHERE user_id=? AND deployment_id=?",
+                               (job[1], job[2]))
+        except Exception as e:
+            print(f"⚠️  Files worker error: {e}")
+        finally:
+            with _files_jobs_lock:
+                _files_jobs_pending.discard((job[0],) + tuple(job[1:3] if job[0] == 'delete' else job[1:2]))
+            _files_jobs.task_done()
+
+
+def _files_enqueue(job):
+    global _files_worker_on
+    if not FILES_REPO_ENABLED:
+        return
+    key = (job[0],) + tuple(job[1:3] if job[0] == 'delete' else job[1:2])
+    with _files_jobs_lock:
+        if key in _files_jobs_pending:
+            return
+        _files_jobs_pending.add(key)
+        if not _files_worker_on:
+            _files_worker_on = True
+            threading.Thread(target=_files_worker, daemon=True, name="FilesRepoWorker").start()
+    _files_jobs.put(job)
+
+
+def files_repo_async_save(deployment_id, reason="auto"):
+    """Fire-and-forget save of one deployment."""
+    _files_enqueue(('save', int(deployment_id), reason))
+
+
+def files_repo_async_delete(user_id, deployment_id):
+    """Fire-and-forget removal. Remembered in the DB so a failed/lost attempt is retried later."""
+    if not FILES_REPO_ENABLED:
+        return
+    db_execute("INSERT OR IGNORE INTO files_repo_pending_delete (user_id, deployment_id, created_at) VALUES (?,?,?)",
+               (int(user_id), int(deployment_id), datetime.now().isoformat()))
+    _files_enqueue(('delete', int(user_id), int(deployment_id)))
+
+
+def _files_retry_pending_deletes():
+    for uid, dep in db_execute("SELECT user_id, deployment_id FROM files_repo_pending_delete",
+                               fetch='all') or []:
+        _files_enqueue(('delete', uid, dep))
+
+
+def _files_sync_thread():
+    """Every FILES_SYNC_INTERVAL_SEC: push changed files (DB snapshots!) of live deployments."""
+    sleep(120)
+    print(f"✅ Files-repo sync started ({FILES_SYNC_INTERVAL_SEC // 60} min cycle)")
+    first = True
+    while True:
+        try:
+            _files_retry_pending_deletes()
+            where = "" if first else "WHERE status IN ('active', 'paused')"
+            ids = [r[0] for r in db_execute(f"SELECT deployment_id FROM deployments {where}", fetch='all') or []]
+            first = False
+            if ids:
+                s = files_repo_backup(ids, "periodic")
+                if s["saved"] or s["failed"] or s["error"]:
+                    print(f"📤 Files sync: {s['saved']} updated · {s['unchanged']} unchanged · "
+                          f"{s['failed']} failed" + (f" · {s['error']}" if s["error"] else ""))
+        except Exception as e:
+            print(f"⚠️  Files sync error: {e}")
+        sleep(FILES_SYNC_INTERVAL_SEC)
+
+
+def files_repo_status_line() -> str:
+    if not FILES_REPO_ENABLED:
+        return "❌ Not configured (set `GITHUB_FILES_REPO_NAME`)"
+    _files_repo_ready()
+    return "✅ Private repo OK" if _files_repo_state["ok"] else f"⚠️ {_files_repo_state['reason']}"
+
+
+def _graceful_shutdown_flush(signum=None, frame=None):
+    """SIGTERM (host redeploy/stop): push every live deployment + the DB before the disk disappears."""
+    print("🛑 Shutdown signal — flushing deployments to GitHub…")
+    done = threading.Event()
+
+    def _work():
+        try:
+            if FILES_REPO_ENABLED:
+                ids = [r[0] for r in db_execute(
+                    "SELECT deployment_id FROM deployments WHERE status IN ('active','paused')", fetch='all') or []]
+                if ids:
+                    files_repo_backup(ids, "shutdown")
+            if GITHUB_ENABLED:
+                github_backup_db("shutdown", force=True)
+        except Exception as e:
+            print(f"⚠️  Shutdown flush error: {e}")
+        finally:
+            done.set()
+
+    threading.Thread(target=_work, daemon=True, name="ShutdownFlush").start()
+    done.wait(timeout=22)
+    os._exit(0)
+
+
+# ==================== RELAUNCH QUEUE ====================
+# Every restart — host reboot, crash, watchdog — goes through ONE queue. Bots are brought
+# back one at a time, each only after the previous one has settled and the machine has
+# free RAM again, so a restart of 50 bots can't spike memory (or pip/npm installs) all at once.
+
+_relaunch_q       = queue.Queue()
+_relaunch_pending = set()
+_relaunch_lock    = threading.Lock()
+_relaunch_started = False
+_relaunch_batch   = {"queued": 0, "done": 0, "results": {}}
+
+
+def _available_memory_mb():
+    """(total_mb, available_mb) — honours container (cgroup) limits, discounting reclaimable cache."""
+    total, _used, avail = _read_proc_meminfo()
+    try:
+        v2 = Path('/sys/fs/cgroup/memory.max')
+        if v2.exists():
+            raw = v2.read_text().strip()
+            if raw != 'max':
+                limit = int(raw)
+                cur = int(Path('/sys/fs/cgroup/memory.current').read_text())
+                inactive = 0
+                for line in Path('/sys/fs/cgroup/memory.stat').read_text().splitlines():
+                    if line.startswith('inactive_file '):
+                        inactive = int(line.split()[1])
+                return limit / 1048576, max(0.0, (limit - max(0, cur - inactive)) / 1048576)
+        else:
+            v1 = Path('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+            if v1.exists():
+                limit = int(v1.read_text())
+                if limit < 2 ** 50:
+                    cur = int(Path('/sys/fs/cgroup/memory/memory.usage_in_bytes').read_text())
+                    inactive = 0
+                    try:
+                        for line in Path('/sys/fs/cgroup/memory/memory.stat').read_text().splitlines():
+                            if line.startswith('total_inactive_file '):
+                                inactive = int(line.split()[1])
+                    except Exception:
+                        pass
+                    return limit / 1048576, max(0.0, (limit - max(0, cur - inactive)) / 1048576)
+    except Exception:
+        pass
+    return total, avail
+
+
+def _wait_for_memory_headroom():
+    total, avail = _available_memory_mb()
+    if not total:
+        return
+    need = min(RELAUNCH_MIN_FREE_MB, total * 0.15)
+    waited = 0
+    while avail < need and waited < RELAUNCH_MEM_WAIT_MAX:
+        sleep(5)
+        waited += 5
+        _, avail = _available_memory_mb()
+    if waited:
+        print(f"⏳ Relaunch queue waited {waited}s for free RAM ({avail:.0f} MB free, wanted {need:.0f} MB)")
+
+
+def enqueue_relaunch(deployment_id, reason="crash", bypass_cap=False) -> bool:
+    """Queue a relaunch. A deployment already queued is not queued twice. True if newly queued."""
+    global _relaunch_started
+    with _relaunch_lock:
+        if deployment_id in _relaunch_pending:
+            return False
+        _relaunch_pending.add(deployment_id)
+        if reason == "startup":
+            _relaunch_batch["queued"] += 1
+        _relaunch_q.put((deployment_id, reason, bypass_cap))
+        if not _relaunch_started:
+            _relaunch_started = True
+            for i in range(max(1, RELAUNCH_WORKERS)):
+                threading.Thread(target=_relaunch_worker, daemon=True, name=f"RelaunchQueue-{i + 1}").start()
+    return True
+
+
+def _relaunch_followup(dep_id, reason, result):
+    """Same manual-restart prompt the health monitor always sent when auto-restart couldn't recover."""
+    if reason not in ("crash", "watchdog") or result not in ("cap_exceeded", "launch_failed"):
+        return
+    row = db_execute("SELECT user_id FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    if not row:
+        return
+    try:
+        send_message(row[0],
+            f"⚠️ *Bot #{dep_id} Crashed*\n\n"
+            f"Automatic restart didn't succeed. Your database is safe — "
+            f"click Restart to try again manually.",
+            {"inline_keyboard": [
+                [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
+                [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}]]})
+    except Exception:
+        pass
+
+
+def _relaunch_worker():
+    while True:
+        dep_id, reason, bypass_cap = _relaunch_q.get()
+        result = "error"
+        try:
+            _wait_for_memory_headroom()
+            result = _auto_relaunch_deployment(dep_id, reason=reason, bypass_cap=bypass_cap)
+            _relaunch_followup(dep_id, reason, result)
+        except Exception as e:
+            print(f"❌ Relaunch queue error (dep#{dep_id}): {e}")
+            traceback.print_exc()
+        finally:
+            with _relaunch_lock:
+                _relaunch_pending.discard(dep_id)
+                if reason == "startup":
+                    b = _relaunch_batch
+                    b["done"] += 1
+                    b["results"][result] = b["results"].get(result, 0) + 1
+                    if b["done"] >= b["queued"]:
+                        summary = ", ".join(f"{k}={v}" for k, v in b["results"].items())
+                        print(f"✅ Reconciliation complete: {summary}")
+                        if b["results"].get("files_missing"):
+                            print(f"⚠️  {b['results']['files_missing']} deployment(s) had no files on disk and "
+                                  f"no usable GitHub backup. Check GITHUB_FILES_REPO_NAME / PERSISTENT_DISK_PATH.")
+                        b.update(queued=0, done=0, results={})
+            _relaunch_q.task_done()
+        sleep(RELAUNCH_STAGGER_SEC)
+
+
+def _launch_and_check(start_script, deploy_folder):
+    """Run a deployment's start.sh and wait until its process has stayed up. -> (is_running, pid)."""
+    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+    _wait_for_launch(deploy_folder, timeout=20, settle=4)
+    new_pid = None
+    pid_file = Path(deploy_folder) / "pid.txt"
+    if pid_file.exists():
+        try:
+            new_pid = int(pid_file.read_text().strip())
+        except Exception:
+            pass
+    alive = False
+    if new_pid:
+        try:
+            os.kill(new_pid, 0)
+            alive = True
+        except Exception:
+            pass
+    return alive, new_pid
+
+
+def _log_shows_missing_dependency(deploy_folder) -> bool:
+    try:
+        tail = (Path(deploy_folder) / "output.log").read_text(errors="replace")[-4000:]
+    except Exception:
+        return False
+    return any(s in tail for s in ("ModuleNotFoundError", "No module named", "ImportError",
+                                   "Cannot find module", "MODULE_NOT_FOUND"))
+
+
 def _find_available_port(preferred: int = 20000) -> int:
     """Return an available TCP port, starting from preferred and sampling nearby."""
     import socket, random
@@ -1671,6 +2688,7 @@ def _wait_for_launch(deploy_folder, timeout=15, settle=3):
     pid_file = Path(deploy_folder) / "pid.txt"
     deadline = datetime.now().timestamp() + timeout
     alive_since = None
+    dead_polls = 0
     while datetime.now().timestamp() < deadline:
         pid = None
         if pid_file.exists():
@@ -1686,12 +2704,19 @@ def _wait_for_launch(deploy_folder, timeout=15, settle=3):
             except Exception:
                 alive = False
         if alive:
+            dead_polls = 0
             if alive_since is None:
                 alive_since = datetime.now().timestamp()
             elif datetime.now().timestamp() - alive_since >= settle:
                 return True
         else:
             alive_since = None
+            if pid:
+                # A PID is recorded but the process is gone: it crashed on start. Fail fast
+                # (after ~2s of re-checks) instead of idling until the timeout.
+                dead_polls += 1
+                if dead_polls >= 4:
+                    return False
         sleep(0.5)
     return False
 
@@ -2351,28 +3376,35 @@ def format_uptime(seconds):
 
 # ==================== CHANNEL VERIFICATION ====================
 
-def check_channel_membership(user_id) -> bool:
+_channel_config_warned = set()
+
+
+def _warn_channel_config(channel, detail):
+    """A channel the bot cannot read members of (bot not admin / wrong name). Tell admins ONCE."""
+    print(f"⚠️  getChatMember({channel}): {detail} — treating as joined")
+    if channel in _channel_config_warned:
+        return
+    _channel_config_warned.add(channel)
+    try:
+        notify_admin(
+            f"⚠️ *Force-join misconfigured: {escape_md_v1(channel)}*\n\n"
+            f"The bot can't read this channel's member list, so the check is being *skipped* "
+            f"and everyone passes it.\n"
+            f"Fix: add the bot as an *administrator* of {escape_md_v1(channel)} "
+            f"and make sure the name is right.\n\n`{str(detail)[:150]}`")
+    except Exception:
+        pass
+
+
+def _check_single_channel(user_id, channel) -> bool:
     """
-    Permanent fix: check whether user_id is a member of REQUIRED_CHANNEL.
-
-    Rules:
-    - If REQUIRED_CHANNEL is not configured → always pass (no gate)
-    - Uses GET with query-string params (works regardless of Content-Type)
-    - Retries up to 3 times on network errors
-    - If Telegram returns a bot-permission error (bot not admin), auto-pass
-      so a misconfigured channel never permanently blocks users
+    True if user_id is a member of ONE channel.
+    - Bot-permission / bad-channel errors (config problems) count as joined so a misconfigured
+      channel can never lock everybody out — admins are told once via _warn_channel_config.
+    - Network failure after 3 tries counts as NOT joined (fail closed; the user can retry).
     """
-    channel = (REQUIRED_CHANNEL or '').strip()
-    if not channel or channel in ('', 'None', 'false', '0'):
-        return True          # no channel gate configured — everyone passes
-
-    # Ensure channel starts with @ or is a numeric id
-    if not channel.startswith('@') and not channel.lstrip('-').isdigit():
-        channel = '@' + channel
-
     url = (f"{TELEGRAM_API}/getChatMember"
            f"?chat_id={urllib.parse.quote(channel)}&user_id={user_id}")
-
     for attempt in range(3):
         try:
             req = urllib.request.Request(url)
@@ -2381,41 +3413,50 @@ def check_channel_membership(user_id) -> bool:
                 if data.get('ok'):
                     status = (data.get('result') or {}).get('status', '')
                     return status in ('member', 'administrator', 'creator', 'restricted')
-                # Telegram error — check if it's a permission issue
                 desc = (data.get('description') or '').lower()
                 if any(kw in desc for kw in ('bot is not', 'not a member',
                                               'need admin', 'rights', 'forbidden')):
-                    print(f"⚠️  getChatMember: {data.get('description')} — auto-passing")
-                    return True     # bot isn't admin → don't punish users
-                return False        # user genuinely not in channel
+                    _warn_channel_config(channel, data.get('description'))
+                    return True
+                return False
         except urllib.error.HTTPError as e:
             body = ''
             try: body = e.read().decode()[:200]
             except Exception: pass
-            print(f"⚠️  getChatMember HTTP {e.code}: {body}")
             if e.code in (400, 403):
-                # Bad request or forbidden — likely config issue, don't block users
+                _warn_channel_config(channel, f"HTTP {e.code}: {body}")
                 return True
+            print(f"⚠️  getChatMember({channel}) HTTP {e.code}: {body}")
             if attempt < 2:
                 sleep(1)
         except Exception as e:
-            print(f"⚠️  getChatMember attempt {attempt+1}: {e}")
+            print(f"⚠️  getChatMember({channel}) attempt {attempt+1}: {e}")
             if attempt < 2:
                 sleep(1)
-
-    # All 3 attempts failed (network issue) → fail CLOSED. A transient outage
-    # must not let everyone through the channel gate; the user can simply
-    # press VERIFY again. (Bot-permission/config errors are handled above.)
-    print(f"⚠️  getChatMember failed after 3 attempts for {user_id} — denying (retry later)")
+    print(f"⚠️  getChatMember({channel}) failed after 3 attempts for {user_id} — denying (retry later)")
     return False
 
 
+def get_missing_channels(user_id) -> list:
+    """The required channels (dicts from REQUIRED_CHANNELS) this user has NOT joined yet."""
+    return [ch for ch in REQUIRED_CHANNELS if not _check_single_channel(user_id, ch["id"])]
+
+
+def check_channel_membership(user_id) -> bool:
+    """True only when the user is a member of EVERY required channel (or no gate is configured)."""
+    if not REQUIRED_CHANNELS:
+        return True
+    return not get_missing_channels(user_id)
+
+
 def mark_channel_joined(user_id):
+    """Record that the user passed the check, together with WHICH channel set they passed."""
     try:
         conn = sqlite3.connect(DATABASE_FILE, timeout=10)
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        c.execute('UPDATE users SET joined_channel = 1 WHERE user_id = ?', (user_id,))
+        c.execute('UPDATE users SET joined_channel = 1, channels_verified = ? WHERE user_id = ?',
+                  (CHANNEL_SIGNATURE, user_id))
         conn.commit()
         conn.close()
         return True
@@ -2426,44 +3467,49 @@ def mark_channel_joined(user_id):
 
 def is_user_verified(user_id) -> bool:
     """
-    Returns True if user has verified (or no channel is required).
-    Admins are always considered verified.
+    True if the user has verified against the CURRENT list of required channels
+    (or no channel is required). Admins are always considered verified.
+    Someone who verified before a channel was added is NOT verified until they pass again.
     """
     if is_admin(user_id):
         return True
-    channel = (REQUIRED_CHANNEL or '').strip()
-    if not channel or channel in ('', 'None', 'false', '0'):
+    if not REQUIRED_CHANNELS:
         return True
     try:
         conn = sqlite3.connect(DATABASE_FILE, timeout=10)
         c = conn.cursor()
-        c.execute('SELECT joined_channel FROM users WHERE user_id = ?', (user_id,))
+        c.execute('SELECT joined_channel, channels_verified FROM users WHERE user_id = ?', (user_id,))
         row = c.fetchone()
         conn.close()
-        return bool(row and row[0])
+        return bool(row and row[0] and row[1] == CHANNEL_SIGNATURE)
     except Exception:
         return False
 
 
-def send_verification_required(chat_id, user_id, first_name, message_id=None):
-    channel = (REQUIRED_CHANNEL or '').strip() or 'our channel'
-    link    = (CHANNEL_LINK or '').strip()
+def _join_buttons(channels):
+    """One 'Join' button per channel that has a link."""
+    return [[{"text": f"📢 Join {ch['id']}", "url": ch["link"]}] for ch in channels if ch.get("link")]
 
+
+def required_channels_text() -> str:
+    return ", ".join(ch["id"] for ch in REQUIRED_CHANNELS) or "our channel"
+
+
+def send_verification_required(chat_id, user_id, first_name, message_id=None):
+    chan_lines = "\n".join(f"📢 *{escape_md_v1(ch['id'])}*" for ch in REQUIRED_CHANNELS) or "📢 *our channel*"
+    n = len(REQUIRED_CHANNELS)
     text = (
         f"*🔐 VERIFICATION REQUIRED*\n\n"
-        f"👋 Hi {first_name or 'there'}!\n\n"
-        f"To use this hosting platform you must join our channel:\n"
-        f"📢 *{channel}*\n\n"
+        f"👋 Hi {escape_md_v1(first_name) if first_name else 'there'}!\n\n"
+        f"To use this hosting platform you must join {'all of our channels' if n > 1 else 'our channel'}:\n"
+        f"{chan_lines}\n\n"
         f"*Steps:*\n"
-        f"1️⃣ Click *JOIN CHANNEL* below\n"
-        f"2️⃣ Join the channel\n"
+        f"1️⃣ Tap each *Join* button below\n"
+        f"2️⃣ Join {'every channel' if n > 1 else 'the channel'}\n"
         f"3️⃣ Come back and click *✅ VERIFY*"
     )
-    buttons = [{"text": "✅ VERIFY", "callback_data": "verify_channel"}]
-    if link:
-        buttons.insert(0, {"text": "📢 JOIN CHANNEL", "url": link})
-
-    keyboard = {"inline_keyboard": [buttons]}
+    keyboard = {"inline_keyboard": _join_buttons(REQUIRED_CHANNELS)
+                + [[{"text": "✅ VERIFY", "callback_data": "verify_channel"}]]}
     if message_id:
         edit_message(chat_id, message_id, text, keyboard)
     else:
@@ -2547,7 +3593,7 @@ def create_redeem_code(admin_id, coins_amount=0, stars_amount=0, expiry_days=30,
 
 def redeem_code(user_id, code):
     if not is_user_verified(user_id):
-        return False, f"❌ You must join {REQUIRED_CHANNEL} first!"
+        return False, f"❌ You must join {required_channels_text()} first!"
     
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -4246,10 +5292,20 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         '    npm install --no-audit --no-fund >> output.log 2>&1\n'
         'fi'
     )
+    # Node bots are spawned from the hosting bot and would otherwise inherit its FULL
+    # environment — including GITHUB_TOKEN, which can read every user's .env in the
+    # files repo. Drop the platform's own secrets BEFORE applying the deployment's values
+    # (same list the Python launcher clears).
+    _platform_keys = ('BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TOKEN', 'API_TOKEN',
+                      'TG_BOT_TOKEN', 'TGBOT_TOKEN', 'DISCORD_TOKEN', 'SLACK_BOT_TOKEN',
+                      'SLACK_APP_TOKEN', 'GITHUB_TOKEN', 'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME',
+                      'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH', 'GITHUB_FILES_REPO_NAME',
+                      'DATABASE_URL', 'DATABASE_FILE', 'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK')
     start_content = (
         f'#!/bin/bash\n'
         f'cd "{deploy_folder}"\n'
         f'export PYTHONUNBUFFERED=1\n'
+        f'unset {" ".join(_platform_keys)}\n'
         f'{env_lines}\n\n'
         f'{npm_install}\n\n'
         f'{run_cmd}\n'
@@ -4325,7 +5381,7 @@ _HOSTING_BOT_KEYS = {{
     'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN', 'TGBOT_TOKEN',
     'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
     'GITHUB_TOKEN', 'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME',
-    'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH',
+    'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH', 'GITHUB_FILES_REPO_NAME',
     'DATABASE_URL', 'DATABASE_FILE',
     'ADMIN_IDS', 'REQUIRED_CHANNEL', 'CHANNEL_LINK',
 }}
@@ -5364,6 +6420,9 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             conn.commit()
             conn.close()
 
+            # Save code + manifests + .env (+ any db the bot has created) to the GitHub files repo
+            files_repo_async_save(deployment_db_id, "deployed")
+
             set_user_step(user_id, None)
             with deployment_lock:
                 active_deployments[deployment_db_id] = proc_pid
@@ -5639,7 +6698,10 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             deployment_db_id = c.lastrowid
             conn.commit()
             conn.close()
-            
+
+            # Save code + manifests + .env (+ any db the bot has created) to the GitHub files repo
+            files_repo_async_save(deployment_db_id, "deployed")
+
             Path(temp_file).unlink(missing_ok=True)
             set_user_step(user_id, None)
             
@@ -5833,7 +6895,11 @@ def delete_deployment(deployment_id, user_id, chat_id):
         c.execute("DELETE FROM deployments WHERE deployment_id = ?", (deployment_id,))
         conn.commit()
         conn.close()
-        
+
+        # Remove it from the GitHub files repo too (queued; remembered in the DB and
+        # retried until it succeeds, so a deleted bot never lingers in the backup).
+        files_repo_async_delete(owner_id, deployment_id)
+
         if is_free:
             used_count = get_free_deployment_used_count(user_id)
             remaining = FREE_USER_MAX_DEPLOYMENTS - used_count
@@ -5921,6 +6987,15 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
         dest_script   = deploy_folder / file_name
 
+        # Files gone (disk wiped)? Bring them back from the GitHub files repo first.
+        if (not deploy_folder.exists() or not dest_script.exists()) and FILES_REPO_ENABLED:
+            send_message(chat_id, "♻️ Files are missing locally — restoring from your GitHub backup…")
+            _ok, _renv = _files_restore_for_relaunch(
+                owner_id, deployment_id, deploy_folder, dest_script,
+                log=lambda m, _d=deployment_id: print(f"   [restore dep#{_d}] {m}"))
+            if _ok and _renv and not (json.loads(env_vars_json) if env_vars_json else {}):
+                env_vars_json = json.dumps(_renv)
+
         if not deploy_folder.exists():
             conn.close()
             send_message(chat_id, "❌ Deployment folder missing — please create a new deployment.")
@@ -5950,42 +7025,37 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
 
         env_vars = json.loads(env_vars_json) if env_vars_json else {}
 
-        try:
-            code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            code_content = ""
-
-        launcher_script, _ = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars, code_content, lambda x: None)
-
-        # Rewrite .env and start.sh to ensure they're fresh
+        # Rewrite .env to ensure it's fresh (paired with the DB's env vars)
         env_file = deploy_folder / ".env"
         env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
 
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
-            f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
-        start_script.chmod(0o755)
+        # Reinstall dependencies if they're missing (cheap no-op when present)
+        _install_deps_for_folder(deploy_folder, dest_script, lambda m: None, only_if_missing=True)
 
-        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
-        sleep(4)
-
-        pid_file = deploy_folder / "pid.txt"
-        new_pid  = None
-        if pid_file.exists():
+        # Build start.sh for the right runtime. A Node.js / TypeScript bot must NOT go
+        # through the Python launcher (it would try to run a .js file with python3) —
+        # same branch the auto-relaunch path uses.
+        if dest_script.suffix.lower() in _NODE_EXTS:
+            start_script, _ = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars, lambda x: None)
+        else:
             try:
-                new_pid = int(pid_file.read_text().strip())
+                code_content = dest_script.read_text(encoding='utf-8', errors='ignore')
             except Exception:
-                pass
+                code_content = ""
+            launcher_script, _ = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars, code_content, lambda x: None)
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f'#!/bin/bash\ncd "{deploy_folder}"\nexport PYTHONUNBUFFERED=1\n'
+                f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
+            start_script.chmod(0o755)
 
-        is_running = False
-        if new_pid:
-            try:
-                os.kill(new_pid, 0)
-                is_running = True
-            except Exception:
-                pass
+        is_running, new_pid = _launch_and_check(start_script, deploy_folder)
+        if not is_running and _log_shows_missing_dependency(deploy_folder):
+            # Died on an import/require error — reinstall everything from the manifests, retry once.
+            _install_deps_for_folder(deploy_folder, dest_script, lambda m: None)
+            is_running, new_pid = _launch_and_check(start_script, deploy_folder)
 
         if is_running:
             if expire_time_str is None:
@@ -6073,11 +7143,14 @@ def stop_deployment(deployment_id):
     c.execute("UPDATE deployments SET status = 'stopped', proc_pid = NULL WHERE deployment_id = ?", (deployment_id,))
     conn.commit()
     conn.close()
-    
+
     with deployment_lock:
         if deployment_id in active_deployments:
             del active_deployments[deployment_id]
-    
+
+    # The process is down, so its database files are now in their final, consistent state.
+    files_repo_async_save(deployment_id, "stopped")
+
     update_system_stats()
 
 # ========== LOG VIEWING FUNCTIONS ==========
@@ -6905,8 +7978,10 @@ def admin_database_menu(chat_id, message_id, user_id):
         f"*💾 DATABASE BACKUP*\n\n"
         f"📦 Current size: `{size_kb:.1f} KB`\n"
         f"☁️ GitHub backup: {gh_status}\n"
+        f"🗂️ User files repo: {files_repo_status_line()}\n"
         f"🕐 Last GitHub push: `{last_backup}`\n\n"
-        f"• *Backup Now* — pushes the current database to GitHub immediately.\n"
+        f"• *Backup Now* — pushes the database AND every user's deployment files "
+        f"(code, requirements/package.json, .env, bot .db files) to GitHub immediately.\n"
         f"• *Download* — sends you the raw `.db` file here in chat.\n"
         f"• *Restore* — replaces the live database with a `.db` file you "
         f"upload. A safety copy of the current database is made first."
@@ -6923,23 +7998,47 @@ def admin_database_menu(chat_id, message_id, user_id):
 def admin_db_backup_now(chat_id, message_id, user_id):
     if not is_admin(user_id):
         return
-    if not GITHUB_ENABLED:
+    back_kb = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]}
+    if not GITHUB_ENABLED and not FILES_REPO_ENABLED:
         edit_message(chat_id, message_id,
             "❌ GitHub backup isn't configured.\n\n"
-            "Set `GITHUB_TOKEN`, `GITHUB_REPO_OWNER`, and `GITHUB_REPO_NAME` to enable it.",
-            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+            "Set `GITHUB_TOKEN`, `GITHUB_REPO_OWNER`, `GITHUB_REPO_NAME` (database) and "
+            "`GITHUB_FILES_REPO_NAME` (user files) to enable it.", back_kb)
         return
-    edit_message(chat_id, message_id, "🔄 Backing up to GitHub...")
-    ok = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
-    if ok:
-        edit_message(chat_id, message_id,
-            "✅ *Backup complete!*\n\nThe database was pushed to GitHub successfully.",
-            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
-    else:
-        edit_message(chat_id, message_id,
-            "❌ *Backup failed.*\n\nCheck the server logs (invalid token, repo not "
-            "found, or the database has no data yet are the usual causes).",
-            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]})
+
+    # 1) the platform database
+    db_line = "⏭️ Database: GitHub DB backup not configured"
+    if GITHUB_ENABLED:
+        edit_message(chat_id, message_id, "🔄 Backing up the database to GitHub…")
+        db_ok = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
+        db_line = "✅ Database pushed" if db_ok else "❌ Database backup failed (see server logs)"
+
+    # 2) every user's deployment files
+    files_line = "⏭️ User files: `GITHUB_FILES_REPO_NAME` not configured"
+    if FILES_REPO_ENABLED:
+        ids = [r[0] for r in db_execute("SELECT deployment_id FROM deployments ORDER BY deployment_id",
+                                        fetch='all') or []]
+        last_edit = [0.0]
+
+        def _progress(i, total, s):
+            now = datetime.now().timestamp()
+            if now - last_edit[0] >= 3 or i == total:      # Telegram edit rate-limit friendly
+                last_edit[0] = now
+                edit_message(chat_id, message_id,
+                    f"🔄 Backing up user files…\n\n{db_line}\n📦 Deployments: `{i}/{total}`")
+
+        s = files_repo_backup(ids, f"manual_admin_{user_id}", progress=_progress, refresh=True) if ids else \
+            {"total": 0, "saved": 0, "unchanged": 0, "failed": 0, "no_files": 0, "oversized": 0, "error": None}
+        if s["error"]:
+            files_line = f"❌ User files: {s['error']}"
+        else:
+            files_line = (f"{'✅' if not s['failed'] else '⚠️'} User files: `{s['total']}` deployment(s) — "
+                          f"`{s['saved']}` updated, `{s['unchanged']}` already up to date"
+                          + (f", `{s['no_files']}` without files on disk" if s['no_files'] else "")
+                          + (f", `{s['failed']}` FAILED" if s['failed'] else "")
+                          + (f"\n   ⚠️ `{s['oversized']}` file(s) over the size caps were not saved" if s['oversized'] else ""))
+
+    edit_message(chat_id, message_id, f"*Backup finished*\n\n{db_line}\n{files_line}", back_kb)
 
 
 def admin_db_download(chat_id, message_id, user_id):
@@ -8558,16 +9657,17 @@ def handle_callback(callback):
             balances = get_user_balances(user_id)
             edit_message(chat_id, message_id,
                 f"✅ *VERIFIED!*\n\n"
-                f"Thank you for joining {REQUIRED_CHANNEL}!",
+                f"Thank you for joining {escape_md_v1(required_channels_text())}!",
                 get_main_menu(user_id))
         else:
+            _missing = get_missing_channels(user_id) or REQUIRED_CHANNELS
             edit_message(chat_id, message_id,
                 f"❌ *NOT VERIFIED*\n\n"
-                f"Please join {REQUIRED_CHANNEL} first.",
-                {"inline_keyboard": [
-                    [{"text": "📢 JOIN", "url": CHANNEL_LINK},
-                     {"text": "✅ VERIFY", "callback_data": "verify_channel"}]
-                ]})
+                f"You still need to join:\n"
+                + "\n".join(f"• {escape_md_v1(ch['id'])}" for ch in _missing)
+                + "\n\nJoin, then tap VERIFY again.",
+                {"inline_keyboard": _join_buttons(_missing)
+                 + [[{"text": "✅ VERIFY", "callback_data": "verify_channel"}]]})
         return
 
     # ========== TERMS OF SERVICE ==========
@@ -10149,10 +11249,19 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
 
     deploy_folder = get_deploy_folder(owner_id, deployment_id)
     dest_script   = deploy_folder / file_name
+    restored_env  = None
 
     if not deploy_folder.exists() or not dest_script.exists():
-        # Files are gone — almost always means the host's disk was wiped on a
-        # redeploy (see PERSISTENT_DISK_PATH). Nothing to relaunch from.
+        # The files are gone — almost always the host's disk being wiped on a redeploy.
+        # Pull the deployment (code + manifests + .env + db) back from the GitHub files
+        # repo and reinstall its dependencies before giving up on it.
+        print(f"♻️  dep#{deployment_id}: files missing — restoring from the GitHub files repo…")
+        _restored_ok, restored_env = _files_restore_for_relaunch(
+            owner_id, deployment_id, deploy_folder, dest_script,
+            log=lambda m, _d=deployment_id: print(f"   [restore dep#{_d}] {m}"))
+
+    if not deploy_folder.exists() or not dest_script.exists():
+        # Nothing on disk and no usable backup — nothing to relaunch from.
         c.execute("UPDATE deployments SET status='stopped', proc_pid=NULL WHERE deployment_id=?",
                   (deployment_id,))
         conn.commit()
@@ -10169,9 +11278,18 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         return "files_missing"
 
     env_vars = json.loads(env_vars_json) if env_vars_json else {}
+    if not env_vars and restored_env:
+        # The platform DB has no env for this deployment but its backup does — use the paired .env.
+        env_vars = restored_env
+        c.execute("UPDATE deployments SET env_vars=? WHERE deployment_id=?",
+                  (json.dumps(env_vars), deployment_id))
+        conn.commit()
 
     env_file = deploy_folder / ".env"
     env_file.write_text('\n'.join(f"{k}={v}" for k, v in env_vars.items()) + '\n')
+
+    # Make sure the dependencies are actually there (cheap no-op when they are).
+    _install_deps_for_folder(deploy_folder, dest_script, lambda m: None, only_if_missing=True)
 
     # Branch on file type exactly like the original deploy path does — a
     # Node.js deployment must NOT be regenerated through the Python launcher,
@@ -10196,24 +11314,12 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
             f'setsid nohup {sys.executable} "{launcher_script}" > output.log 2>&1 &\necho $! > pid.txt\n')
         start_script.chmod(0o755)
 
-    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
-    sleep(4)
-
-    pid_file = deploy_folder / "pid.txt"
-    new_pid = None
-    if pid_file.exists():
-        try:
-            new_pid = int(pid_file.read_text().strip())
-        except Exception:
-            pass
-
-    is_running = False
-    if new_pid:
-        try:
-            os.kill(new_pid, 0)
-            is_running = True
-        except Exception:
-            pass
+    is_running, new_pid = _launch_and_check(start_script, deploy_folder)
+    if not is_running and _log_shows_missing_dependency(deploy_folder):
+        # Died on an import/require error — reinstall everything from the manifests and try once more.
+        print(f"📦 dep#{deployment_id}: launch failed on a missing dependency — reinstalling and retrying once")
+        _install_deps_for_folder(deploy_folder, dest_script, lambda m: None)
+        is_running, new_pid = _launch_and_check(start_script, deploy_folder)
 
     if is_running:
         c.execute("""UPDATE deployments
@@ -10279,30 +11385,12 @@ def process_health_monitor():
 
                 with deployment_lock:
                     active_deployments.pop(dep_id, None)
-                print(f"💀 Dead process for deployment {dep_id} (user {uid}) — attempting auto-restart")
-
-                result = _auto_relaunch_deployment(dep_id, reason="crash")
-
-                if result in ("restarted", "expired", "files_missing", "paused_premium"):
-                    # Each of these already left the deployment in a correct,
-                    # user-visible state (running again, or clearly stopped
-                    # with an explanation) — nothing further to do.
-                    continue
-
-                # cap_exceeded / launch_failed / not_found: auto-restart
-                # couldn't bring it back — fall back to a manual prompt so
-                # the owner isn't left in the dark.
-                try:
-                    send_message(uid,
-                        f"⚠️ *Bot #{dep_id} Crashed*\n\n"
-                        f"Automatic restart didn't succeed. Your database is safe — "
-                        f"click Restart to try again manually.",
-                        {"inline_keyboard": [
-                            [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
-                            [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}],
-                        ]})
-                except Exception:
-                    pass
+                # Hand the relaunch to the queue: bots come back one at a time (so a mass
+                # crash can't spike RAM), restoring files from GitHub first if they're gone.
+                # If auto-restart ultimately can't recover it, the queue worker sends the
+                # owner the manual "Restart Bot" prompt.
+                if enqueue_relaunch(dep_id, reason="crash"):
+                    print(f"💀 Dead process for deployment {dep_id} (user {uid}) — queued for auto-restart")
 
         except Exception as e:
             print(f"❌ Health monitor error: {e}")
@@ -10419,12 +11507,9 @@ def _hosted_bot_watchdog():
                     alive = True   # unknown error — assume alive
 
                 if not alive:
-                    print(f"⚠️  Watchdog: dep#{dep_id} PID {pid} is dead — relaunching…")
-                    try:
-                        result = _auto_relaunch_deployment(dep_id, reason="watchdog")
-                        print(f"   → dep#{dep_id} relaunch: {result}")
-                    except Exception as re:
-                        print(f"   → dep#{dep_id} relaunch error: {re}")
+                    # Queued (and de-duplicated against the health monitor) — never launched inline.
+                    if enqueue_relaunch(dep_id, reason="watchdog"):
+                        print(f"⚠️  Watchdog: dep#{dep_id} PID {pid} is dead — queued for relaunch")
 
         except Exception as e:
             print(f"⚠️  Watchdog cycle error: {e}")
@@ -10452,20 +11537,12 @@ def reconcile_deployments_on_startup():
     if not rows:
         return
 
-    print(f"🔄 Reconciling {len(rows)} deployment(s) from previous run...")
-    counts = {}
+    # Queue them all and return immediately: the bot starts answering Telegram right away while a
+    # single worker brings the deployments back one at a time (restoring files from the GitHub
+    # files repo where the disk was wiped), waiting for free RAM between each one.
+    print(f"🔄 Queueing {len(rows)} deployment(s) from the previous run for one-at-a-time relaunch…")
     for (dep_id,) in rows:
-        result = _auto_relaunch_deployment(dep_id, reason="startup", bypass_cap=True)
-        counts[result] = counts.get(result, 0) + 1
-        sleep(0.5)  # avoid hammering disk/CPU relaunching many bots at once
-
-    summary = ", ".join(f"{k}={v}" for k, v in counts.items())
-    print(f"✅ Reconciliation complete: {summary}")
-
-    if counts.get("files_missing"):
-        print(f"⚠️  {counts['files_missing']} deployment(s) lost their files on this restart. "
-              f"This means BASE_DIR is not on a real persistent disk — set the "
-              f"PERSISTENT_DISK_PATH env var to a mounted Render Disk to fix this permanently.")
+        enqueue_relaunch(dep_id, reason="startup", bypass_cap=True)
 
 
 def setup_memory_compression():
@@ -10582,7 +11659,22 @@ def main():
     
     init_db()
 
+    # ── GitHub files repo (per-deployment code / requirements / .env / db) ──
+    if FILES_REPO_ENABLED:
+        _files_init_tables()
+        if _files_repo_ready(force=True):
+            print(f"✅ Files repo ready: {GITHUB_REPO_OWNER}/{GITHUB_FILES_REPO_NAME} "
+                  f"[branch: {GITHUB_BACKUP_BRANCH}] (private)")
+        # Push live deployments + the DB when the host stops us (redeploy / scale-down)
+        try:
+            signal.signal(signal.SIGTERM, _graceful_shutdown_flush)
+        except Exception as _se:
+            print(f"ℹ️  Could not register SIGTERM flush: {_se}")
+    else:
+        print("ℹ️  GITHUB_FILES_REPO_NAME not set — user deployment files are NOT backed up to GitHub")
+
     # ── Bring back whatever was running before this process started ──
+    # (queued: restores missing files from GitHub, then relaunches one bot at a time)
     reconcile_deployments_on_startup()
     # ───────────────────────────────────────────────────────────────
     
@@ -10597,7 +11689,9 @@ def main():
     threading.Thread(target=_self_ping_thread,          daemon=True, name="KeepAlive").start()
     threading.Thread(target=_hosted_bot_watchdog,       daemon=True, name="BotWatchdog").start()
     threading.Thread(target=quota_monitor,              daemon=True, name="QuotaMonitor").start()
-    
+    if FILES_REPO_ENABLED:
+        threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
+
     try:
         me = http_get(f"{TELEGRAM_API}/getMe")
         if me and me.get('ok'):
