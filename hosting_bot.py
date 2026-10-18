@@ -1027,19 +1027,21 @@ def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, lis
         blocked, critical, warnings = SECURITY_SCANNER.scan(file_bytes, filename)
     except Exception as e:
         # Scanner itself crashed — log and let deployment proceed with a warning
-        return False, [], [f"Scanner error: {e}"], f"⚠️ Security scan encountered an error: {e}"
+        return False, [], [f"Scanner error: {e}"], f"⚠️ Security scan encountered an error: `{safe_md(e)[:200]}`"
 
     lines = [f"🔒 Security Scan — `{display_filename(filename)}`\n"]
     if critical:
         lines.append(f"🔴 *{len(critical)} CRITICAL issue(s) — BLOCKED:*")
+        # Findings are raw regex/pattern text full of * _ [ ] — put each in a code span so
+        # Telegram's Markdown parser can't choke on it (only backticks matter inside one).
         for i in critical[:10]:
-            lines.append(f"  • {i}")
+            lines.append(f"  • `{safe_md(i)[:200]}`")
         if len(critical) > 10:
             lines.append(f"  … and {len(critical)-10} more")
     if warnings:
         lines.append(f"\n🟡 *{len(warnings)} warning(s):*")
         for w in warnings[:8]:
-            lines.append(f"  • {w}")
+            lines.append(f"  • `{safe_md(w)[:200]}`")
         if len(warnings) > 8:
             lines.append(f"  … and {len(warnings)-8} more")
     if not critical and not warnings:
@@ -6329,7 +6331,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                     f"🐙 Repo: `{owner}/{repo}@{branch}`\n"
                     f"📁 File: `{safe_md(dest_script.name)}`\n"
                     f"⚠️ Critical: `{len(crit)}`\n\n"
-                    + '\n'.join(f"• {safe_md(c[:120])}" for c in crit[:8])
+                    + '\n'.join(f"• `{safe_md(c[:120])}`" for c in crit[:8])
                     + (f"\n_...and {len(crit)-8} more_" if len(crit) > 8 else "")
                 )
                 admin_kb = {"inline_keyboard": [
@@ -10057,7 +10059,7 @@ def handle_callback(callback):
                 f"*Critical ({len(crits)}):*\n"
                 + '\n'.join(f"• `{safe_md(c[:150])}`" for c in crits)
                 + (f"\n\n*Warnings ({len(warns)}):*\n"
-                   + '\n'.join(f"• {safe_md(w[:150])}" for w in warns[:10])
+                   + '\n'.join(f"• `{safe_md(w[:150])}`" for w in warns[:10])
                    if warns else "")
             )
             send_message(chat_id, full[:4000],
@@ -10151,7 +10153,6 @@ def handle_callback(callback):
 
                 if rv_src == "github":
                     # Re-run GitHub deployment without the security block
-                    from pathlib import Path as _P
                     # `step` was stored by deploy_from_github itself (owner/repo/
                     # branch/plan/...), not the temp_* keys _launch_github_deploy
                     # reads, so call deploy_from_github directly with them.
@@ -10171,7 +10172,7 @@ def handle_callback(callback):
 
                 else:
                     # File-upload path — read saved pending file
-                    pending = _P(rv_fp) if rv_fp else None
+                    pending = Path(rv_fp) if rv_fp else None
                     if not pending or not pending.exists():
                         send_message(rv_cid,
                             "❌ Approved file no longer on disk.\n"
@@ -10997,7 +10998,7 @@ def handle_message(message):
                     f"⚠️ Critical issues: `{len(critical)}`\n"
                     f"🔔 Warnings: `{len(scan_warnings)}`\n\n"
                     f"*Issues found:*\n"
-                    + '\n'.join(f"• {safe_md(c[:120])}" for c in critical[:8])
+                    + '\n'.join(f"• `{safe_md(c[:120])}`" for c in critical[:8])
                     + (f"\n_...and {len(critical)-8} more_" if len(critical) > 8 else "")
                     + f"\n\n*What would you like to do?*"
                 )
@@ -11054,7 +11055,7 @@ def handle_message(message):
                 f"🔒 {scan_note}\n\n"
             )
             if scan_warnings:
-                summary += f"*Warnings:*\n" + '\n'.join(f'• {w}' for w in scan_warnings[:4]) + "\n\n"
+                summary += f"*Warnings:*\n" + '\n'.join(f'• `{safe_md(w)[:200]}`' for w in scan_warnings[:4]) + "\n\n"
             summary += (
                 f"📋 Plan: `{(user_step.get('plan') or 'free').upper()}`\n"
                 f"⏱️ Duration: `{user_step.get('duration', 'N/A')}` days\n\n"
