@@ -1279,7 +1279,8 @@ _NODE_EXTS = ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
 _DB_SUFFIXES = {'.db', '.sqlite', '.sqlite3', '.db3'}
 _FILES_SKIP_DIRS = {'packages', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
                     '.cache', '.npm', '.pnpm-store', 'site-packages', '.idea', '.vscode'}
-_FILES_SKIP_NAMES = {'start.sh', 'pid.txt', 'output.log', 'nohup.out', '.env', '.DS_Store'}
+_FILES_SKIP_NAMES = {'start.sh', 'pid.txt', 'output.log', 'nohup.out', '.env', '.DS_Store',
+                     '.heartbeat'}     # .heartbeat is rewritten every 30 s — would force a commit per sync
 _FILES_SKIP_SUFFIXES = {'.pyc', '.pyo', '.log', '.pid', '.lock', '.tmp', '.swp'}
 _FILES_SKIP_ENDINGS = ('-wal', '-shm', '-journal')          # SQLite side files (merged by the snapshot)
 _DEP_MANIFEST_NAMES = {'requirements.txt', 'requirements-dev.txt', 'requirements_prod.txt',
@@ -1556,6 +1557,57 @@ def _sqlite_consistent_bytes(p: Path) -> bytes:
 
 def _env_dict_to_text(env_vars: dict) -> str:
     return ''.join(f"{k}={v}\n" for k, v in (env_vars or {}).items())
+
+
+_ENV_KEY_RE   = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_ENV_COLON_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*:\s+(\S.*)$')
+_PLATFORM_ENV_KEYS = {'PORT', 'BOT_PORT', 'GITHUB_DEPLOY_TOKEN'}   # added by the platform, not typed by the user
+
+
+def parse_env_input(text) -> tuple:
+    """
+    Parse environment variables a user typed or pasted. Returns (dict, ignored_count).
+    Accepts, one per line:
+        KEY=VALUE          export KEY=VALUE          KEY: VALUE
+        KEY="VALUE"        KEY='VALUE'               (matching surrounding quotes are removed)
+    Blank lines and # comments are skipped silently. Anything else counts as ignored — only the
+    COUNT is reported, never the line, because a mistyped line may still contain a secret.
+    Names must be shell-safe ([A-Za-z_][A-Za-z0-9_]*): the Node launcher `export`s them in bash.
+    """
+    out, ignored = {}, 0
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.lower().startswith('export '):
+            line = line[7:].strip()
+        if '=' in line:
+            k, _, v = line.partition('=')
+        else:
+            m = _ENV_COLON_RE.match(line)
+            if not m:
+                ignored += 1
+                continue
+            k, v = m.group(1), m.group(2)
+        k, v = k.strip(), v.strip()
+        if not _ENV_KEY_RE.match(k):
+            ignored += 1
+            continue
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        out[k] = v
+    return out, ignored
+
+
+def env_names_line(env_vars) -> str:
+    """'🔧 Env vars saved (3): `A`, `B`, `C`' — NAMES ONLY, never values. Platform-added keys excluded."""
+    names = [re.sub(r'[^A-Za-z0-9_]', '_', str(k)) for k in (env_vars or {})
+             if k not in _PLATFORM_ENV_KEYS]
+    if not names:
+        return "🔧 *Env vars:* none set\n"
+    shown = ', '.join(f"`{n}`" for n in names[:12])
+    more = f" +{len(names) - 12} more" if len(names) > 12 else ""
+    return f"🔧 *Env vars saved ({len(names)}):* {shown}{more}\n"
 
 
 def _parse_env_text(text: str) -> dict:
@@ -6436,6 +6488,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 f"🔧 *Framework:* {get_platform_label(frameworks)}\n"
                 f"📋 *Plan:* {plan.upper()}\n"
                 f"📅 *Expires:* `{expire_str}`\n"
+                f"{env_names_line(env_vars_dict)}"
                 f"🆔 *ID:* `{deployment_db_id}`",
                 {"inline_keyboard": [
                     [{"text": "📄 Runtime Logs",  "callback_data": f"view_runtime_logs_{deployment_db_id}"}],
@@ -6526,14 +6579,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             if isinstance(env_vars, dict):
                 env_vars_dict = env_vars
             elif isinstance(env_vars, str):
-                for line in env_vars.strip().split('\n'):
-                    line = line.strip()
-                    if '=' in line:
-                        first_eq = line.find('=')
-                        key = line[:first_eq].strip()
-                        value = line[first_eq+1:].strip()
-                        if key:
-                            env_vars_dict[key] = value
+                env_vars_dict, _ = parse_env_input(env_vars)
         
         # Read code content for analysis
         with open(dest_script, 'r', encoding='utf-8') as f:
@@ -6729,7 +6775,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 f"{duration_line}\n"
                 f"{expiry_line}\n"
                 f"📦 *Dependencies:* {len(requirements_list)} package(s)\n"
-                f"🔧 *Env Vars:* {len(env_vars_dict)}\n"
+                f"{env_names_line(env_vars_dict)}"
                 f"🆔 *ID:* `{deployment_db_id}`"
             )
             
@@ -8817,12 +8863,10 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_secu
 
     env_vars_dict = {}
     if env_raw and env_raw.strip() != '.':
-        for line in env_raw.strip().splitlines():
-            if '=' in line:
-                k, _, v = line.partition('=')
-                k = k.strip(); v = v.strip()
-                if k:
-                    env_vars_dict[k] = v
+        env_vars_dict, _ign = parse_env_input(env_raw)
+        if _ign:
+            send_message(chat_id, f"⚠️ `{_ign}` line(s) in your variables were not understood and were "
+                                  f"skipped. Use one `KEY=VALUE` per line.")
     if token:
         env_vars_dict['GITHUB_DEPLOY_TOKEN'] = token
 
@@ -10073,17 +10117,28 @@ def handle_callback(callback):
             "Use it responsibly — misuse may result in account suspension."
             if action == "approve_warn" else ""
         )
-        send_message(rv_chat_id,
-            f"✅ *Deployment Approved!*\n\n"
-            f"Admin approved `{safe_md(rv_file_name)}`."
-            f"{warn_note}\n\n"
-            f"🚀 Starting deployment now…",
-            {"inline_keyboard": [[{"text": "⏳ Deploying…", "callback_data": "main_menu"}]]})
+        if rv_source == "github":
+            send_message(rv_chat_id,
+                f"✅ *Deployment Approved!*\n\n"
+                f"Admin approved `{safe_md(rv_file_name)}`."
+                f"{warn_note}\n\n"
+                f"🚀 Starting deployment now…",
+                {"inline_keyboard": [[{"text": "⏳ Deploying…", "callback_data": "main_menu"}]]})
+            _admin_note = f"Deploying for user `{rv_user_id}`…"
+        else:
+            # Uploads still need requirements / env vars / payment from the user — see below.
+            send_message(rv_chat_id,
+                f"✅ *Deployment Approved!*\n\n"
+                f"Admin approved `{safe_md(rv_file_name)}`."
+                f"{warn_note}\n\n"
+                f"➡️ Continue setting it up in the next message.",
+                {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+            _admin_note = f"User `{rv_user_id}` has been asked to finish setup (requirements, env vars)."
 
         # Update admin message immediately
         edit_message(chat_id, message_id,
             f"✅ Review `#{review_id}` — *Approved*\n"
-            f"Deploying for user `{rv_user_id}`…",
+            f"{_admin_note}",
             {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
 
         # Run the actual deployment in a background thread
@@ -10129,8 +10184,13 @@ def handle_callback(callback):
                     temp_path.write_bytes(pending.read_bytes())
                     pending.unlink(missing_ok=True)
 
-                    # Restore the user's step state so the deploy flow has
-                    # plan / duration / payment_method etc.
+                    # The security scan runs right after the upload — BEFORE the user has been
+                    # asked for requirements, environment variables or payment. So there is
+                    # nothing to deploy yet: deploying here would start the bot with NO env
+                    # vars (empty .env, no BOT_TOKEN) and always as a free 24h bot whatever
+                    # plan they chose. Put the user back at exactly the point a clean upload
+                    # reaches, and let the normal flow take over:
+                    #   requirements → env vars → DEPLOY NOW → plan / payment → deploy.
                     set_user_step(rv_uid, 'awaiting_reqs',
                                   temp_file=str(temp_path),
                                   plan=step.get('plan'),
@@ -10138,14 +10198,22 @@ def handle_callback(callback):
                                   cost_coins=step.get('cost_coins'),
                                   cost_stars=step.get('cost_stars'),
                                   payment_method=step.get('payment_method'),
-                                  env_vars=step.get('env_vars', {}))
+                                  env_vars={})
 
-                    # Proceed directly to deployment (requirements auto-detect)
-                    deploy_free_bot_with_logs(
-                        rv_cid, rv_uid,
-                        str(temp_path),
-                        step.get('requirements', ''),
-                        step.get('env_vars', {}))
+                    _lang = {
+                        '.py': '🐍 Python', '.js': '🟨 Node.js', '.mjs': '🟨 Node.js (ESM)',
+                        '.cjs': '🟨 Node.js (CJS)', '.ts': '🔷 TypeScript',
+                        '.tsx': '🔷 TypeScript/React', '.jsx': '🟨 JavaScript/React',
+                    }.get(temp_path.suffix.lower(), '📄 Script')
+                    send_message(rv_cid,
+                        f"*✅ File approved* — {_lang}\n\n"
+                        f"📁 `{safe_md(rv_fn)}`\n"
+                        f"🔒 An admin reviewed and approved this file.\n\n"
+                        f"📋 Plan: `{(step.get('plan') or 'free').upper()}`\n"
+                        f"⏱️ Duration: `{step.get('duration', 'N/A')}` days\n\n"
+                        "*📦 Add requirements?*\nUpload `requirements.txt` or `package.json`, "
+                        "or click Auto-detect — then you'll add your environment variables.",
+                        get_reqs_keyboard())
 
             except Exception as e:
                 print(f"❌ Approved deployment failed (review #{rv_id}): {e}")
@@ -10675,15 +10743,9 @@ def handle_message(message):
                 try:    raw = json.loads(raw)
                 except Exception: raw = {}
             env_vars = dict(raw)
-            added = 0
-            for line in text.strip().split('\n'):
-                line = line.strip()
-                if '=' in line:
-                    eq = line.index('=')
-                    k, v = line[:eq].strip(), line[eq+1:].strip()
-                    if k:
-                        env_vars[k] = v
-                        added += 1
+            _parsed, _ignored = parse_env_input(text)
+            env_vars.update(_parsed)
+            added = len(_parsed)
             set_user_step(user_id, 'awaiting_env',
                          waiting_for_env=1,
                          temp_file=user_step.get('temp_file'),
@@ -10695,8 +10757,11 @@ def handle_message(message):
                          cost_stars=user_step.get('cost_stars'),
                          payment_method=user_step.get('payment_method'))
             if added:
+                _ign_note = (f"\n⚠️ `{_ignored}` line(s) not understood and skipped "
+                             f"(use one `KEY=VALUE` per line)." if _ignored else "")
                 send_message(chat_id,
-                    f"✅ *{added}* variable(s) saved — total: `{len(env_vars)}`\n\nSend more, or:",
+                    f"✅ *{added}* variable(s) saved — total: `{len(env_vars)}`\n"
+                    f"{env_names_line(env_vars)}{_ign_note}\nSend more, or:",
                     get_env_keyboard(len(env_vars)))
             else:
                 send_message(chat_id,
