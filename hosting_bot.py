@@ -1280,7 +1280,8 @@ _files_public_warned = False
 _NODE_EXTS = ('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx')
 _DB_SUFFIXES = {'.db', '.sqlite', '.sqlite3', '.db3'}
 _FILES_SKIP_DIRS = {'packages', 'node_modules', '__pycache__', '.git', '.venv', 'venv',
-                    '.cache', '.npm', '.pnpm-store', 'site-packages', '.idea', '.vscode'}
+                    '.cache', '.npm', '.pnpm-store', 'site-packages', '.idea', '.vscode',
+                    '.tmp'}      # '.tmp' = the deployment's private TMPDIR (scratch space, never backed up)
 _FILES_SKIP_NAMES = {'start.sh', 'pid.txt', 'output.log', 'nohup.out', '.env', '.DS_Store',
                      '.heartbeat'}     # .heartbeat is rewritten every 30 s — would force a commit per sync
 _FILES_SKIP_SUFFIXES = {'.pyc', '.pyo', '.log', '.pid', '.lock', '.tmp', '.swp'}
@@ -1642,6 +1643,14 @@ def _files_snapshot(deployment_id):
     main_rel = (file_name or "").replace("\\", "/")
     if not folder.exists() or not main_rel or not (folder / main_rel).exists():
         return None
+    # Identity guard: the folder being backed up must be this OWNER's folder. Anything else
+    # would file one user's data under another user's id.
+    try:
+        if folder.parent.name != str(int(uid)):
+            print(f"🚫 dep#{deployment_id}: folder {folder} is not under user {uid} — refusing to back it up")
+            return None
+    except Exception:
+        return None
     try:
         env_vars = json.loads(env_json) if env_json else {}
         if not isinstance(env_vars, dict):
@@ -1850,10 +1859,18 @@ def files_repo_delete_deployment(user_id, deployment_id) -> bool:
             return False
 
 
-def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log=print):
+def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log=print,
+                                  expect_folder_name=None):
     """
     Download a deployment's files from the repo into dest_folder.
-    Returns {"files": n, "manifest": {...}} or None (nothing stored / any download failed).
+    Returns {"files": n, "manifest": {...}} or None (nothing stored / any download failed /
+    the backup does not belong to this exact deployment).
+
+    Identity check BEFORE anything is written: the stored manifest must name this user and
+    this deployment (and, when known, this deployment's folder_name — the unique stamp of
+    one particular deployment). A backup that doesn't match is refused, so a database can
+    never be restored into the wrong user's / the wrong deployment's folder, whatever the
+    files happen to be called.
     """
     if not _files_repo_ready():
         return None
@@ -1865,6 +1882,23 @@ def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log
             log(f"⚠️ Could not list the backup: {e}")
             return None
         if not remote:
+            return None
+        man_sha = remote.get(f"{prefix}/manifest.json")
+        man_data = _files_fetch_blob(man_sha) if man_sha else None
+        try:
+            man = json.loads(man_data.decode('utf-8', 'ignore')) if man_data else None
+        except Exception:
+            man = None
+        if not isinstance(man, dict):
+            log("🚫 Backup has no readable manifest — cannot verify it belongs to this deployment; refusing")
+            return None
+        if int(man.get("user_id", -1)) != int(user_id) or int(man.get("deployment_id", -1)) != int(deployment_id):
+            log(f"🚫 Backup identity mismatch (manifest says user {man.get('user_id')} / "
+                f"deployment {man.get('deployment_id')}) — refusing to restore")
+            return None
+        if expect_folder_name and man.get("folder_name") and str(man["folder_name"]) != str(expect_folder_name):
+            log(f"🚫 Backup is from a different deployment that reused this id "
+                f"(folder {man['folder_name']} ≠ {expect_folder_name}) — refusing to restore")
             return None
         dest_folder = Path(dest_folder)
         dest_folder.mkdir(parents=True, exist_ok=True)
@@ -1953,7 +1987,10 @@ def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, de
         return False, None
     existed = deploy_folder.exists()
     try:
-        info = files_repo_restore_deployment(owner_id, deployment_id, deploy_folder, log)
+        _row = db_execute("SELECT folder_name FROM deployments WHERE deployment_id = ?",
+                          (deployment_id,), fetch='one')
+        info = files_repo_restore_deployment(owner_id, deployment_id, deploy_folder, log,
+                                             expect_folder_name=(_row[0] if _row else None))
     except Exception as e:
         log(f"⚠️ Restore error: {e}")
         info = None
@@ -2732,6 +2769,67 @@ def is_user_premium(user_id):
     except Exception:
         return False
 
+def get_premium_end(user_id):
+    """When this user's CURRENT premium subscription ends (datetime), or None for admins /
+    users without active premium (admins are never capped)."""
+    if is_admin(user_id):
+        return None
+    try:
+        row = db_execute("SELECT is_premium, premium_expires FROM users WHERE user_id = ?",
+                         (user_id,), fetch='one')
+        if row and row[0] == 1 and row[1]:
+            end = datetime.fromisoformat(row[1])
+            if end > datetime.now():
+                return end
+    except Exception:
+        pass
+    return None
+
+
+def cap_expiry_to_premium(user_id, expire_time, covered_by_premium):
+    """
+    A deployment that is free BECAUSE of the owner's premium must not outlive that premium:
+    a 30-day deployment started when the subscription has 2 days left runs for 2 days.
+    Deployments the user paid for themselves (coins / Stars) and admin lifetime deployments
+    are not capped. Returns (expire_time, was_capped).
+    """
+    if not covered_by_premium or expire_time is None:
+        return expire_time, False
+    end = get_premium_end(user_id)
+    if end is not None and end < expire_time:
+        return end, True
+    return expire_time, False
+
+
+def extend_premium_deployments(user_id, premium_end):
+    """
+    The user just renewed premium: deployments that were capped to the OLD subscription end
+    get extended — up to the end of the new subscription, but never beyond their own plan
+    window (30 days monthly / 365 days yearly, counted from when they started).
+    Returns how many deployments were extended.
+    """
+    n = 0
+    try:
+        rows = db_execute("""SELECT deployment_id, plan, start_time, expire_time FROM deployments
+                             WHERE user_id = ? AND payment_method = 'premium_free' AND is_free = 0
+                               AND plan IN ('monthly', 'yearly') AND status IN ('active', 'paused')
+                               AND expire_time IS NOT NULL""", (user_id,), fetch='all') or []
+        for dep_id, plan, start_str, exp_str in rows:
+            try:
+                window_days = 30 if plan == 'monthly' else 365
+                plan_end = datetime.fromisoformat(start_str) + timedelta(days=window_days)
+                new_exp = min(plan_end, premium_end)
+                if new_exp > datetime.fromisoformat(exp_str):
+                    db_execute("UPDATE deployments SET expire_time = ? WHERE deployment_id = ?",
+                               (new_exp.isoformat(), dep_id))
+                    n += 1
+            except Exception as e:
+                print(f"⚠️  extend_premium_deployments dep#{dep_id}: {e}")
+    except Exception as e:
+        print(f"⚠️  extend_premium_deployments: {e}")
+    return n
+
+
 def _wait_for_launch(deploy_folder, timeout=15, settle=3):
     """
     Poll pid.txt instead of sleeping a fixed time. Returns once the process
@@ -3028,7 +3126,15 @@ def count_github_deployments(user_id):
 
 def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
     try:
-        end_date = datetime.now() + timedelta(days=duration_days)
+        # Stack the new period onto any days still remaining (early renewal loses nothing)
+        _base = datetime.now()
+        try:
+            _cur = get_premium_end(user_id)
+            if _cur and _cur > _base:
+                _base = _cur
+        except Exception:
+            pass
+        end_date = _base + timedelta(days=duration_days)
 
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
@@ -3052,6 +3158,10 @@ def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
         paused_resumed = 0
         if not premium_resumed:
             paused_resumed = resume_paused_deployments(user_id)
+
+        # 4. Deployments that were free-because-of-premium and capped to the previous
+        #    subscription end keep running for the renewed period.
+        extend_premium_deployments(user_id, end_date)
 
         update_system_stats()
 
@@ -5359,6 +5469,13 @@ def create_node_launcher_script(deploy_folder: Path, dest_script: Path,
         f'#!/bin/bash\n'
         f'cd "{deploy_folder}"\n'
         f'export PYTHONUNBUFFERED=1\n'
+        # Private scratch space per deployment (see the Python launcher for why)
+        f'mkdir -p "{deploy_folder}/.tmp"\n'
+        f'export TMPDIR="{deploy_folder}/.tmp" TMP="{deploy_folder}/.tmp" TEMP="{deploy_folder}/.tmp"\n'
+        f'mkdir -p "{deploy_folder}/.home/.cache" "{deploy_folder}/.home/.config" "{deploy_folder}/.home/.local/share"\n'
+        f'export HOME="{deploy_folder}/.home" USERPROFILE="{deploy_folder}/.home" '
+        f'XDG_CACHE_HOME="{deploy_folder}/.home/.cache" XDG_CONFIG_HOME="{deploy_folder}/.home/.config" '
+        f'XDG_DATA_HOME="{deploy_folder}/.home/.local/share"\n'
         f'unset {" ".join(_platform_keys)}\n'
         f'{env_lines}\n\n'
         f'{npm_install}\n\n'
@@ -5419,6 +5536,29 @@ if os.path.isdir(_pkg_dir) and _pkg_dir not in sys.path:
 
 # Change to deployment directory
 os.chdir(r"{deploy_folder}")
+
+# ── Private scratch space (data isolation) ───────────────────────────────────
+# Relative paths already resolve inside THIS deployment's own folder (chdir above). The
+# shared system temp dir is the other place two bots could meet — e.g. both creating a
+# "bot.db" via tempfile or $TMPDIR — so every deployment gets its own.
+try:
+    _tmp_dir = Path(r"{deploy_folder}") / ".tmp"
+    _tmp_dir.mkdir(exist_ok=True)
+    for _tk in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[_tk] = str(_tmp_dir)
+    # Private HOME too: ~/.cache, ~/.config, ~/.local, ~/.npm, ~/bot.db etc. are per deployment
+    _home_dir = Path(r"{deploy_folder}") / ".home"
+    for _sub in ("", ".cache", ".config", ".local/share"):
+        (_home_dir / _sub).mkdir(parents=True, exist_ok=True)
+    os.environ["HOME"] = str(_home_dir)
+    os.environ["USERPROFILE"] = str(_home_dir)
+    os.environ["XDG_CACHE_HOME"] = str(_home_dir / ".cache")
+    os.environ["XDG_CONFIG_HOME"] = str(_home_dir / ".config")
+    os.environ["XDG_DATA_HOME"] = str(_home_dir / ".local/share")
+    import tempfile as _tempfile
+    _tempfile.tempdir = str(_tmp_dir)
+except Exception:
+    pass
 
 # ========== ENVIRONMENT ISOLATION ==========
 # This process was spawned by the hosting bot itself and inherits its FULL
@@ -6454,6 +6594,9 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
             else:
                 expire_time = start_time + timedelta(hours=duration * 24)
+                # Free-because-of-premium → lasts for the subscription, not a flat 30/365 days.
+                expire_time, _premium_capped = cap_expiry_to_premium(
+                    user_id, expire_time, payment_method == 'premium_free')
 
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
@@ -6731,7 +6874,10 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 expire_time = start_time + timedelta(hours=FREE_DEPLOYMENT_DURATION_HOURS)
             else:
                 expire_time = start_time + timedelta(days=duration)
-            
+                # Free-because-of-premium → lasts for the subscription, not a flat 30/365 days.
+                expire_time, _premium_capped = cap_expiry_to_premium(
+                    user_id, expire_time, payment_method == 'premium_free')
+
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
             c.execute('''INSERT INTO deployments 
@@ -6768,6 +6914,9 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                 else f"📅 *Expires:* {expire_time.strftime('%Y-%m-%d %H:%M:%S')}"
             duration_line = "⏱️ *Duration:* Lifetime — never expires" if is_lifetime \
                 else f"⏱️ *Duration:* {duration if not is_free else FREE_DEPLOYMENT_DURATION_HOURS} {'days' if not is_free else 'hours'}"
+            if not is_lifetime and not is_free and _premium_capped:
+                duration_line = "⏱️ *Duration:* until your premium subscription ends"
+                expiry_line += "\n⭐ _Renew premium and it keeps running (up to your plan's length)._"
 
             success_text = (
                 f"*🎉 DEPLOYMENT SUCCESSFUL!* 🎉\n\n"
@@ -7132,6 +7281,9 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
                         # re-verified above — keep the original duration window
                         original_hours = max(1, (current_expire - datetime.fromisoformat(start_time_str)).total_seconds() / 3600)
                         new_expire = datetime.now() + timedelta(hours=original_hours)
+                        # This extension exists only because the owner is premium right now,
+                        # so it can't run past the end of that subscription.
+                        new_expire, _ = cap_expiry_to_premium(owner_id, new_expire, plan != "lifetime")
                     c.execute("""UPDATE deployments
                                  SET proc_pid=?, status='active', is_paused=0, expire_time=?, start_time=?
                                  WHERE deployment_id=?""",
