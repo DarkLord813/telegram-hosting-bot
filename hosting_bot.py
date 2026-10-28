@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
+import time
 import threading
 import secrets
 import string
@@ -1860,7 +1861,7 @@ def files_repo_delete_deployment(user_id, deployment_id) -> bool:
 
 
 def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log=print,
-                                  expect_folder_name=None):
+                                  expect_folder_name=None, progress=None):
     """
     Download a deployment's files from the repo into dest_folder.
     Returns {"files": n, "manifest": {...}} or None (nothing stored / any download failed /
@@ -1903,7 +1904,11 @@ def files_repo_restore_deployment(user_id, deployment_id, dest_folder: Path, log
         dest_folder = Path(dest_folder)
         dest_folder.mkdir(parents=True, exist_ok=True)
         manifest, written = {}, 0
-        for path, sha in sorted(remote.items()):
+        _total = max(1, len(remote))
+        for _i, (path, sha) in enumerate(sorted(remote.items())):
+            if progress:
+                try: progress(5 + int(70 * _i / _total), f"Downloading files ({_i}/{_total})")
+                except Exception: pass
             rel = path[len(prefix) + 1:]
             parts = rel.split('/')
             if not rel or rel.startswith('/') or '..' in parts or '' in parts:
@@ -1978,7 +1983,8 @@ def _install_deps_for_folder(deploy_folder: Path, dest_script: Path, log=print, 
         return False
 
 
-def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, dest_script: Path, log=print):
+def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, dest_script: Path, log=print,
+                                progress=None):
     """
     Pull a deployment whose files are gone from the files repo and reinstall its dependencies.
     Returns (ok, env_dict_or_None).
@@ -1989,8 +1995,12 @@ def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, de
     try:
         _row = db_execute("SELECT folder_name FROM deployments WHERE deployment_id = ?",
                           (deployment_id,), fetch='one')
+        if progress:
+            try: progress(2, "Checking your backup")
+            except Exception: pass
         info = files_repo_restore_deployment(owner_id, deployment_id, deploy_folder, log,
-                                             expect_folder_name=(_row[0] if _row else None))
+                                             expect_folder_name=(_row[0] if _row else None),
+                                             progress=progress)
     except Exception as e:
         log(f"⚠️ Restore error: {e}")
         info = None
@@ -2000,7 +2010,13 @@ def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, de
         return False, None
     if (info.get("manifest") or {}).get("truncated"):
         log("⚠️ This backup was truncated (some files exceeded the size caps)")
+    if progress:
+        try: progress(78, "Installing dependencies")
+        except Exception: pass
     _install_deps_for_folder(deploy_folder, dest_script, log)
+    if progress:
+        try: progress(100, "Restore complete")
+        except Exception: pass
     env = None
     try:
         env = _parse_env_text((deploy_folder / '.env').read_text(errors='replace'))
@@ -7118,6 +7134,36 @@ def delete_deployment(deployment_id, user_id, chat_id):
         send_message(chat_id, f"❌ Error deleting deployment: {str(e)}")
         return False
 
+def progress_bar(pct, width=12):
+    pct = max(0, min(100, int(pct)))
+    filled = round(width * pct / 100)
+    return "█" * filled + "░" * (width - filled) + f" {pct}%"
+
+
+def make_restore_progress(chat_id, title="♻️ *Files are missing locally — restoring from your GitHub backup…*"):
+    """Returns a progress(pct, label) callback that keeps ONE Telegram message updated with a bar.
+    Edits are throttled (Telegram rate-limits them); the message id is taken from the first send."""
+    state = {"mid": None, "last": 0.0, "pct": -1}
+    def _render(pct, label):
+        if str(label).startswith("❌"):
+            pct = max(state["pct"], 0)       # a failure must not look like a full bar
+        return f"{title}\n\n`{progress_bar(pct)}`\n_{label}_"
+    def progress(pct, label=""):
+        now = time.time()
+        if state["mid"] is None:
+            r = send_message(chat_id, _render(pct, label))
+            try: state["mid"] = (r or {}).get("result", {}).get("message_id")
+            except Exception: state["mid"] = None
+            state["last"], state["pct"] = now, pct
+            return
+        if state["mid"] and (pct == 100 or (now - state["last"] >= 1.5 and pct != state["pct"])):
+            edit_message(chat_id, state["mid"], _render(pct, label))
+            state["last"] = now
+            if not str(label).startswith("❌"):
+                state["pct"] = pct
+    return progress
+
+
 def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=False):
     try:
         conn = sqlite3.connect(DATABASE_FILE)
@@ -7186,10 +7232,15 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
 
         # Files gone (disk wiped)? Bring them back from the GitHub files repo first.
         if (not deploy_folder.exists() or not dest_script.exists()) and FILES_REPO_ENABLED:
-            send_message(chat_id, "♻️ Files are missing locally — restoring from your GitHub backup…")
+            _prog = make_restore_progress(chat_id)
+            _prog(0, "Starting")
             _ok, _renv = _files_restore_for_relaunch(
                 owner_id, deployment_id, deploy_folder, dest_script,
-                log=lambda m, _d=deployment_id: print(f"   [restore dep#{_d}] {m}"))
+                log=lambda m, _d=deployment_id: print(f"   [restore dep#{_d}] {m}"),
+                progress=_prog)
+            if not _ok:
+                try: _prog(100, "❌ No usable backup found")
+                except Exception: pass
             if _ok and _renv and not (json.loads(env_vars_json) if env_vars_json else {}):
                 env_vars_json = json.dumps(_renv)
 
