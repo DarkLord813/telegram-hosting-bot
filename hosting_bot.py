@@ -7384,6 +7384,69 @@ def view_install_logs(chat_id, message_id, user_id, dep_id):
         f"```\n📋 INSTALLATION LOGS\n📁 {display_filename(file_name)}\n\n{log_text[-3000:]}\n```",
         keyboard)
 
+def _build_full_log_text(user_id, dep_id):
+    """Complete log (install log + entire runtime output + error) for one of the user's deployments.
+    Returns (text, file_name) or (None, None) when the deployment isn't theirs."""
+    row = db_execute("SELECT deploy_log, file_name, status, error_log FROM deployments "
+                     "WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id), fetch='one')
+    if not row:
+        return None, None
+    deploy_log, file_name, status, error_log = row
+    parts = [f"=== DEPLOYMENT #{dep_id} — {display_filename(file_name)} — {str(status).upper()} ===\n"]
+    if deploy_log:
+        parts.append("--- INSTALL / DEPLOY LOG ---\n" + deploy_log)
+    lf = get_deploy_folder(user_id, dep_id) / "output.log"
+    try:
+        if lf.exists():
+            parts.append("--- RUNTIME OUTPUT (full) ---\n" + lf.read_text(errors="replace"))
+    except Exception as e:
+        parts.append(f"(could not read runtime log: {e})")
+    if error_log:
+        parts.append("--- ERROR ---\n" + error_log)
+    return "\n\n".join(parts), file_name
+
+def send_full_logs(chat_id, user_id, dep_id):
+    text, fname = _build_full_log_text(user_id, dep_id)
+    if text is None:
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    out = LOGS_DIR / f"logs_{user_id}_{dep_id}_{secrets.token_hex(4)}.txt"
+    try:
+        out.write_text(text, encoding="utf-8")
+        send_document(chat_id, out, caption=f"📥 Download logs — {display_filename(fname)}\n"
+                      "Open the file, then select all and copy.", filename=f"logs_{dep_id}.txt")
+    finally:
+        try: out.unlink()
+        except Exception: pass
+
+def send_copyable_logs(chat_id, user_id, dep_id, max_chunks=40, chunk=3900):
+    """The COMPLETE log as consecutive tap-to-copy code blocks (Telegram copies a block on tap).
+    Telegram caps a message at 4096 chars, so a long log is split on line boundaries."""
+    text, fname = _build_full_log_text(user_id, dep_id)
+    if text is None:
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    text = text.replace("`", "'")
+    pieces, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > chunk:                      # a single huge line
+            if cur: pieces.append(cur); cur = ""
+            pieces.append(line[:chunk]); line = line[chunk:]
+        if len(cur) + len(line) > chunk:
+            pieces.append(cur); cur = ""
+        cur += line
+    if cur: pieces.append(cur)
+    if len(pieces) > max_chunks:
+        send_message(chat_id, f"ℹ️ This log is very long ({len(pieces)} parts). Sending the latest {max_chunks}; "
+                              "use 📥 Download Logs for the complete file.")
+        pieces = pieces[-max_chunks:]
+    elif len(pieces) > 1:
+        send_message(chat_id, f"📋 Full logs in {len(pieces)} parts — tap a block to copy it.")
+    for piece in pieces:
+        send_message(chat_id, f"```\n{piece.rstrip()}\n```")
+        if len(pieces) > 3:
+            sleep(0.4)                                # stay under Telegram's per-chat flood limit
+
 def view_runtime_logs(chat_id, message_id, user_id, dep_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -7422,6 +7485,8 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
     keyboard = {
         "inline_keyboard": [
             [{"text": "🔄 Refresh", "callback_data": f"view_runtime_logs_{dep_id}"}],
+            [{"text": "📥 Download Logs", "callback_data": f"full_logs_{dep_id}"},
+             {"text": "📋 Copy Logs", "callback_data": f"copy_logs_{dep_id}"}],
             [{"text": "📋 Install Logs", "callback_data": f"view_install_logs_{dep_id}"}],
             [{"text": "🔄 Restart", "callback_data": f"restart_deploy_{dep_id}"}],
             [{"text": "🗑️ Delete", "callback_data": f"delete_deploy_{dep_id}"}],
@@ -9781,6 +9846,14 @@ def handle_callback(callback):
         view_install_logs(chat_id, message_id, user_id, dep_id)
         return
     
+    if data.startswith("full_logs_"):
+        send_full_logs(chat_id, user_id, int(data.split("_")[2]))
+        return
+
+    if data.startswith("copy_logs_"):
+        send_copyable_logs(chat_id, user_id, int(data.split("_")[2]))
+        return
+
     if data.startswith("view_runtime_logs_"):
         dep_id = int(data.split("_")[3])
         view_runtime_logs(chat_id, message_id, user_id, dep_id)
