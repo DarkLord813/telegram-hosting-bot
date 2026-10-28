@@ -7735,7 +7735,7 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
     c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date) VALUES (?, ?, ?, ?)",
               (user_id, username, first_name, datetime.now().isoformat()))
     c.execute("UPDATE users SET last_active = ?, username = ?, first_name = ? WHERE user_id = ?",
-              (datetime.now().isoformat(), username, first_name, user_id))
+              (datetime.now().isoformat(), username or None, first_name, user_id))
     conn.commit()
     conn.close()
 
@@ -8586,26 +8586,119 @@ def admin_list_codes(chat_id, message_id):
     keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
     edit_message(chat_id, message_id, text, keyboard)
 
-def admin_list_users(chat_id, message_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT user_id, username, first_name, coins_balance, stars_balance, is_premium, join_date
-                 FROM users ORDER BY join_date DESC LIMIT 30''')
-    rows = c.fetchall()
-    conn.close()
-    
+USERS_PER_PAGE = 8
+
+def _ago(iso):
+    try:
+        secs = (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
+    except Exception:
+        return "never"
+    if secs < 90:      return "just now"
+    if secs < 3600:    return f"{int(secs // 60)}m ago"
+    if secs < 86400:   return f"{int(secs // 3600)}h ago"
+    if secs < 86400*60: return f"{int(secs // 86400)}d ago"
+    return iso[:10]
+
+
+def _user_plan_label(uid, premium, expires, plan):
+    if is_admin(uid):
+        return "👑 Admin"
+    if premium and expires:
+        try:
+            if datetime.fromisoformat(expires) > datetime.now():
+                return f"⭐ Premium{(' ' + plan.title()) if plan else ''} → {expires[:10]}"
+        except Exception:
+            pass
+    return "🆓 Free"
+
+
+def _user_card(row, number=None):
+    uid, username, first, coins, stars, premium, expires, plan, join_date, last_active = row
+    name = safe_md(first or 'Unknown')
+    head = f"*{number}.* " if number else ""
+    lines = [f"{head}👤 `{name}`" + (f"  @{safe_md(username)}" if username else ""),
+             f"🆔 `{uid}`",
+             f"💎 {_user_plan_label(uid, premium, expires, plan)}",
+             f"🪙 `{coins or 0}`   ⭐ `{stars or 0}`",
+             f"📅 Joined `{(join_date or 'Unknown')[:10]}`  ·  🕒 Active `{_ago(last_active) if last_active else 'never'}`"]
+    return "\n".join(lines)
+
+
+_USER_COLS = ("user_id, username, first_name, coins_balance, stars_balance, is_premium, "
+              "premium_expires, premium_plan, join_date, last_active")
+
+
+def admin_list_users(chat_id, message_id, page=0):
+    total = (db_execute("SELECT COUNT(*) FROM users", fetch='one') or [0])[0] or 0
+    pages = max(1, -(-total // USERS_PER_PAGE))
+    page = max(0, min(int(page), pages - 1))
+    rows = db_execute(f"SELECT {_USER_COLS} FROM users ORDER BY join_date DESC LIMIT ? OFFSET ?",
+                      (USERS_PER_PAGE, page * USERS_PER_PAGE), fetch='all') or []
     if not rows:
         text = "👥 No users found."
     else:
-        text = "*👥 USERS*\n\n"
-        for uid, username, first, coins, stars, premium, join_date in rows:
-            premium_icon = "⭐" if premium else "🆓"
-            join_short = join_date[:10] if join_date else "Unknown"
-            text += f"• `{uid}` - {first or username or 'Unknown'}\n"
-            text += f"  🪙{coins} ⭐{stars} | {premium_icon} | Joined: {join_short}\n\n"
-    
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
+        premium_n = (db_execute("SELECT COUNT(*) FROM users WHERE is_premium=1", fetch='one') or [0])[0]
+        text = (f"*👥 USERS*  —  page {page + 1}/{pages}\n"
+                f"Total `{total}`  ·  ⭐ Premium `{premium_n}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n")
+        text += "\n\n".join(_user_card(r, page * USERS_PER_PAGE + i + 1) for i, r in enumerate(rows))
+    nav = []
+    if page > 0:         nav.append({"text": "⬅️ Prev", "callback_data": f"admin_users_p_{page - 1}"})
+    nav.append({"text": f"{page + 1}/{pages}", "callback_data": f"admin_users_p_{page}"})
+    if page < pages - 1: nav.append({"text": "Next ➡️", "callback_data": f"admin_users_p_{page + 1}"})
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔍 Search by User ID", "callback_data": "admin_search_user"}],
+        nav,
+        [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
     edit_message(chat_id, message_id, text, keyboard)
+
+
+def admin_prompt_user_search(chat_id, message_id, admin_id):
+    set_user_step(admin_id, 'awaiting_admin_user_search')
+    edit_message(chat_id, message_id,
+        "*🔍 SEARCH USER*\n\nSend the user's *numeric ID* (e.g. `8935687148`).\n"
+        "_You can also send an @username or part of a name._",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_list_users"}]]})
+
+
+def admin_user_detail(chat_id, target_id):
+    row = db_execute(f"SELECT {_USER_COLS} FROM users WHERE user_id = ?", (target_id,), fetch='one')
+    if not row:
+        send_message(chat_id, f"❌ No user with ID `{target_id}`.",
+                     {"inline_keyboard": [[{"text": "🔍 Search again", "callback_data": "admin_search_user"}],
+                                          [{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
+        return
+    dep = db_execute("SELECT COUNT(*), SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) "
+                     "FROM deployments WHERE user_id = ?", (target_id,), fetch='one') or (0, 0)
+    text = (f"*👤 USER DETAILS*\n━━━━━━━━━━━━━━━━━━━━━━\n{_user_card(row)}\n"
+            f"📦 Deployments: `{dep[0] or 0}` (🟢 `{dep[1] or 0}` running)")
+    send_message(chat_id, text,
+                 {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": f"admin_user_view_{target_id}"}],
+                                      [{"text": "🔍 Search again", "callback_data": "admin_search_user"}],
+                                      [{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
+
+
+def admin_handle_user_search(chat_id, admin_id, text):
+    q = (text or '').strip()
+    set_user_step(admin_id, None)
+    if q.lstrip('-').isdigit():
+        admin_user_detail(chat_id, int(q))
+        return
+    like = f"%{q.lstrip('@')}%"
+    rows = db_execute("SELECT user_id, first_name, username FROM users "
+                      "WHERE username LIKE ? OR first_name LIKE ? ORDER BY last_active DESC LIMIT 8",
+                      (like, like), fetch='all') or []
+    if not rows:
+        send_message(chat_id, "❌ No matching user.",
+                     {"inline_keyboard": [[{"text": "🔍 Search again", "callback_data": "admin_search_user"}],
+                                          [{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
+    elif len(rows) == 1:
+        admin_user_detail(chat_id, rows[0][0])
+    else:
+        send_message(chat_id, f"*🔍 {len(rows)} matches* — pick one:",
+                     {"inline_keyboard": [[{"text": f"{(r[1] or 'Unknown')[:24]} · {r[0]}",
+                                            "callback_data": f"admin_user_view_{r[0]}"}] for r in rows]
+                                         + [[{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
 
 def admin_subscriptions(chat_id, message_id):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -9421,7 +9514,28 @@ def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
 
 
 # ==================== CALLBACK HANDLER ====================
+def touch_user(tg_user):
+    """Keep a user's stored details accurate: called for EVERY message / button press, so a changed
+    display name or @username (and last-active time) is picked up immediately, not just on /start."""
+    try:
+        uid = int(tg_user['id'])
+        now = datetime.now().isoformat()
+        name  = (tg_user.get('first_name') or '').strip() or None
+        uname = tg_user.get('username') or None
+        conn = sqlite3.connect(DATABASE_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date) VALUES (?,?,?,?)",
+                  (uid, uname, name, now))
+        c.execute("UPDATE users SET username = ?, first_name = COALESCE(?, first_name), last_active = ? "
+                  "WHERE user_id = ?", (uname, name, now, uid))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ touch_user failed: {e}")
+
+
 def handle_callback(callback):
+    touch_user(callback.get('from') or {})
     callback_id = callback['id']
     user_id = callback['from']['id']
     message = callback.get('message', {})
@@ -9433,6 +9547,10 @@ def handle_callback(callback):
     print(f"📨 Callback: {data} from user {user_id}")
     
     # ========== MAIN MENU ==========
+    if data in ("main_menu", "admin_panel") and is_admin(user_id):
+        if get_user_step(user_id).get('step') == 'awaiting_admin_user_search':
+            set_user_step(user_id, None)           # leaving the search prompt cancels it
+
     if data == "main_menu":
         if is_user_verified(user_id):
             welcome = build_main_menu_text(user_id, callback['from'].get('first_name'))
@@ -9457,7 +9575,23 @@ def handle_callback(callback):
     
     if data == "admin_list_users":
         if is_admin(user_id):
+            set_user_step(user_id, None)
             admin_list_users(chat_id, message_id)
+        return
+
+    if data.startswith("admin_users_p_"):
+        if is_admin(user_id):
+            admin_list_users(chat_id, message_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data == "admin_search_user":
+        if is_admin(user_id):
+            admin_prompt_user_search(chat_id, message_id, user_id)
+        return
+
+    if data.startswith("admin_user_view_"):
+        if is_admin(user_id):
+            admin_user_detail(chat_id, int(data.rsplit("_", 1)[1]))
         return
     
     if data == "admin_subscriptions":
@@ -10760,6 +10894,7 @@ def get_user_step(user_id):
 
 # ==================== MESSAGE HANDLER ====================
 def handle_message(message):
+    touch_user(message.get('from') or {})
     chat_id = message['chat']['id']
     user_id = message['from']['id']
     first_name = message['from'].get('first_name', 'User')
@@ -10776,6 +10911,14 @@ def handle_message(message):
     
     if 'text' in message:
         text = message['text']
+
+        # ── Admin: search a user ─────────────────────────────────────
+        if user_step.get('step') == 'awaiting_admin_user_search':
+            if is_admin(user_id):
+                admin_handle_user_search(chat_id, user_id, text)
+            else:
+                set_user_step(user_id, None)
+            return
 
         # ── GitHub deploy: env vars (from _start_github_deploy) ──────
         if user_step.get('step') == 'awaiting_env_vars' and user_step.get('temp_source') == 'github':
