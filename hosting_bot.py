@@ -8616,7 +8616,7 @@ def _user_card(row, number=None):
     uid, username, first, coins, stars, premium, expires, plan, join_date, last_active = row
     name = safe_md(first or 'Unknown')
     head = f"*{number}.* " if number else ""
-    lines = [f"{head}👤 `{name}`" + (f"  @{safe_md(username)}" if username else ""),
+    lines = [f"{head}👤 `{name}`" + (f"  `@{safe_md(username)}`" if username else ""),
              f"🆔 `{uid}`",
              f"💎 {_user_plan_label(uid, premium, expires, plan)}",
              f"🪙 `{coins or 0}`   ⭐ `{stars or 0}`",
