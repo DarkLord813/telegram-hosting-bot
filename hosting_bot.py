@@ -1061,6 +1061,9 @@ def _gh_api(method, path, payload=None):
     """Raw GitHub Contents API call. Returns (http_status, response_dict)."""
     url     = (f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/"
                f"{GITHUB_REPO_NAME}/contents/{path}")
+    if method == "GET" and "?" not in path:
+        # read from the SAME branch the backup is written to (not the repo's default branch)
+        url += "?ref=" + urllib.parse.quote(GITHUB_BACKUP_BRANCH, safe="")
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept":        "application/vnd.github+json",
@@ -1070,13 +1073,56 @@ def _gh_api(method, path, payload=None):
     body = json.dumps(payload).encode() if payload else None
     req  = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=120 if payload else 30) as r:   # big uploads need time
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         try:    return e.code, json.loads(e.read())
         except: return e.code, {}
     except Exception as ex:
         return 0, {"error": str(ex)}
+
+def _gh_repo_api(method, subpath, timeout=120):
+    """GitHub REST call on the DB repo (not under /contents) — used for the Git blobs API."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{subpath}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    req = urllib.request.Request(url, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:    return e.code, json.loads(e.read())
+        except: return e.code, {}
+    except Exception as ex:
+        return 0, {"error": str(ex)}
+
+
+def _gh_contents_bytes(resp):
+    """
+    File bytes from a Contents-API response. GitHub only inlines the content for files up to
+    1 MB — for anything bigger `content` is EMPTY (encoding "none"). That is exactly what made the
+    bot think a >1 MB backup was 'too small', skip the restore and start with a fresh database.
+    Larger files are fetched through the Git blobs API (works up to 100 MB).
+    """
+    raw = (resp.get("content") or "").replace("\n", "")
+    if raw and resp.get("encoding", "base64") == "base64":
+        data = base64.b64decode(raw)
+    else:
+        sha = resp.get("sha")
+        if not sha:
+            raise RuntimeError("backup has no content and no blob sha")
+        status, blob = _gh_repo_api("GET", f"git/blobs/{sha}")
+        if status != 200:
+            raise RuntimeError(f"large-file download failed (HTTP {status}: {blob.get('message', blob)})")
+        data = base64.b64decode((blob.get("content") or "").replace("\n", ""))
+    expected = resp.get("size")
+    if isinstance(expected, int) and expected and len(data) != expected:
+        raise RuntimeError(f"incomplete download ({len(data)} of {expected} bytes)")
+    return data
+
+
+_db_restore_failed = False    # True when a backup EXISTS but could not be restored -> never overwrite it
+
 
 def _db_has_data():
     """Return True only when the database contains real rows (not just schema)."""
@@ -1115,21 +1161,24 @@ def github_restore_db():
     if status == 404:
         print("ℹ️  No backup found on GitHub — starting fresh")
         return False
+    global _db_restore_failed
     if status != 200:
         print(f"⚠️  GitHub restore HTTP {status}: {resp.get('message', resp)}")
+        _db_restore_failed = True      # a backup may exist — don't let a fresh DB overwrite it
         return False
 
     try:
-        raw_b64  = resp.get("content", "").replace("\n", "")
-        db_bytes = base64.b64decode(raw_b64)
+        db_bytes = _gh_contents_bytes(resp)
 
         if len(db_bytes) < 1024:
             print("⚠️  GitHub backup is too small — skipping restore (corrupt?)")
+            _db_restore_failed = True
             return False
 
         # Validate it is really a SQLite database before touching the live one
         if not db_bytes.startswith(b"SQLite format 3\x00"):
             print("⚠️  GitHub backup is not a valid SQLite file — skipping restore")
+            _db_restore_failed = True
             return False
 
         DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1145,10 +1194,12 @@ def github_restore_db():
             if not _ok or _ok[0] != "ok":
                 print(f"⚠️  GitHub backup failed integrity check ({_ok}) — skipping restore")
                 _tmp_restore.unlink(missing_ok=True)
+                _db_restore_failed = True
                 return False
         except Exception as _ie:
             print(f"⚠️  GitHub backup unreadable ({_ie}) — skipping restore")
             _tmp_restore.unlink(missing_ok=True)
+            _db_restore_failed = True
             return False
 
         # Keep a safety copy of any existing live database before overwriting
@@ -1167,6 +1218,7 @@ def github_restore_db():
         return True
     except Exception as e:
         print(f"❌ GitHub restore error: {e}")
+        _db_restore_failed = True
         return False
 
 def github_backup_db(reason: str = "auto", force: bool = False):
@@ -1185,6 +1237,10 @@ def github_backup_db(reason: str = "auto", force: bool = False):
         return False
     if not _db_has_data():
         print(f"⏭️  Backup skipped ({reason}): database has no data")
+        return False
+    if _db_restore_failed and not force:
+        print(f"🛡️  Backup skipped ({reason}): the GitHub backup could not be restored at startup, "
+              f"so it is NOT being overwritten with this database")
         return False
 
     now = datetime.now().timestamp()
@@ -1212,6 +1268,13 @@ def github_backup_db(reason: str = "auto", force: bool = False):
         status, resp = _gh_api("GET", GITHUB_BACKUP_PATH)
         if status == 200:
             sha = resp.get("sha")
+            _remote_size = resp.get("size") or 0
+            # Never replace a substantial backup with a drastically smaller database
+            # (a reset/fresh DB would otherwise destroy the only good copy).
+            if not force and _remote_size > 65536 and len(db_bytes) < _remote_size * 0.4:
+                print(f"🛡️  Backup skipped ({reason}): local DB is {len(db_bytes)/1024:.0f} KB but the "
+                      f"GitHub backup is {_remote_size/1024:.0f} KB — refusing to overwrite it")
+                return False
         elif status not in (200, 404):
             print(f"⚠️  GitHub SHA lookup failed (HTTP {status}) — backup aborted")
             return False
@@ -2099,6 +2162,7 @@ def _files_sync_thread():
     while True:
         try:
             _files_retry_pending_deletes()
+            files_repo_purge_orphans_auto()
             where = "" if first else "WHERE status IN ('active', 'paused')"
             ids = [r[0] for r in db_execute(f"SELECT deployment_id FROM deployments {where}", fetch='all') or []]
             first = False
@@ -2110,6 +2174,100 @@ def _files_sync_thread():
         except Exception as e:
             print(f"⚠️  Files sync error: {e}")
         sleep(FILES_SYNC_INTERVAL_SEC)
+
+
+def _files_remote_deployment_dirs():
+    """{(user_id, deployment_id): [repo paths]} for everything stored under FILES_REPO_ROOT.
+    One Git-tree call; falls back to walking the Contents API when GitHub truncates a huge tree.
+    Anything not shaped like <root>/<digits>/<digits>/... is ignored (never touched)."""
+    head = _files_ensure_branch()
+    if not head:
+        raise RuntimeError("backup branch not available")
+    status, commit = _gh_files_api("GET", f"git/commits/{head}")
+    if status != 200:
+        raise RuntimeError(f"commit lookup failed (HTTP {status})")
+    status, tree = _gh_files_api("GET", f"git/trees/{commit['tree']['sha']}?recursive=1", timeout=120)
+    if status == 200 and not tree.get("truncated"):
+        paths = [t["path"] for t in tree.get("tree", []) if t.get("type") == "blob"]
+    else:
+        paths = list(_files_list_remote(FILES_REPO_ROOT).keys())
+    found = {}
+    pre = FILES_REPO_ROOT + "/"
+    for pth in paths:
+        if not pth.startswith(pre):
+            continue
+        parts = pth[len(pre):].split("/")
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            found.setdefault((int(parts[0]), int(parts[1])), []).append(pth)
+    return found
+
+
+def files_repo_purge_orphans(force=False, dry_run=False):
+    """
+    Delete every deployment folder in the files repo that no longer exists in the database
+    (or belongs to a different user than the database says). One commit.
+    Returns {"checked": n, "orphans": [(uid, dep), ...], "deleted": n, "error": str|None, "blocked": str|None}.
+
+    Safety: if the database has NO deployments, or the orphans are most of the repo, the
+    database is far more likely to be empty/restored-from-old than the repo to be full of
+    junk — so the purge refuses (blocked) unless force=True (admin confirmed).
+    """
+    res = {"checked": 0, "orphans": [], "deleted": 0, "error": None, "blocked": None}
+    if not _files_repo_ready():
+        res["error"] = "files repo not configured / not private"
+        return res
+    with _files_lock:
+        try:
+            found = _files_remote_deployment_dirs()
+            res["checked"] = len(found)
+            if not found:
+                return res
+            known = {(int(u), int(d)) for u, d in
+                     (db_execute("SELECT user_id, deployment_id FROM deployments", fetch='all') or [])}
+            orphans = sorted(k for k in found if k not in known)
+            res["orphans"] = orphans
+            if not orphans or dry_run:
+                return res
+            if not force:
+                if not known:
+                    res["blocked"] = "the database lists no deployments at all (empty or just restored?)"
+                elif len(orphans) > max(5, len(found) // 2):
+                    res["blocked"] = (f"{len(orphans)} of {len(found)} stored deployments look orphaned "
+                                      f"— that many is suspicious")
+                if res["blocked"]:
+                    return res
+            changes = {pth: None for k in orphans for pth in found[k]}
+            if _files_commit(changes, f"purge {len(orphans)} orphaned deployment(s)"):
+                res["deleted"] = len(orphans)
+                for (u, d) in orphans:
+                    _files_remote.pop((u, d), None)
+                    db_execute("DELETE FROM files_repo_pending_delete WHERE user_id=? AND deployment_id=?", (u, d))
+            else:
+                res["error"] = "commit failed"
+        except Exception as e:
+            res["error"] = str(e)
+    return res
+
+
+def files_repo_purge_orphans_auto():
+    r = files_repo_purge_orphans()
+    if r["deleted"]:
+        print(f"🧹 Files repo: removed {r['deleted']} orphaned deployment(s): {r['orphans'][:10]}")
+        try:
+            notify_admin(f"🧹 Removed {r['deleted']} orphaned deployment folder(s) from the GitHub files repo "
+                         f"(not in the database any more).")
+        except Exception:
+            pass
+    elif r["blocked"]:
+        print(f"⚠️  Files repo purge skipped: {r['blocked']}")
+        try:
+            notify_admin(f"⚠️ Orphan cleanup skipped: {r['blocked']}.\nUse Admin → Database → "
+                         f"Clean Orphaned Files to review it manually.")
+        except Exception:
+            pass
+    elif r["error"]:
+        print(f"⚠️  Files repo purge error: {r['error']}")
+    return r
 
 
 def files_repo_status_line() -> str:
@@ -8304,11 +8462,37 @@ def admin_database_menu(chat_id, message_id, user_id):
     )
     keyboard = {"inline_keyboard": [
         [{"text": "🔄 Backup to GitHub Now", "callback_data": "admin_db_backup_now"}],
+        [{"text": "🧹 Clean Orphaned Files", "callback_data": "admin_purge_orphans"}],
         [{"text": "⬇️ Download DB File",      "callback_data": "admin_db_download"}],
         [{"text": "⬆️ Restore from File",     "callback_data": "admin_db_restore_start"}],
         [{"text": "🔙 Back to Admin Panel",   "callback_data": "admin_panel"}],
     ]}
     edit_message(chat_id, message_id, text, keyboard)
+
+
+def admin_purge_orphans(chat_id, message_id, user_id, force=False):
+    if not is_admin(user_id):
+        return
+    back_kb = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "admin_database"}]]}
+    if not FILES_REPO_ENABLED:
+        edit_message(chat_id, message_id, "❌ `GITHUB_FILES_REPO_NAME` isn't configured.", back_kb)
+        return
+    edit_message(chat_id, message_id, "🧹 Checking the files repo for orphaned deployments…")
+    r = files_repo_purge_orphans(force=force)
+    names = ", ".join(f"{u}/{d}" for u, d in r["orphans"][:15]) + (" …" if len(r["orphans"]) > 15 else "")
+    if r["error"]:
+        text = f"❌ Cleanup failed: {safe_md(r['error'])}"
+    elif r["blocked"]:
+        text = (f"⚠️ *Cleanup paused*\n\n{safe_md(r['blocked'])}.\n\nOrphans found: `{len(r['orphans'])}` of "
+                f"`{r['checked']}`\n`{names}`\n\nIf you're sure the database is correct, delete them anyway.")
+        back_kb = {"inline_keyboard": [[{"text": "🗑️ Delete them anyway", "callback_data": "admin_purge_orphans_force"}],
+                                       [{"text": "🔙 Back", "callback_data": "admin_database"}]]}
+    elif r["deleted"]:
+        text = (f"✅ Removed `{r['deleted']}` orphaned deployment(s) from the files repo.\n`{names}`\n"
+                f"Checked `{r['checked']}` stored deployment(s).")
+    else:
+        text = f"✅ Nothing to clean — all `{r['checked']}` stored deployment(s) exist in the database."
+    edit_message(chat_id, message_id, text, back_kb)
 
 
 def admin_db_backup_now(chat_id, message_id, user_id):
@@ -8332,6 +8516,9 @@ def admin_db_backup_now(chat_id, message_id, user_id):
     # 2) every user's deployment files
     files_line = "⏭️ User files: `GITHUB_FILES_REPO_NAME` not configured"
     if FILES_REPO_ENABLED:
+        _pr = files_repo_purge_orphans()
+        if _pr["deleted"]:
+            db_line += f"\n🧹 Removed `{_pr['deleted']}` orphaned deployment(s) from the repo"
         ids = [r[0] for r in db_execute("SELECT deployment_id FROM deployments ORDER BY deployment_id",
                                         fetch='all') or []]
         last_edit = [0.0]
@@ -9626,6 +9813,11 @@ def handle_callback(callback):
             admin_kill_orphans_action(chat_id, message_id, user_id)
         else:
             edit_message(chat_id, message_id, "🔒 Unauthorized!")
+        return
+
+    if data in ("admin_purge_orphans", "admin_purge_orphans_force"):
+        if is_admin(user_id):
+            admin_purge_orphans(chat_id, message_id, user_id, force=data.endswith("_force"))
         return
 
     if data == "admin_db_backup_now":
