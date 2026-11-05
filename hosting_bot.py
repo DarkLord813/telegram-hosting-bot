@@ -180,10 +180,10 @@ def _tier_price(key, default):
     except ValueError:
         return default
 RESOURCE_TIERS = {
-    "512mb": (512,  "512 MB", _tier_price("512mb", 300)),
-    "1gb":   (1024, "1 GB",   _tier_price("1gb",   500)),
-    "2gb":   (2048, "2 GB",   _tier_price("2gb",   900)),
-    "4gb":   (4096, "4 GB",   _tier_price("4gb",  1600)),
+    "512mb": (512,  "512 MB", _tier_price("512mb", 30)),
+    "1gb":   (1024, "1 GB",   _tier_price("1gb",   50)),
+    "2gb":   (2048, "2 GB",   _tier_price("2gb",   90)),
+    "4gb":   (4096, "4 GB",   _tier_price("4gb",  160)),
 }
 # Share of the pool that may be sold as tiers (default 80%). A size is on sale only while the
 # sellable, UNALLOCATED RAM can cover it (so when less than 512 MB is sellable, nothing is purchasable).
