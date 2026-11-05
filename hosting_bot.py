@@ -168,6 +168,26 @@ FREE_DEPLOYMENT_DURATION_HOURS = int(os.environ.get("FREE_DEPLOYMENT_DURATION_HO
 # Exchange rate
 STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 
+# ── Resource tiers: a purchased, guaranteed RAM allocation for 30 days ─────────────────────
+# key -> (MB, label, stars). Override prices with TIER_PRICE_<KEY>_STARS (e.g. TIER_PRICE_1GB_STARS=450).
+# Coins price = stars x STARS_PER_COIN. A tier also includes 30 days of Monthly Premium.
+RESOURCE_TIER_DAYS = 30
+def _tier_price(key, default):
+    try:
+        return int(os.environ.get(f"TIER_PRICE_{key.upper()}_STARS", default))
+    except ValueError:
+        return default
+RESOURCE_TIERS = {
+    "512mb": (512,  "512 MB", _tier_price("512mb", 300)),
+    "1gb":   (1024, "1 GB",   _tier_price("1gb",   500)),
+    "2gb":   (2048, "2 GB",   _tier_price("2gb",   900)),
+    "4gb":   (4096, "4 GB",   _tier_price("4gb",  1600)),
+}
+# Share of the pool that may be sold as tiers (default 80%). A size is on sale only while the
+# sellable, UNALLOCATED RAM can cover it (so when less than 512 MB is sellable, nothing is purchasable).
+# The other 20% is always shared by free users. Set to 1.0 to sell the whole pool.
+TIER_POOL_MAX_FRACTION = float(os.environ.get("TIER_POOL_MAX_FRACTION", 0.8))
+
 # Referral reward
 REFERRAL_REWARD_COINS = int(os.environ.get("REFERRAL_REWARD_COINS", 50))
 
@@ -490,6 +510,9 @@ def init_db():
         ("total_referrals","INTEGER DEFAULT 0"),
         ("pending_json",   "TEXT DEFAULT '{}'"),
         ("channels_verified", "TEXT"),
+        ("resource_tier_key",     "TEXT"),
+        ("resource_tier_mb",      "INTEGER DEFAULT 0"),
+        ("resource_tier_expires", "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}" if _col == "folder_name"
@@ -2737,12 +2760,72 @@ def count_quota_users() -> int:
         return 1
 
 
+def get_user_tier(user_id):
+    """(key, mb, expires_datetime) of the user's ACTIVE resource tier, or None."""
+    try:
+        row = db_execute("SELECT resource_tier_key, resource_tier_mb, resource_tier_expires "
+                         "FROM users WHERE user_id = ?", (user_id,), fetch='one')
+        if row and row[1] and row[2]:
+            exp = datetime.fromisoformat(row[2])
+            if exp > datetime.now():
+                return row[0], int(row[1]), exp
+    except Exception:
+        pass
+    return None
+
+
+def tier_sold_mb():
+    """(total MB, number of users) held by ACTIVE resource tiers (admins excluded)."""
+    try:
+        admin_list = list(ADMIN_IDS)
+        q = ("SELECT COALESCE(SUM(resource_tier_mb),0), COUNT(*) FROM users "
+             "WHERE resource_tier_mb > 0 AND resource_tier_expires > ?")
+        params = [datetime.now().isoformat()]
+        if admin_list:
+            q += " AND user_id NOT IN (%s)" % ",".join("?" * len(admin_list))
+            params += admin_list
+        row = db_execute(q, tuple(params), fetch='one')
+        return float(row[0] or 0), int(row[1] or 0)
+    except Exception:
+        return 0.0, 0
+
+
+def count_pool_sharers() -> int:
+    """Users who split the REMAINING pool equally: non-admins without an active tier (min 1)."""
+    return max(1, count_quota_users() - tier_sold_mb()[1])
+
+
+def tier_unallocated_mb(user_id=None) -> float:
+    """RAM of the pool not held by anyone's tier (a user's OWN current tier counts as free for them,
+    since a new purchase replaces it)."""
+    sold, _ = tier_sold_mb()
+    cur = get_user_tier(user_id) if user_id else None
+    if cur:
+        sold -= cur[1]
+    return max(0.0, get_resource_pool_mb() * TIER_POOL_MAX_FRACTION - sold)
+
+
+def tier_capacity_ok(user_id, new_mb) -> bool:
+    """Can new_mb be sold to this user without exceeding TIER_POOL_MAX_FRACTION of the pool?
+    (their own current tier is being replaced, so it doesn't count twice)"""
+    sold, _ = tier_sold_mb()
+    cur = get_user_tier(user_id)
+    if cur:
+        sold -= cur[1]
+    return sold + new_mb <= get_resource_pool_mb() * TIER_POOL_MAX_FRACTION
+
+
 def get_user_quota_mb(user_id) -> float:
-    """This user's share of the pool in MB (admins get the whole pool)."""
+    """Admins: the whole pool. Tier holders: their purchased amount. Everyone else: an equal
+    share of what is left of the pool after tiers are carved out."""
     pool = get_resource_pool_mb()
     if is_admin(user_id):
         return pool
-    return pool / count_quota_users()
+    tier = get_user_tier(user_id)
+    if tier:
+        return float(tier[1])
+    sold, _ = tier_sold_mb()
+    return max(64.0, (pool - sold) / count_pool_sharers())
 
 
 def format_resource(mb: float) -> str:
@@ -2816,7 +2899,9 @@ def quota_exceeded_text(used_mb, quota_mb) -> str:
             f"`{format_resource(quota_mb)}` share.\n"
             f"The host's resources are split equally between all users, so your "
             f"share shrinks as more people join.\n\n"
-            f"Stop or delete a bot to free up resources, then try again.")
+            f"Stop or delete a bot to free up resources, or get a guaranteed amount "
+            f"with a *📈 Resource Plan* (512 MB - 4 GB).\n\n"
+            f"Then try again.")
 
 
 def quota_monitor():
@@ -4249,7 +4334,8 @@ def show_premium_menu(chat_id, user_id, message_id=None):
                 f"✨ Benefits active!\n\n"
                 f"💰 Monthly/Yearly deployments are *FREE* for you!"
             )
-            keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
+            keyboard = {"inline_keyboard": [[{"text": "📈 Resource Plans", "callback_data": "resource_tiers"}],
+                                            [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
         else:
             text = "❌ Premium expired. Renew now!"
             keyboard = {"inline_keyboard": [[{"text": "💰 Renew Premium", "callback_data": "subscribe_premium"}]]}
@@ -4273,6 +4359,7 @@ def show_premium_menu(chat_id, user_id, message_id=None):
                  {"text": f"🪙 Monthly ({PRICE_MONTHLY_COINS}🪙)", "callback_data": "premium_monthly_coins"}],
                 [{"text": f"⭐ Yearly ({PRICE_YEARLY_STARS}⭐)", "callback_data": "premium_yearly_stars"},
                  {"text": f"🪙 Yearly ({PRICE_YEARLY_COINS}🪙)", "callback_data": "premium_yearly_coins"}],
+                [{"text": "📈 Resource Plans (512 MB - 4 GB)", "callback_data": "resource_tiers"}],
                 [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
             ]
         }
@@ -4281,6 +4368,138 @@ def show_premium_menu(chat_id, user_id, message_id=None):
         edit_message(chat_id, message_id, text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
+
+# ==================== RESOURCE TIERS (purchase) ====================
+def tier_price_coins(key):
+    return RESOURCE_TIERS[key][2] * STARS_PER_COIN
+
+
+def show_resource_tiers_menu(chat_id, user_id, message_id=None):
+    if is_admin(user_id):
+        text = "👑 Admins already have the whole resource pool."
+        kb = {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
+    else:
+        cur = get_user_tier(user_id)
+        used = get_user_resource_usage_mb(user_id)
+        quota = get_user_quota_mb(user_id)
+        if cur:
+            cur_line = (f"✅ Your plan: *{RESOURCE_TIERS.get(cur[0], (0, format_resource(cur[1]), 0))[1]}* "
+                        f"until `{cur[2].strftime('%Y-%m-%d')}`\n")
+        else:
+            cur_line = f"🆓 You're on the shared pool: `{format_resource(quota)}`\n"
+        free_mb = tier_unallocated_mb(user_id)
+        avail = {k: tier_capacity_ok(user_id, v[0]) for k, v in RESOURCE_TIERS.items()}
+        lines = [f"• *{label}* — `{stars}⭐` / `{tier_price_coins(key)}🪙`" + ("" if avail[key] else "  🚫 _sold out_")
+                 for key, (mb, label, stars) in RESOURCE_TIERS.items()]
+        text = (f"*📈 RESOURCE PLANS*\n\n{cur_line}"
+                f"💾 In use: `{format_resource(used)} / {format_resource(quota)}`\n"
+                f"🧮 Available to buy: `{format_resource(free_mb)}`"
+                + ("" if any(avail.values()) else " _(none right now)_") + "\n\n"
+                f"Get a *guaranteed* amount of RAM for {RESOURCE_TIER_DAYS} days — it doesn't shrink "
+                f"when more users join. Includes {RESOURCE_TIER_DAYS} days of Monthly Premium "
+                f"(free monthly deployments).\n\n" + "\n".join(lines) +
+                "\n\n_Buying again extends your time; picking a different size switches to it "
+                "(your remaining time carries over)._")
+        rows = []
+        for key, (mb, label, stars) in RESOURCE_TIERS.items():
+            mark = "✅ " if cur and cur[0] == key else ""
+            if not avail[key]:
+                rows.append([{"text": f"🚫 {label} · sold out", "callback_data": "resource_tiers"}])
+                continue
+            rows.append([{"text": f"{mark}{label} · {stars}⭐", "callback_data": f"tier_stars_{key}"},
+                         {"text": f"{tier_price_coins(key)}🪙", "callback_data": f"tier_coins_{key}"}])
+        rows.append([{"text": "🔙 Back to Menu", "callback_data": "main_menu"}])
+        kb = {"inline_keyboard": rows}
+    if message_id:
+        edit_message(chat_id, message_id, text, kb)
+    else:
+        send_message(chat_id, text, kb)
+
+
+def activate_resource_tier(user_id, key, stars_paid, coins_paid):
+    """Grant/extend a tier. Same size: +30 days on top of what is left. Different size: switch,
+    keeping the remaining time. Also grants 30 days of Monthly Premium (never downgrades Yearly)."""
+    mb, label, _price = RESOURCE_TIERS[key]
+    now = datetime.now()
+    cur = get_user_tier(user_id)
+    base = cur[2] if cur and cur[2] > now else now
+    end = base + timedelta(days=RESOURCE_TIER_DAYS)
+    db_execute("UPDATE users SET resource_tier_key=?, resource_tier_mb=?, resource_tier_expires=? WHERE user_id=?",
+               (key, mb, end.isoformat(), user_id))
+    prow = db_execute("SELECT premium_plan FROM users WHERE user_id = ?", (user_id,), fetch='one')
+    already_yearly = bool(is_user_premium(user_id) and prow and (prow[0] or "").lower() == "yearly")
+    if already_yearly:
+        db_execute("INSERT INTO subscriptions (user_id, plan, amount_stars, amount_coins, start_date, end_date, status) "
+                   "VALUES (?,?,?,?,?,?,?)",
+                   (user_id, f"tier_{key}", stars_paid, coins_paid, now.isoformat(), end.isoformat(), 'active'))
+    else:
+        activate_premium(user_id, "monthly", stars_paid, coins_paid, RESOURCE_TIER_DAYS)
+        db_execute("UPDATE subscriptions SET plan = ? WHERE subscription_id = "
+                   "(SELECT MAX(subscription_id) FROM subscriptions WHERE user_id = ?)",
+                   (f"tier_{key}", user_id))
+    try:
+        notify_admin(f"📈 RESOURCE TIER\nUser: {user_id}\nTier: {label} until {end.strftime('%Y-%m-%d')}\n"
+                     f"Paid: {stars_paid}⭐ / {coins_paid}🪙")
+    except Exception:
+        pass
+    async_backup(f"tier_{key}_{user_id}")
+    return end
+
+
+def _tier_blocked_reason(user_id, key):
+    if key not in RESOURCE_TIERS:
+        return "Unknown plan."
+    if is_admin(user_id):
+        return "Admins already have the whole resource pool."
+    if not tier_capacity_ok(user_id, RESOURCE_TIERS[key][0]):
+        left = format_resource(tier_unallocated_mb(user_id))
+        return (f"This size is sold out — only {left} of the host's RAM is unallocated. "
+                f"Try a smaller plan or check back later.")
+    return None
+
+
+def purchase_tier_stars(chat_id, user_id, key):
+    why = _tier_blocked_reason(user_id, key)
+    if why:
+        send_message(chat_id, f"❌ {why}")
+        return
+    mb, label, stars = RESOURCE_TIERS[key]
+    payload = f"tier_{key}_{user_id}_{int(datetime.now().timestamp())}"
+    invoice = {"chat_id": chat_id, "title": f"Resource Plan {label}",
+               "description": f"{label} guaranteed RAM for {RESOURCE_TIER_DAYS} days + Monthly Premium",
+               "payload": payload, "currency": "XTR", "prices": [{"label": f"{label} plan", "amount": stars}]}
+    try:
+        req = urllib.request.Request(f"{TELEGRAM_API}/sendInvoice", data=json.dumps(invoice).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode())
+        if not res.get('ok'):
+            send_message(chat_id, f"❌ Failed to create invoice: {res.get('description')}")
+    except Exception as e:
+        send_message(chat_id, f"❌ Failed to create invoice: {e}")
+
+
+def purchase_tier_coins(chat_id, user_id, key):
+    why = _tier_blocked_reason(user_id, key)
+    if why:
+        send_message(chat_id, f"❌ {why}")
+        return
+    mb, label, stars = RESOURCE_TIERS[key]
+    cost = tier_price_coins(key)
+    bal = get_user_balances(user_id)
+    if bal['coins'] < cost:
+        send_message(chat_id,
+            f"❌ *INSUFFICIENT COINS*\n\nRequired: `{cost}🪙`\nYour balance: `{bal['coins']}🪙`",
+            {"inline_keyboard": [[{"text": f"⭐ Pay {stars}⭐", "callback_data": f"tier_stars_{key}"},
+                                  {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
+        return
+    update_user_coins(user_id, -cost, "resource_tier", f"tier_{key}")
+    end = activate_resource_tier(user_id, key, stars, cost)
+    send_message(chat_id,
+        f"✅ *{label} PLAN ACTIVE*\n\n💾 Guaranteed: `{label}`\n📅 Until: `{end.strftime('%Y-%m-%d')}`\n"
+        f"Paid: `{cost}🪙`\n\nThank you! 🙏",
+        {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
+
 
 def purchase_premium_stars(chat_id, user_id, plan, duration_days, cost_stars):
     success, error = create_premium_invoice(chat_id, user_id, plan, duration_days, cost_stars)
@@ -7844,6 +8063,9 @@ def build_main_menu_text(user_id, first_name=None) -> str:
         except Exception:
             pass
         plan_line = f"⭐ PREMIUM ({(premium_plan or 'monthly').capitalize()}){days_left}"
+        _t = get_user_tier(user_id)
+        if _t:
+            plan_line += f" · 📈 {RESOURCE_TIERS.get(_t[0], (0, format_resource(_t[1]), 0))[1]} tier"
     else:
         used_free = get_free_deployment_used_count(user_id)
         plan_line = f"🆓 FREE ({used_free}/{FREE_USER_MAX_DEPLOYMENTS} slots)"
@@ -7855,8 +8077,14 @@ def build_main_menu_text(user_id, first_name=None) -> str:
     filled = int(pct / 100 * 10)
     bar = "█" * filled + "░" * (10 - filled)
     n_users = count_quota_users()
-    share_note = ("whole pool" if is_admin(user_id)
-                  else f"pool {format_resource(get_resource_pool_mb())} ÷ {n_users} user(s)")
+    _tier = None if is_admin(user_id) else get_user_tier(user_id)
+    if is_admin(user_id):
+        share_note = "whole pool"
+    elif _tier:
+        share_note = f"📈 {format_resource(_tier[1])} tier · until {_tier[2].strftime('%Y-%m-%d')}"
+    else:
+        share_note = (f"free share: {format_resource(max(0.0, get_resource_pool_mb() - tier_sold_mb()[0]))}"
+                      f" ÷ {count_pool_sharers()} user(s)")
 
     # Coins & projects
     bal = get_user_balances(user_id)
@@ -8209,7 +8437,8 @@ def get_main_menu(user_id):
             [{"text": "🎫 Redeem Code",                         "callback_data": "redeem_code"},
              {"text": "👥 Referral",                             "callback_data": "my_referral"}],
             [{"text": "⭐ Premium Subscription",                "callback_data": "subscribe_premium"},
-             {"text": "🐛 Report Bug",                          "callback_data": "report_bug"}],
+             {"text": "📈 Resource Plans",                      "callback_data": "resource_tiers"}],
+            [{"text": "🐛 Report Bug",                          "callback_data": "report_bug"}],
         ]
     }
 
@@ -9933,6 +10162,18 @@ def handle_callback(callback):
     # ========== PREMIUM SUBSCRIPTION ==========
     if data == "subscribe_premium":
         show_premium_menu(chat_id, user_id, message_id)
+        return
+
+    if data == "resource_tiers":
+        show_resource_tiers_menu(chat_id, user_id, message_id)
+        return
+
+    if data.startswith("tier_stars_"):
+        purchase_tier_stars(chat_id, user_id, data.split("_", 2)[2])
+        return
+
+    if data.startswith("tier_coins_"):
+        purchase_tier_coins(chat_id, user_id, data.split("_", 2)[2])
         return
 
     if data.startswith("reactivate_premium_"):
@@ -11699,6 +11940,23 @@ def handle_successful_payment(message):
         
         print(f"💰 Payment: {total_amount}⭐ from user {user_id}")
         
+        if invoice_payload.startswith("tier_"):
+            tparts = invoice_payload.split("_")
+            tkey = tparts[1] if len(tparts) > 1 else ""
+            if tkey not in RESOURCE_TIERS or str(user_id) != (tparts[2] if len(tparts) > 2 else ""):
+                send_message(chat_id, "⚠️ Payment received but the plan could not be verified. "
+                                      "Please contact an admin.")
+                return
+            if total_amount < RESOURCE_TIERS[tkey][2]:
+                send_message(chat_id, "⚠️ Payment amount doesn't match the plan price. Please contact an admin.")
+                return
+            end = activate_resource_tier(user_id, tkey, total_amount, total_amount * STARS_PER_COIN)
+            send_message(chat_id,
+                f"✅ *{RESOURCE_TIERS[tkey][1]} PLAN ACTIVE*\n\n💾 Guaranteed: `{RESOURCE_TIERS[tkey][1]}`\n"
+                f"📅 Until: `{end.strftime('%Y-%m-%d')}`\n\nThank you! 🙏",
+                {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
+            return
+
         if invoice_payload.startswith("premium_"):
             parts = invoice_payload.split("_")
             plan = parts[1]
@@ -11778,6 +12036,14 @@ def handle_pre_checkout_query(pre_checkout_query):
         query_id = pre_checkout_query['id']
         url = f"{TELEGRAM_API}/answerPreCheckoutQuery"
         data = {"pre_checkout_query_id": query_id, "ok": True}
+        _pl = str(pre_checkout_query.get('invoice_payload', ''))
+        if _pl.startswith("tier_"):
+            try:
+                _why = _tier_blocked_reason(int(pre_checkout_query['from']['id']), _pl.split("_")[1])
+            except Exception:
+                _why = "Could not verify this plan."
+            if _why:
+                data = {"pre_checkout_query_id": query_id, "ok": False, "error_message": _why[:200]}
         data_bytes = json.dumps(data).encode('utf-8')
         req = urllib.request.Request(url, data=data_bytes, headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=10) as response:
