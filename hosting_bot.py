@@ -9029,28 +9029,99 @@ def show_admin_panel(chat_id, message_id):
 
     edit_message(chat_id, message_id, f"*🔧 ADMIN PANEL*\n\n{stats_text}", keyboard)
 
-def admin_list_codes(chat_id, message_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT code, coins_amount, used_count, max_uses, expires_at, is_active, created_at
-                 FROM redeem_codes ORDER BY created_at DESC LIMIT 30''')
-    rows = c.fetchall()
-    conn.close()
-    
+CODES_PER_PAGE = 8
+
+def _code_state(expires, active, used, max_uses):
+    """(emoji, word) describing why/if a redeem code can still be used."""
+    try:
+        if expires and datetime.fromisoformat(expires) < datetime.now():
+            return "⌛", "expired"
+    except Exception:
+        pass
+    if not active:
+        return "❌", "inactive"
+    if max_uses and max_uses > 0 and used >= max_uses:
+        return "🔒", "used up"
+    return "✅", "active"
+
+
+def admin_list_codes(chat_id, message_id, page=0):
+    total = (db_execute("SELECT COUNT(*) FROM redeem_codes", fetch='one') or [0])[0] or 0
+    pages = max(1, -(-total // CODES_PER_PAGE))
+    page = max(0, min(int(page), pages - 1))
+    rows = db_execute("SELECT code_id, code, coins_amount, stars_amount, used_count, max_uses, expires_at, "
+                      "is_active, created_at FROM redeem_codes ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                      (CODES_PER_PAGE, page * CODES_PER_PAGE), fetch='all') or []
+    buttons = []
     if not rows:
         text = "📭 No redeem codes found."
     else:
-        text = "*🎫 REDEEM CODES*\n\n"
-        for code, coins, used, max_uses, expires, active, created in rows:
-            status = "✅" if active else "❌"
-            max_text = "∞" if max_uses == 0 else str(max_uses)
-            expires_short = expires[:10] if expires else "Never"
-            created_short = created[:10] if created else "Unknown"
-            text += f"• `{code}` → {coins}🪙 | {used}/{max_text} | {status}\n"
-            text += f"  Created: {created_short} | Expires: {expires_short}\n\n"
-    
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
-    edit_message(chat_id, message_id, text, keyboard)
+        text = f"*🎫 REDEEM CODES*  —  page {page + 1}/{pages}  (total `{total}`)\n\n"
+        for code_id, code, coins, stars, used, max_uses, expires, active, created in rows:
+            emoji, word = _code_state(expires, active, used or 0, max_uses)
+            max_text = "∞" if not max_uses else str(max_uses)
+            reward = " + ".join(x for x in (f"{coins}🪙" if coins else "", f"{stars}⭐" if stars else "") if x) or "—"
+            text += (f"{emoji} `{code}` → {reward} | {used or 0}/{max_text} | _{word}_\n"
+                     f"   Created {(created or '?')[:10]} · Expires {(expires or 'Never')[:10]}\n\n")
+            buttons.append([{"text": f"🗑️ Delete {code}"[:40], "callback_data": f"admin_code_del_{code_id}"}])
+    nav = []
+    if page > 0:         nav.append({"text": "⬅️ Prev", "callback_data": f"admin_codes_p_{page - 1}"})
+    if page < pages - 1: nav.append({"text": "Next ➡️", "callback_data": f"admin_codes_p_{page + 1}"})
+    if nav:
+        buttons.append(nav)
+    if total:
+        buttons.append([{"text": "🧹 Delete all expired / used-up", "callback_data": "admin_codes_clean"}])
+    buttons.append([{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}])
+    edit_message(chat_id, message_id, text, {"inline_keyboard": buttons})
+
+
+def admin_code_delete_confirm(chat_id, message_id, code_id):
+    row = db_execute("SELECT code, used_count, max_uses FROM redeem_codes WHERE code_id = ?",
+                     (code_id,), fetch='one')
+    if not row:
+        edit_message(chat_id, message_id, "❌ That code no longer exists.",
+                     {"inline_keyboard": [[{"text": "🔙 Codes", "callback_data": "admin_list_codes"}]]})
+        return
+    edit_message(chat_id, message_id,
+                 f"🗑️ *Delete redeem code?*\n\n`{row[0]}`\nUsed `{row[1] or 0}` time(s)\n\n"
+                 f"It can't be redeemed afterwards. Coins already given stay with users.",
+                 {"inline_keyboard": [[{"text": "✅ Yes, delete", "callback_data": f"admin_code_delok_{code_id}"},
+                                       {"text": "❌ Cancel", "callback_data": "admin_list_codes"}]]})
+
+
+def admin_code_delete(chat_id, message_id, code_id):
+    row = db_execute("SELECT code FROM redeem_codes WHERE code_id = ?", (code_id,), fetch='one')
+    if row:
+        db_execute("DELETE FROM redeem_codes WHERE code_id = ?", (code_id,))
+        try: update_system_stats()
+        except Exception: pass
+        try: async_backup("code_deleted")
+        except Exception: pass
+        print(f"🗑️ Redeem code deleted: {row[0]}")
+    admin_list_codes(chat_id, message_id)
+
+
+def admin_codes_clean(chat_id, message_id, confirmed=False):
+    now = datetime.now().isoformat()
+    where = ("(expires_at IS NOT NULL AND expires_at < ?) OR is_active = 0 "
+             "OR (max_uses > 0 AND used_count >= max_uses)")
+    n = (db_execute(f"SELECT COUNT(*) FROM redeem_codes WHERE {where}", (now,), fetch='one') or [0])[0] or 0
+    if not confirmed:
+        if not n:
+            edit_message(chat_id, message_id, "✅ Nothing to clean — no expired, inactive or used-up codes.",
+                         {"inline_keyboard": [[{"text": "🔙 Codes", "callback_data": "admin_list_codes"}]]})
+            return
+        edit_message(chat_id, message_id,
+                     f"🧹 Delete `{n}` expired / inactive / used-up code(s)?\n\nActive codes are not touched.",
+                     {"inline_keyboard": [[{"text": "✅ Yes, delete", "callback_data": "admin_codes_cleanok"},
+                                           {"text": "❌ Cancel", "callback_data": "admin_list_codes"}]]})
+        return
+    db_execute(f"DELETE FROM redeem_codes WHERE {where}", (now,))
+    try: update_system_stats()
+    except Exception: pass
+    try: async_backup("codes_cleaned")
+    except Exception: pass
+    admin_list_codes(chat_id, message_id)
 
 USERS_PER_PAGE = 8
 
@@ -10034,6 +10105,26 @@ def handle_callback(callback):
             edit_message(chat_id, message_id, "🔒 Unauthorized!")
         return
     
+    if data.startswith("admin_codes_p_"):
+        if is_admin(user_id):
+            admin_list_codes(chat_id, message_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data.startswith("admin_code_del_"):
+        if is_admin(user_id):
+            admin_code_delete_confirm(chat_id, message_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data.startswith("admin_code_delok_"):
+        if is_admin(user_id):
+            admin_code_delete(chat_id, message_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data in ("admin_codes_clean", "admin_codes_cleanok"):
+        if is_admin(user_id):
+            admin_codes_clean(chat_id, message_id, confirmed=(data == "admin_codes_cleanok"))
+        return
+
     if data == "admin_list_codes":
         if is_admin(user_id):
             admin_list_codes(chat_id, message_id)
