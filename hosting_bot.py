@@ -172,6 +172,8 @@ STARS_PER_COIN = int(os.environ.get("STARS_PER_COIN", 10))
 # key -> (MB, label, stars). Override prices with TIER_PRICE_<KEY>_STARS (e.g. TIER_PRICE_1GB_STARS=450).
 # Coins price = stars x STARS_PER_COIN. A tier also includes 30 days of Monthly Premium.
 RESOURCE_TIER_DAYS = 30
+TIER_YEARLY_MULTIPLIER = int(os.environ.get("TIER_YEARLY_MULTIPLIER", 10))   # yearly = monthly price x 10 (2 months free)
+TIER_PERIODS = {"m": ("Monthly", 30, 1), "y": ("Yearly", 365, TIER_YEARLY_MULTIPLIER)}   # code -> (label, days, price multiplier)
 def _tier_price(key, default):
     try:
         return int(os.environ.get(f"TIER_PRICE_{key.upper()}_STARS", default))
@@ -4340,6 +4342,7 @@ def show_premium_menu(chat_id, user_id, message_id=None):
             text = "❌ Premium expired. Renew now!"
             keyboard = {"inline_keyboard": [[{"text": "💰 Renew Premium", "callback_data": "subscribe_premium"}]]}
     else:
+        return show_resource_tiers_menu(chat_id, user_id, message_id)
         text = (
             f"*⭐ PREMIUM SUBSCRIPTION*\n\n"
             f"✨ *Benefits:*\n"
@@ -4370,11 +4373,16 @@ def show_premium_menu(chat_id, user_id, message_id=None):
         send_message(chat_id, text, keyboard)
 
 # ==================== RESOURCE TIERS (purchase) ====================
-def tier_price_coins(key):
-    return RESOURCE_TIERS[key][2] * STARS_PER_COIN
+def tier_price_stars(key, period="m"):
+    return RESOURCE_TIERS[key][2] * TIER_PERIODS[period][2]
+
+
+def tier_price_coins(key, period="m"):
+    return tier_price_stars(key, period) * STARS_PER_COIN
 
 
 def show_resource_tiers_menu(chat_id, user_id, message_id=None):
+    """Step 1: pick a SIZE (the only way to get Premium: monthly/yearly is chosen next)."""
     if is_admin(user_id):
         text = "👑 Admins already have the whole resource pool."
         kb = {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]]}
@@ -4389,25 +4397,25 @@ def show_resource_tiers_menu(chat_id, user_id, message_id=None):
             cur_line = f"🆓 You're on the shared pool: `{format_resource(quota)}`\n"
         free_mb = tier_unallocated_mb(user_id)
         avail = {k: tier_capacity_ok(user_id, v[0]) for k, v in RESOURCE_TIERS.items()}
-        lines = [f"• *{label}* — `{stars}⭐` / `{tier_price_coins(key)}🪙`" + ("" if avail[key] else "  🚫 _sold out_")
+        lines = [f"• *{label}* — `{stars}⭐`/month · `{tier_price_stars(key, 'y')}⭐`/year"
+                 + ("" if avail[key] else "  🚫 _sold out_")
                  for key, (mb, label, stars) in RESOURCE_TIERS.items()]
         text = (f"*📈 RESOURCE PLANS*\n\n{cur_line}"
                 f"💾 In use: `{format_resource(used)} / {format_resource(quota)}`\n"
                 f"🧮 Available to buy: `{format_resource(free_mb)}`"
                 + ("" if any(avail.values()) else " _(none right now)_") + "\n\n"
-                f"Get a *guaranteed* amount of RAM for {RESOURCE_TIER_DAYS} days — it doesn't shrink "
-                f"when more users join. Includes {RESOURCE_TIER_DAYS} days of Monthly Premium "
-                f"(free monthly deployments).\n\n" + "\n".join(lines) +
-                "\n\n_Buying again extends your time; picking a different size switches to it "
-                "(your remaining time carries over)._")
+                f"Pick a size for a *guaranteed* amount of RAM that doesn't shrink when more users join. "
+                f"Every plan includes *Premium* (free monthly deployments; yearly also covers yearly "
+                f"deployments).\n\n" + "\n".join(lines) +
+                f"\n\n_Yearly = {TIER_YEARLY_MULTIPLIER}× the monthly price. Buying again extends your time; "
+                f"picking a different size switches to it (remaining time carries over)._")
         rows = []
         for key, (mb, label, stars) in RESOURCE_TIERS.items():
-            mark = "✅ " if cur and cur[0] == key else ""
             if not avail[key]:
                 rows.append([{"text": f"🚫 {label} · sold out", "callback_data": "resource_tiers"}])
                 continue
-            rows.append([{"text": f"{mark}{label} · {stars}⭐", "callback_data": f"tier_stars_{key}"},
-                         {"text": f"{tier_price_coins(key)}🪙", "callback_data": f"tier_coins_{key}"}])
+            mark = "✅ " if cur and cur[0] == key else ""
+            rows.append([{"text": f"{mark}{label} — from {stars}⭐", "callback_data": f"tier_pick_{key}"}])
         rows.append([{"text": "🔙 Back to Menu", "callback_data": "main_menu"}])
         kb = {"inline_keyboard": rows}
     if message_id:
@@ -4416,33 +4424,66 @@ def show_resource_tiers_menu(chat_id, user_id, message_id=None):
         send_message(chat_id, text, kb)
 
 
-def activate_resource_tier(user_id, key, stars_paid, coins_paid):
-    """Grant/extend a tier. Same size: +30 days on top of what is left. Different size: switch,
-    keeping the remaining time. Also grants 30 days of Monthly Premium (never downgrades Yearly)."""
+def show_tier_period_menu(chat_id, user_id, key, message_id=None):
+    """Step 2: monthly or yearly for the chosen size, with prices."""
+    why = _tier_blocked_reason(user_id, key)
+    if why:
+        back = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "resource_tiers"}]]}
+        if message_id:
+            edit_message(chat_id, message_id, f"❌ {why}", back)
+        else:
+            send_message(chat_id, f"❌ {why}", back)
+        return
+    mb, label, stars = RESOURCE_TIERS[key]
+    m_s, y_s = tier_price_stars(key, "m"), tier_price_stars(key, "y")
+    saving = m_s * 12 - y_s
+    text = (f"*📈 {label.upper()} PLAN*\n\n"
+            f"💾 Guaranteed RAM: `{label}`\n\n"
+            f"📅 *Monthly* (30 days): `{m_s}⭐` / `{tier_price_coins(key, 'm')}🪙`\n"
+            f"🌟 *Yearly* (365 days): `{y_s}⭐` / `{tier_price_coins(key, 'y')}🪙`"
+            + (f"  — saves `{saving}⭐` vs 12 months" if saving > 0 else "") +
+            f"\n\nChoose how long and how to pay:")
+    kb = {"inline_keyboard": [
+        [{"text": f"⭐ Monthly {m_s}⭐", "callback_data": f"tier_stars_{key}_m"},
+         {"text": f"🪙 Monthly {tier_price_coins(key, 'm')}🪙", "callback_data": f"tier_coins_{key}_m"}],
+        [{"text": f"⭐ Yearly {y_s}⭐", "callback_data": f"tier_stars_{key}_y"},
+         {"text": f"🪙 Yearly {tier_price_coins(key, 'y')}🪙", "callback_data": f"tier_coins_{key}_y"}],
+        [{"text": "🔙 Back", "callback_data": "resource_tiers"}]]}
+    if message_id:
+        edit_message(chat_id, message_id, text, kb)
+    else:
+        send_message(chat_id, text, kb)
+
+
+def activate_resource_tier(user_id, key, period, stars_paid, coins_paid):
+    """Grant/extend a tier for a monthly (30 d) or yearly (365 d) period. Same size: time is added on top
+    of what is left. Different size: switch, keeping the remaining time. Premium of the same length is
+    included (a Yearly premium holder is never downgraded to Monthly)."""
     mb, label, _price = RESOURCE_TIERS[key]
+    pname, days, _mult = TIER_PERIODS[period]
     now = datetime.now()
     cur = get_user_tier(user_id)
     base = cur[2] if cur and cur[2] > now else now
-    end = base + timedelta(days=RESOURCE_TIER_DAYS)
+    end = base + timedelta(days=days)
     db_execute("UPDATE users SET resource_tier_key=?, resource_tier_mb=?, resource_tier_expires=? WHERE user_id=?",
                (key, mb, end.isoformat(), user_id))
     prow = db_execute("SELECT premium_plan FROM users WHERE user_id = ?", (user_id,), fetch='one')
-    already_yearly = bool(is_user_premium(user_id) and prow and (prow[0] or "").lower() == "yearly")
-    if already_yearly:
+    holds_yearly = bool(is_user_premium(user_id) and prow and (prow[0] or "").lower() == "yearly")
+    if holds_yearly and period == "m":
         db_execute("INSERT INTO subscriptions (user_id, plan, amount_stars, amount_coins, start_date, end_date, status) "
                    "VALUES (?,?,?,?,?,?,?)",
-                   (user_id, f"tier_{key}", stars_paid, coins_paid, now.isoformat(), end.isoformat(), 'active'))
+                   (user_id, f"tier_{key}_{period}", stars_paid, coins_paid, now.isoformat(), end.isoformat(), 'active'))
     else:
-        activate_premium(user_id, "monthly", stars_paid, coins_paid, RESOURCE_TIER_DAYS)
+        activate_premium(user_id, pname.lower(), stars_paid, coins_paid, days)
         db_execute("UPDATE subscriptions SET plan = ? WHERE subscription_id = "
                    "(SELECT MAX(subscription_id) FROM subscriptions WHERE user_id = ?)",
-                   (f"tier_{key}", user_id))
+                   (f"tier_{key}_{period}", user_id))
     try:
-        notify_admin(f"📈 RESOURCE TIER\nUser: {user_id}\nTier: {label} until {end.strftime('%Y-%m-%d')}\n"
+        notify_admin(f"📈 RESOURCE PLAN\nUser: {user_id}\nPlan: {label} {pname} until {end.strftime('%Y-%m-%d')}\n"
                      f"Paid: {stars_paid}⭐ / {coins_paid}🪙")
     except Exception:
         pass
-    async_backup(f"tier_{key}_{user_id}")
+    async_backup(f"tier_{key}_{period}_{user_id}")
     return end
 
 
@@ -4458,16 +4499,21 @@ def _tier_blocked_reason(user_id, key):
     return None
 
 
-def purchase_tier_stars(chat_id, user_id, key):
+def purchase_tier_stars(chat_id, user_id, key, period="m"):
+    if period not in TIER_PERIODS:
+        return
     why = _tier_blocked_reason(user_id, key)
     if why:
         send_message(chat_id, f"❌ {why}")
         return
-    mb, label, stars = RESOURCE_TIERS[key]
-    payload = f"tier_{key}_{user_id}_{int(datetime.now().timestamp())}"
-    invoice = {"chat_id": chat_id, "title": f"Resource Plan {label}",
-               "description": f"{label} guaranteed RAM for {RESOURCE_TIER_DAYS} days + Monthly Premium",
-               "payload": payload, "currency": "XTR", "prices": [{"label": f"{label} plan", "amount": stars}]}
+    mb, label, _ = RESOURCE_TIERS[key]
+    pname, days, _m = TIER_PERIODS[period]
+    stars = tier_price_stars(key, period)
+    payload = f"tier_{key}_{period}_{user_id}_{int(datetime.now().timestamp())}"
+    invoice = {"chat_id": chat_id, "title": f"{label} Resource Plan — {pname}",
+               "description": f"{label} guaranteed RAM for {days} days + Premium",
+               "payload": payload, "currency": "XTR",
+               "prices": [{"label": f"{label} {pname}", "amount": stars}]}
     try:
         req = urllib.request.Request(f"{TELEGRAM_API}/sendInvoice", data=json.dumps(invoice).encode(),
                                      headers={'Content-Type': 'application/json'})
@@ -4479,24 +4525,28 @@ def purchase_tier_stars(chat_id, user_id, key):
         send_message(chat_id, f"❌ Failed to create invoice: {e}")
 
 
-def purchase_tier_coins(chat_id, user_id, key):
+def purchase_tier_coins(chat_id, user_id, key, period="m"):
+    if period not in TIER_PERIODS:
+        return
     why = _tier_blocked_reason(user_id, key)
     if why:
         send_message(chat_id, f"❌ {why}")
         return
-    mb, label, stars = RESOURCE_TIERS[key]
-    cost = tier_price_coins(key)
+    mb, label, _ = RESOURCE_TIERS[key]
+    pname = TIER_PERIODS[period][0]
+    stars = tier_price_stars(key, period)
+    cost = tier_price_coins(key, period)
     bal = get_user_balances(user_id)
     if bal['coins'] < cost:
         send_message(chat_id,
             f"❌ *INSUFFICIENT COINS*\n\nRequired: `{cost}🪙`\nYour balance: `{bal['coins']}🪙`",
-            {"inline_keyboard": [[{"text": f"⭐ Pay {stars}⭐", "callback_data": f"tier_stars_{key}"},
+            {"inline_keyboard": [[{"text": f"⭐ Pay {stars}⭐", "callback_data": f"tier_stars_{key}_{period}"},
                                   {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
         return
-    update_user_coins(user_id, -cost, "resource_tier", f"tier_{key}")
-    end = activate_resource_tier(user_id, key, stars, cost)
+    update_user_coins(user_id, -cost, "resource_tier", f"tier_{key}_{period}")
+    end = activate_resource_tier(user_id, key, period, stars, cost)
     send_message(chat_id,
-        f"✅ *{label} PLAN ACTIVE*\n\n💾 Guaranteed: `{label}`\n📅 Until: `{end.strftime('%Y-%m-%d')}`\n"
+        f"✅ *{label} {pname.upper()} PLAN ACTIVE*\n\n💾 Guaranteed: `{label}`\n📅 Until: `{end.strftime('%Y-%m-%d')}`\n"
         f"Paid: `{cost}🪙`\n\nThank you! 🙏",
         {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
 
@@ -10168,12 +10218,17 @@ def handle_callback(callback):
         show_resource_tiers_menu(chat_id, user_id, message_id)
         return
 
-    if data.startswith("tier_stars_"):
-        purchase_tier_stars(chat_id, user_id, data.split("_", 2)[2])
+    if data.startswith("tier_pick_"):
+        show_tier_period_menu(chat_id, user_id, data.split("_", 2)[2], message_id)
         return
 
-    if data.startswith("tier_coins_"):
-        purchase_tier_coins(chat_id, user_id, data.split("_", 2)[2])
+    if data.startswith("tier_stars_") or data.startswith("tier_coins_"):
+        _tp = data.split("_")                      # tier, stars|coins, <key>, <m|y>
+        _key, _per = (_tp[2] if len(_tp) > 2 else ""), (_tp[3] if len(_tp) > 3 else "m")
+        if data.startswith("tier_stars_"):
+            purchase_tier_stars(chat_id, user_id, _key, _per)
+        else:
+            purchase_tier_coins(chat_id, user_id, _key, _per)
         return
 
     if data.startswith("reactivate_premium_"):
@@ -10191,22 +10246,11 @@ def handle_callback(callback):
             show_premium_menu(chat_id, user_id, message_id)
         return
     
-    if data == "premium_monthly_stars":
-        purchase_premium_stars(chat_id, user_id, "monthly", 30, PRICE_MONTHLY_STARS)
+    if data in ("premium_monthly_stars", "premium_yearly_stars", "premium_monthly_coins", "premium_yearly_coins"):
+        # Standalone Premium is gone: Premium now comes with a Resource Plan (old buttons land here).
+        show_resource_tiers_menu(chat_id, user_id, message_id)
         return
-    
-    if data == "premium_yearly_stars":
-        purchase_premium_stars(chat_id, user_id, "yearly", 365, PRICE_YEARLY_STARS)
-        return
-    
-    if data == "premium_monthly_coins":
-        purchase_premium_coins(chat_id, user_id, "monthly", 30, PRICE_MONTHLY_COINS)
-        return
-    
-    if data == "premium_yearly_coins":
-        purchase_premium_coins(chat_id, user_id, "yearly", 365, PRICE_YEARLY_COINS)
-        return
-    
+
     # ========== DEPLOYMENT PLANS ==========
     if data == "deploy_new":
         if not is_user_verified(user_id):
@@ -11941,18 +11985,20 @@ def handle_successful_payment(message):
         print(f"💰 Payment: {total_amount}⭐ from user {user_id}")
         
         if invoice_payload.startswith("tier_"):
-            tparts = invoice_payload.split("_")
+            tparts = invoice_payload.split("_")          # tier, <key>, <m|y>, <user_id>, <ts>
             tkey = tparts[1] if len(tparts) > 1 else ""
-            if tkey not in RESOURCE_TIERS or str(user_id) != (tparts[2] if len(tparts) > 2 else ""):
+            tper = tparts[2] if len(tparts) > 2 else ""
+            if (tkey not in RESOURCE_TIERS or tper not in TIER_PERIODS
+                    or str(user_id) != (tparts[3] if len(tparts) > 3 else "")):
                 send_message(chat_id, "⚠️ Payment received but the plan could not be verified. "
                                       "Please contact an admin.")
                 return
-            if total_amount < RESOURCE_TIERS[tkey][2]:
+            if total_amount < tier_price_stars(tkey, tper):
                 send_message(chat_id, "⚠️ Payment amount doesn't match the plan price. Please contact an admin.")
                 return
-            end = activate_resource_tier(user_id, tkey, total_amount, total_amount * STARS_PER_COIN)
+            end = activate_resource_tier(user_id, tkey, tper, total_amount, total_amount * STARS_PER_COIN)
             send_message(chat_id,
-                f"✅ *{RESOURCE_TIERS[tkey][1]} PLAN ACTIVE*\n\n💾 Guaranteed: `{RESOURCE_TIERS[tkey][1]}`\n"
+                f"✅ *{RESOURCE_TIERS[tkey][1]} {TIER_PERIODS[tper][0].upper()} PLAN ACTIVE*\n\n💾 Guaranteed: `{RESOURCE_TIERS[tkey][1]}`\n"
                 f"📅 Until: `{end.strftime('%Y-%m-%d')}`\n\nThank you! 🙏",
                 {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
             return
