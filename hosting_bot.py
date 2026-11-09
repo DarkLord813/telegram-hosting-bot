@@ -2055,7 +2055,7 @@ def _install_deps_for_folder(deploy_folder: Path, dest_script: Path, log=print, 
         packages_dir.mkdir(exist_ok=True)
         installed = install_from_repo_requirements(deploy_folder, log) or []
         already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower() for r in installed}
-        auto = UniversalDependencyInstaller.scan_imports(code, log)
+        auto = UniversalDependencyInstaller.scan_imports(code, log, local_dir=deploy_folder)
         gap = [a for a in auto if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in already]
         if gap:
             log(f"📦 Installing {len(gap)} import(s) not covered by the manifests: {', '.join(gap)}")
@@ -4625,6 +4625,46 @@ def delete_user_file(user_id, filename):
     return False
 
 # ========== UNIVERSAL DEPENDENCY INSTALLER ==========
+# ── Modules that ship with Python: they are imported, never pip-installed ─────────────────────
+_STDLIB_FALLBACK = set("""
+__future__ abc aifc argparse array ast asynchat asyncio asyncore atexit audioop base64 bdb binascii bisect
+builtins bz2 calendar cgi cgitb chunk cmath cmd code codecs codeop collections colorsys compileall concurrent
+configparser contextlib contextvars copy copyreg cProfile crypt csv ctypes curses dataclasses datetime dbm
+decimal difflib dis distutils doctest email encodings ensurepip enum errno faulthandler fcntl filecmp fileinput
+fnmatch fractions ftplib functools gc getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html
+http idlelib imaplib imghdr imp importlib inspect io ipaddress itertools json keyword lib2to3 linecache locale
+logging lzma mailbox mailcap marshal math mimetypes mmap modulefinder msilib msvcrt multiprocessing netrc nis
+nntplib ntpath numbers opcode operator optparse os ossaudiodev pathlib pdb pickle pickletools pipes pkgutil
+platform plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc queue quopri
+random re readline reprlib resource rlcompleter runpy sched secrets select selectors shelve shlex shutil signal
+site smtpd smtplib sndhdr socket socketserver spwd sqlite3 ssl stat statistics string stringprep struct
+subprocess sunau symtable sys sysconfig syslog tabnanny tarfile telnetlib tempfile termios textwrap threading
+time timeit tkinter token tokenize tomllib trace traceback tracemalloc tty turtle types typing unicodedata
+unittest urllib uu uuid venv warnings wave weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc
+zipapp zipfile zipimport zlib zoneinfo
+""".split())
+_STDLIB_MODULES = set(getattr(sys, "stdlib_module_names", ())) | _STDLIB_FALLBACK
+# ancient PyPI backports named like stdlib modules — installing them BREAKS Python
+_STDLIB_MODULES |= {"sqlite", "futures", "enum34", "pathlib2"}
+_STDLIB_LOWER = {m.lower() for m in _STDLIB_MODULES}
+
+
+def is_stdlib_requirement(spec: str) -> bool:
+    """True for a requirement line that names a built-in module (sqlite3, asyncio, json, pickle…)."""
+    base = re.split(r'[=<>!~\[\s;@]', str(spec).strip(), 1)[0].strip()
+    return bool(base) and base.lower().replace('-', '_') in _STDLIB_LOWER
+
+
+def drop_stdlib_requirements(specs, update_logs=None):
+    """Remove built-in modules from a requirement list (with a note), keeping everything else."""
+    kept, dropped = [], []
+    for sp in specs:
+        (dropped if is_stdlib_requirement(sp) else kept).append(sp)
+    if dropped and update_logs:
+        update_logs(f"ℹ️ Built into Python — nothing to install: {', '.join(sorted(set(d.strip() for d in dropped)))}")
+    return kept
+
+
 class UniversalDependencyInstaller:
     """Supports ALL Python dependency types: PyPI, Git, Mercurial, Subversion, local, wheel, egg, etc."""
     
@@ -4752,16 +4792,29 @@ class UniversalDependencyInstaller:
     }
 
     @classmethod
-    def scan_imports(cls, code_content: str, update_logs: callable) -> list:
-        """Automatically detect required dependencies by scanning code"""
+    def scan_imports(cls, code_content: str, update_logs: callable, local_dir=None) -> list:
+        """Automatically detect required dependencies by scanning code.
+        Built-in modules (sqlite3, asyncio…) and the user's own files/folders (local_dir) are never
+        treated as pip packages."""
         detected = set()
         lines = code_content.split('\n')
+        local_names = set()
+        try:
+            if local_dir:
+                for it in Path(local_dir).iterdir():
+                    if it.name in ('packages', 'node_modules') or it.name.startswith('.'):
+                        continue
+                    local_names.add(it.stem if it.is_file() else it.name)
+        except Exception:
+            pass
         
         for line in lines:
             line = line.strip()
             match = re.match(r'^(?:from|import)\s+([a-zA-Z0-9_\.]+)', line)
             if match:
                 module = match.group(1).split('.')[0]
+                if module.lower() in _STDLIB_LOWER or module in local_names:
+                    continue
                 if module in cls.IMPORT_MAPPING:
                     package = cls.IMPORT_MAPPING[module]
                     if package and package not in detected:
@@ -4830,6 +4883,9 @@ class UniversalDependencyInstaller:
                                 f"using '{_correct}' instead")
                     line = _correct
 
+                if is_stdlib_requirement(line):
+                    update_logs(f"   ℹ️ '{line[:40]}' is built into Python — skipping (nothing to install)")
+                    continue
                 requirements.append(line)
                 update_logs(f"   📄 From requirements: {line[:60]}")
         return requirements
@@ -5016,6 +5072,7 @@ def _install_pip(packages_dir, deploy_folder, update_logs):
         raw = rp.read_text(errors='ignore').strip()
         pkgs = [ln.split(';')[0].strip() for ln in raw.splitlines()
                 if ln.strip() and not ln.startswith(('#', '-r ', '-c ', '--'))]
+        pkgs = drop_stdlib_requirements(pkgs, update_logs)
         if not pkgs:
             continue
 
@@ -5025,10 +5082,10 @@ def _install_pip(packages_dir, deploy_folder, update_logs):
             _clean_stale_package(packages_dir, pkg)
             # Try with --upgrade first, then a clean forced reinstall on failure
             # (never trust partially-written files from a failed first attempt)
-            ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=180)
+            ok, out = _run(_pip_base(packages_dir) + ['--upgrade', pkg], timeout=PIP_TIMEOUT)
             if not ok:
                 _clean_stale_package(packages_dir, pkg)
-                ok, out = _run(_pip_base(packages_dir) + ['--upgrade', '--force-reinstall', pkg], timeout=180)
+                ok, out = _run(_pip_base(packages_dir) + ['--upgrade', '--force-reinstall', pkg], timeout=PIP_TIMEOUT)
             if ok:
                 installed += 1
             else:
@@ -5485,6 +5542,9 @@ def install_all_dependencies(deploy_folder: Path, update_logs=None,
 
 
 # ========== ENHANCED DEPENDENCY INSTALLATION ==========
+PIP_TIMEOUT = int(os.environ.get("PIP_TIMEOUT", 600))   # per package; big ones (aiogram + deps) need > 3 min on a slow host
+
+
 def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
     """
     VPS-grade installer.
@@ -5506,6 +5566,10 @@ def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
 
         packages = [p.strip() for p in raw.split('\n')
                     if p.strip() and not p.startswith('#') and not p.startswith('-')]
+        packages = drop_stdlib_requirements(packages, update_logs)     # sqlite3, asyncio, json…
+        if not packages:
+            update_logs("✅ Nothing to install (only built-in modules listed)")
+            return True, []
         update_logs(f"📦 {len(packages)} package(s) to install")
 
         # Upgrade pip silently first
@@ -5546,7 +5610,11 @@ def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
             else:
                 cmd = _pip_cmd(package)
 
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=PIP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # one slow package must not abort the whole install (aiogram pulls in many dependencies)
+                res = subprocess.CompletedProcess(cmd, 1, "", f"timed out after {PIP_TIMEOUT}s")
             if res.returncode == 0:
                 success_count += 1
                 update_logs(f"   ✅ {package[:60]}")
@@ -5558,17 +5626,23 @@ def install_dependencies_enhanced(reqs_file, update_logs, packages_dir=None):
                 # deep inside libraries like python-telegram-bot).
                 if packages_dir:
                     _clean_stale_package(packages_dir, package)
-                res2 = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
-                     *(["--target", str(packages_dir)] if packages_dir else []),
-                     package],
-                    capture_output=True, text=True, timeout=180)
+                try:
+                    res2 = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "--quiet", "--force-reinstall",
+                         *(["--target", str(packages_dir)] if packages_dir else []),
+                         package],
+                        capture_output=True, text=True, timeout=PIP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    res2 = subprocess.CompletedProcess([], 1, "", f"timed out after {PIP_TIMEOUT}s")
                 if res2.returncode == 0:
                     success_count += 1
                     update_logs(f"   ✅ {package[:60]} (retry OK)")
                 else:
                     failed_packages.append(package)
-                    err_line = (res.stderr or res.stdout or "")[-200:].strip().split('\n')[-1]
+                    _err_lines = [l for l in (res2.stderr or res.stderr or res.stdout or "").strip().split('\n')
+                                  if l.strip()]
+                    err_line = next((l for l in reversed(_err_lines) if l.startswith('ERROR')), None) \
+                               or (_err_lines[-1] if _err_lines else "unknown error")
                     update_logs(f"   ❌ {package[:50]}: {err_line[:80]}")
 
         update_logs(create_progress_bar(100, 25))
@@ -6955,7 +7029,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         try:
             _gh_already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower()
                            for r in (_installed_from_manifests or [])}
-            _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+            _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs, local_dir=deploy_folder)
             _gh_gap = [a for a in _gh_auto
                        if re.split(r'[=<>!~\[\s]', a.strip(), 1)[0].lower() not in _gh_already]
             if _gh_gap:
@@ -7214,7 +7288,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
                     update_logs(f"📦 Added {len(_gap_filled)} import(s) missing from requirements.txt: "
                                 f"{', '.join(_gap_filled)}")
             else:
-                auto_detected = UniversalDependencyInstaller.scan_imports(code_content, update_logs)
+                auto_detected = UniversalDependencyInstaller.scan_imports(code_content, update_logs, local_dir=deploy_folder)
                 if auto_detected:
                     requirements_list.extend(auto_detected)
                     update_logs(f"📦 Auto-detected {len(auto_detected)} package(s)")
