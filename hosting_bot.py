@@ -8050,6 +8050,374 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
         f"```\n📄 RUNTIME LOGS\n📁 {display_filename(file_name)} (Status: {status.upper()})\n\n{log_text[-3000:]}\n```",
         keyboard)
 
+# ==================== EDIT DEPLOYMENT (env · requirements · code) ====================
+EDIT_MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+def _edit_load(user_id, dep_id):
+    """The deployment's editable state, or None if it isn't this user's."""
+    row = db_execute("SELECT file_name, env_vars, status, framework FROM deployments "
+                     "WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id), fetch='one')
+    if not row:
+        return None
+    file_name, env_json, status, framework = row
+    try:
+        env = json.loads(env_json) if env_json else {}
+        if not isinstance(env, dict):
+            env = {}
+    except Exception:
+        env = {}
+    folder = get_deploy_folder(user_id, dep_id)
+    return {"file_name": file_name, "env": env, "status": status, "framework": framework,
+            "folder": folder, "script": folder / file_name,
+            "is_node": Path(file_name).suffix.lower() in _NODE_EXTS}
+
+
+def _edit_keyhash(key):
+    return hashlib.sha1(str(key).encode()).hexdigest()[:8]
+
+
+def _edit_user_keys(env):
+    """Keys the user manages (platform-added PORT etc. are hidden)."""
+    return [k for k in env if k not in _PLATFORM_ENV_KEYS]
+
+
+def _edit_save_env(user_id, dep_id, env, folder):
+    db_execute("UPDATE deployments SET env_vars = ? WHERE deployment_id = ? AND user_id = ?",
+               (json.dumps(env), dep_id, user_id))
+    try:
+        (folder / ".env").write_text(''.join(f"{k}={v}\n" for k, v in env.items()))
+    except Exception as e:
+        print(f"⚠️ edit: could not rewrite .env for #{dep_id}: {e}")
+    try:
+        files_repo_async_save(dep_id, "edit_env")
+    except Exception:
+        pass
+
+
+def _edit_after_kb(dep_id):
+    return {"inline_keyboard": [
+        [{"text": "🔄 Apply & Restart", "callback_data": f"restart_deploy_{dep_id}"}],
+        [{"text": "✏️ Keep editing", "callback_data": f"edit_deploy_{dep_id}"}],
+        [{"text": "🔙 Deployment", "callback_data": f"view_deploy_{dep_id}"}]]}
+
+
+def _edit_reply(chat_id, message_id, text, kb):
+    if message_id:
+        edit_message(chat_id, message_id, text, kb)
+    else:
+        send_message(chat_id, text, kb)
+
+
+def show_edit_menu(chat_id, message_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
+        return
+    set_user_step(user_id, None)
+    n_env = len(_edit_user_keys(d["env"]))
+    reqs_label = "📦 package.json" if d["is_node"] else "📦 requirements.txt"
+    text = (f"*✏️ EDIT DEPLOYMENT #{dep_id}*\n\n"
+            f"📁 File: `{display_filename(d['file_name'])}`\n"
+            f"🔑 Env vars: `{n_env}`\n"
+            f"🔘 Status: `{d['status']}`\n\n"
+            f"Pick what to change. Changes are saved straight away and take effect after a *restart*.")
+    kb = {"inline_keyboard": [
+        [{"text": f"🔑 Environment Variables ({n_env})", "callback_data": f"edit_env_{dep_id}"}],
+        [{"text": reqs_label, "callback_data": f"edit_reqs_{dep_id}"}],
+        [{"text": f"📄 Replace {display_filename(d['file_name'])[:24]}", "callback_data": f"edit_code_{dep_id}"}],
+        [{"text": "🔄 Apply & Restart", "callback_data": f"restart_deploy_{dep_id}"}],
+        [{"text": "🔙 Back", "callback_data": f"view_deploy_{dep_id}"}]]}
+    _edit_reply(chat_id, message_id, text, kb)
+
+
+# ---------- environment variables ----------
+def show_edit_env(chat_id, message_id, user_id, dep_id, note=""):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
+        return
+    set_user_step(user_id, None)
+    keys = _edit_user_keys(d["env"])
+    listing = "\n".join(f"• `{re.sub(r'[^A-Za-z0-9_]', '_', k)}`" for k in keys[:40]) or "_none set_"
+    if len(keys) > 40:
+        listing += f"\n_…and {len(keys) - 40} more_"
+    text = (f"{note}*🔑 ENV VARIABLES — #{dep_id}*\n\n{listing}\n\n"
+            f"Tap a name to *remove* it, or add / update variables. Values are never shown.")
+    rows, row = [], []
+    for k in keys[:40]:
+        row.append({"text": f"🗑️ {k}"[:30], "callback_data": f"edit_envdel_{dep_id}_{_edit_keyhash(k)}"})
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "➕ Add / Update variables", "callback_data": f"edit_envadd_{dep_id}"}])
+    rows.append([{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}])
+    _edit_reply(chat_id, message_id, text, {"inline_keyboard": rows})
+
+
+def edit_env_delete(chat_id, message_id, user_id, dep_id, key_hash):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        return
+    target = next((k for k in _edit_user_keys(d["env"]) if _edit_keyhash(k) == key_hash), None)
+    if not target:
+        show_edit_env(chat_id, message_id, user_id, dep_id, note="⚠️ That variable was already removed.\n\n")
+        return
+    env = dict(d["env"]); env.pop(target, None)
+    _edit_save_env(user_id, dep_id, env, d["folder"])
+    show_edit_env(chat_id, message_id, user_id, dep_id,
+                  note=f"✅ Removed `{re.sub(r'[^A-Za-z0-9_]', '_', target)}` — restart to apply.\n\n")
+
+
+def edit_env_prompt(chat_id, message_id, user_id, dep_id):
+    if not _edit_load(user_id, dep_id):
+        return
+    set_user_step(user_id, 'edit_env', edit_dep=dep_id)
+    _edit_reply(chat_id, message_id,
+        "*➕ ADD / UPDATE VARIABLES*\n\nSend one per line:\n```\nBOT_TOKEN=12345:ABC\nADMIN_ID=123456\n```\n"
+        "A name that already exists is *updated*; new names are *added*. Your message is deleted afterwards "
+        "so secrets don't stay in the chat.",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_env_{dep_id}"}]]})
+
+
+def _edit_try_delete(chat_id, message_id):
+    try:
+        http_get(f"{TELEGRAM_API}/deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    except Exception:
+        pass
+
+
+def handle_edit_env_text(chat_id, user_id, text, user_message_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        set_user_step(user_id, None)
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    new_vars, ignored = parse_env_input(text)
+    new_vars = {k: v for k, v in new_vars.items() if k not in _PLATFORM_ENV_KEYS}
+    if user_message_id:
+        _edit_try_delete(chat_id, user_message_id)
+    if not new_vars:
+        send_message(chat_id,
+            "❌ I couldn't find any `KEY=VALUE` lines. Send them like:\n```\nAPI_KEY=abc123\n```",
+            {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_env_{dep_id}"}]]})
+        return
+    env = dict(d["env"])
+    added = [k for k in new_vars if k not in env]
+    updated = [k for k in new_vars if k in env]
+    env.update(new_vars)
+    _edit_save_env(user_id, dep_id, env, d["folder"])
+    set_user_step(user_id, None)
+    parts = []
+    if added:   parts.append("➕ Added: " + ", ".join(f"`{k}`" for k in added[:15]))
+    if updated: parts.append("♻️ Updated: " + ", ".join(f"`{k}`" for k in updated[:15]))
+    if ignored: parts.append(f"⚠️ {ignored} line(s) ignored (not `KEY=VALUE`)")
+    send_message(chat_id, "✅ *Saved*\n\n" + "\n".join(parts) + "\n\nRestart to apply.", _edit_after_kb(dep_id))
+
+
+# ---------- requirements / package.json ----------
+def show_edit_reqs(chat_id, message_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
+        return
+    set_user_step(user_id, None)
+    mf = d["folder"] / ("package.json" if d["is_node"] else "requirements.txt")
+    try:
+        cur = mf.read_text(errors="replace").strip() if mf.exists() else ""
+    except Exception:
+        cur = ""
+    shown = (cur[:1200] + ("\n…" if len(cur) > 1200 else "")).replace("`", "'") if cur else "(none)"
+    name = "package.json" if d["is_node"] else "requirements.txt"
+    text = (f"*📦 {name.upper()} — #{dep_id}*\n\nCurrent:\n```\n{shown}\n```\n"
+            f"Send a new `{name}` *file*" + ("" if d["is_node"] else " (or paste the list as text)") +
+            " to replace it. The packages are reinstalled for you.")
+    _edit_reply(chat_id, message_id, text, {"inline_keyboard": [
+        [{"text": "📤 Replace it", "callback_data": f"edit_reqsnew_{dep_id}"}],
+        [{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}]]})
+
+
+def edit_reqs_prompt(chat_id, message_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        return
+    set_user_step(user_id, 'edit_reqs', edit_dep=dep_id)
+    name = "package.json" if d["is_node"] else "requirements.txt"
+    _edit_reply(chat_id, message_id, f"📤 Send the new `{name}` now.",
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_reqs_{dep_id}"}]]})
+
+
+def _edit_reinstall(chat_id, user_id, dep_id, d, what):
+    """Reinstall dependencies for the edited deployment, reporting progress in one message."""
+    r = send_message(chat_id, f"📦 Installing dependencies after the {what} change… this can take a few minutes.")
+    mid = (r or {}).get("result", {}).get("message_id")
+    lines = []
+    ok = True
+    try:
+        ok = _install_deps_for_folder(d["folder"], d["script"], lambda m: lines.append(str(m)))
+    except Exception as e:
+        ok = False
+        lines.append(f"error: {e}")
+    failed = [l for l in lines if "❌" in l]
+    if ok and not failed:
+        msg = "✅ Dependencies are installed."
+    else:
+        tail = "\n".join(failed[-4:]) or "\n".join(lines[-4:])
+        msg = f"⚠️ Some dependencies had problems:\n```\n{tail.replace('`', chr(39))[:700]}\n```\nCheck the names/versions and try again."
+    if mid:
+        edit_message(chat_id, mid, msg, None)
+    else:
+        send_message(chat_id, msg)
+    try:
+        files_repo_async_save(dep_id, f"edit_{what}")
+    except Exception:
+        pass
+
+
+def _edit_apply_manifest(chat_id, user_id, dep_id, content):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    if len(content.encode("utf-8", "ignore")) > EDIT_MAX_MANIFEST_BYTES:
+        send_message(chat_id, "❌ That file is too large for a requirements list (max 1 MB).")
+        return
+    if d["is_node"]:
+        try:
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError("top level must be an object")
+        except Exception as e:
+            send_message(chat_id, f"❌ That isn't a valid `package.json`: {safe_md(str(e))[:150]}",
+                         {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_reqs_{dep_id}"}]]})
+            return
+        (d["folder"] / "package.json").write_text(content)
+        stored = content[:2000]
+    else:
+        lines = [ln.rstrip() for ln in content.splitlines()]
+        pkgs = [ln for ln in lines if ln.strip() and not ln.strip().startswith('#')]
+        removed = [p for p in pkgs if is_stdlib_requirement(p)]
+        kept = [ln for ln in lines if not (ln.strip() and not ln.strip().startswith('#') and is_stdlib_requirement(ln))]
+        (d["folder"] / "requirements.txt").write_text("\n".join(kept).strip() + "\n")
+        stored = "\n".join(kept)[:2000]
+        if removed:
+            send_message(chat_id, "ℹ️ Skipped (built into Python): " + ", ".join(f"`{r}`" for r in removed[:10]))
+    db_execute("UPDATE deployments SET requirements = ? WHERE deployment_id = ? AND user_id = ?",
+               (stored, dep_id, user_id))
+    set_user_step(user_id, None)
+    _edit_reinstall(chat_id, user_id, dep_id, d, "requirements")
+    send_message(chat_id, "✅ *Requirements updated.* Restart to apply.", _edit_after_kb(dep_id))
+
+
+def handle_edit_reqs_text(chat_id, user_id, text, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if d and d["is_node"] and not text.strip().startswith("{"):
+        send_message(chat_id, "❌ Send the `package.json` as a file or as JSON text (starting with `{`).")
+        return
+    _edit_apply_manifest(chat_id, user_id, dep_id, text)
+
+
+def handle_edit_reqs_document(chat_id, user_id, doc, file_name, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        set_user_step(user_id, None)
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    expected = "package.json" if d["is_node"] else None
+    ok_name = (file_name == "package.json") if d["is_node"] else (file_name.endswith(".txt"))
+    if not ok_name:
+        send_message(chat_id, f"❌ Please send " + ("`package.json`." if d["is_node"] else "a `requirements.txt` file."))
+        return
+    raw = _download_telegram_file_bytes(doc.get("file_id"))
+    if raw is None:
+        send_message(chat_id, "❌ Could not download the file from Telegram.")
+        return
+    _edit_apply_manifest(chat_id, user_id, dep_id, raw.decode("utf-8", errors="replace"))
+
+
+# ---------- replace the bot's code ----------
+def show_edit_code(chat_id, message_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
+        return
+    set_user_step(user_id, None)
+    ext = Path(d["file_name"]).suffix.lower()
+    size = d["script"].stat().st_size if d["script"].exists() else 0
+    _edit_reply(chat_id, message_id,
+        f"*📄 REPLACE CODE — #{dep_id}*\n\nCurrent: `{display_filename(d['file_name'])}` ({format_file_size(size)})\n\n"
+        f"Send the new version as a `{ext}` file. It replaces the old one (same name), goes through the same "
+        f"6-layer security scan, and its imports are installed automatically. Your data files, database and "
+        f"env vars are untouched.",
+        {"inline_keyboard": [
+            [{"text": "📤 Upload new file", "callback_data": f"edit_codenew_{dep_id}"}],
+            [{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}]]})
+
+
+def edit_code_prompt(chat_id, message_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        return
+    set_user_step(user_id, 'edit_code', edit_dep=dep_id)
+    ext = Path(d["file_name"]).suffix.lower()
+    _edit_reply(chat_id, message_id, f"📤 Send the new `{ext}` file now.",
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_code_{dep_id}"}]]})
+
+
+def handle_edit_code_document(chat_id, user_id, doc, file_name, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        set_user_step(user_id, None)
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    want = Path(d["file_name"]).suffix.lower()
+    if Path(file_name).suffix.lower() != want:
+        send_message(chat_id, f"❌ This deployment runs a `{want}` file — please send a `{want}` file.\n"
+                              f"To switch language, create a new deployment instead.",
+                     {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_code_{dep_id}"}]]})
+        return
+    raw = _download_telegram_file_bytes(doc.get("file_id"))
+    if raw is None:
+        send_message(chat_id, "❌ Could not download the file from Telegram.")
+        return
+    send_message(chat_id, "🔒 *Running 6-layer security scan…*")
+    blocked, critical, warnings, report = run_security_scan(raw, file_name)
+    if blocked:
+        set_user_step(user_id, None)
+        send_message(chat_id,
+            f"🚫 *The new file was blocked by the security scan, so nothing was changed.*\n\n{report}\n\n"
+            f"If you believe this is a false alarm, upload it as a new deployment — that route sends it to "
+            f"an admin for review.",
+            {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}]]})
+        return
+    try:
+        d["script"].write_bytes(raw)
+    except Exception as e:
+        send_message(chat_id, f"❌ Could not save the file: {e}")
+        return
+    db_execute("UPDATE deployments SET file_size = ? WHERE deployment_id = ? AND user_id = ?",
+               (len(raw), dep_id, user_id))
+    set_user_step(user_id, None)
+    note = (f"\n⚠️ {len(warnings)} warning(s) noted." if warnings else "\n✅ Security scan passed.")
+    send_message(chat_id, f"✅ *Code replaced* ({format_file_size(len(raw))}).{note}")
+    _edit_reinstall(chat_id, user_id, dep_id, d, "code")
+    send_message(chat_id, "Restart to run the new code.", _edit_after_kb(dep_id))
+
+
+def _download_telegram_file_bytes(file_id):
+    try:
+        info = http_get(f"{TELEGRAM_API}/getFile", {"file_id": file_id})
+        if not info or not info.get("ok"):
+            return None
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info['result']['file_path']}"
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read()
+    except Exception as e:
+        print(f"⚠️ download failed: {e}")
+        return None
+
+
 def view_deployment(chat_id, message_id, user_id, dep_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
@@ -8137,6 +8505,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
             keyboard["inline_keyboard"].append(
                 [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
     
+    keyboard["inline_keyboard"].append([{"text": "✏️ Edit (env · requirements · code)", "callback_data": f"edit_deploy_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "📋 View Install Logs", "callback_data": f"view_install_logs_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "📄 View Runtime Logs", "callback_data": f"view_runtime_logs_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "🗑️ Delete Deployment", "callback_data": f"delete_deploy_{dep_id}"}])
@@ -10158,6 +10527,10 @@ def handle_callback(callback):
     print(f"📨 Callback: {data} from user {user_id}")
     
     # ========== MAIN MENU ==========
+    if (data in ("main_menu", "my_deployments") or data.startswith("view_deploy_")) \
+            and str(get_user_step(user_id).get('step') or '').startswith('edit_'):
+        set_user_step(user_id, None)           # leaving the edit prompt cancels it
+
     if data in ("main_menu", "admin_panel") and is_admin(user_id):
         if get_user_step(user_id).get('step') == 'awaiting_admin_user_search':
             set_user_step(user_id, None)           # leaving the search prompt cancels it
@@ -10666,6 +11039,31 @@ def handle_callback(callback):
     if data.startswith("view_deploy_"):
         dep_id = int(data.split("_")[2])
         view_deployment(chat_id, message_id, user_id, dep_id)
+        return
+
+    # ── Edit deployment (env · requirements · code) ──
+    if data.startswith("edit_"):
+        try:
+            _p = data.split("_")
+            _act, _dep = _p[1], int(_p[2])
+        except Exception:
+            return
+        if _act == "deploy":
+            show_edit_menu(chat_id, message_id, user_id, _dep)
+        elif _act == "env":
+            show_edit_env(chat_id, message_id, user_id, _dep)
+        elif _act == "envadd":
+            edit_env_prompt(chat_id, message_id, user_id, _dep)
+        elif _act == "envdel" and len(_p) > 3:
+            edit_env_delete(chat_id, message_id, user_id, _dep, _p[3])
+        elif _act == "reqs":
+            show_edit_reqs(chat_id, message_id, user_id, _dep)
+        elif _act == "reqsnew":
+            edit_reqs_prompt(chat_id, message_id, user_id, _dep)
+        elif _act == "code":
+            show_edit_code(chat_id, message_id, user_id, _dep)
+        elif _act == "codenew":
+            edit_code_prompt(chat_id, message_id, user_id, _dep)
         return
     
     if data.startswith("view_install_logs_"):
@@ -11554,6 +11952,14 @@ def handle_message(message):
     if 'text' in message:
         text = message['text']
 
+        # ── Edit deployment: env / requirements text ─────────────────
+        if user_step.get('step') == 'edit_env' and user_step.get('edit_dep'):
+            handle_edit_env_text(chat_id, user_id, text, message.get('message_id'), int(user_step['edit_dep']))
+            return
+        if user_step.get('step') == 'edit_reqs' and user_step.get('edit_dep'):
+            handle_edit_reqs_text(chat_id, user_id, text, int(user_step['edit_dep']))
+            return
+
         # ── Admin: search a user ─────────────────────────────────────
         if user_step.get('step') == 'awaiting_admin_user_search':
             if is_admin(user_id):
@@ -11924,6 +12330,14 @@ def handle_message(message):
         
         if not is_user_verified(user_id):
             send_verification_required(chat_id, user_id, first_name, None)
+            return
+
+        # ── Edit deployment: new requirements / package.json / code file ──
+        if user_step.get('step') == 'edit_reqs' and user_step.get('edit_dep'):
+            handle_edit_reqs_document(chat_id, user_id, doc, file_name, int(user_step['edit_dep']))
+            return
+        if user_step.get('step') == 'edit_code' and user_step.get('edit_dep'):
+            handle_edit_code_document(chat_id, user_id, doc, file_name, int(user_step['edit_dep']))
             return
         
         # Requirements file — accept requirements.txt/.txt (Python) or
