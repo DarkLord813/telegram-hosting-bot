@@ -368,6 +368,16 @@ def init_db():
         github_branch TEXT DEFAULT 'main'
     )''')
     
+    c.execute('''CREATE TABLE IF NOT EXISTS deploy_credits (
+        credit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        plan TEXT,
+        seconds_left INTEGER,
+        source_deployment INTEGER,
+        created_at TEXT,
+        used INTEGER DEFAULT 0
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS coin_transactions (
         transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -3133,7 +3143,7 @@ def _wait_for_launch(deploy_folder, timeout=15, settle=3):
         sleep(0.5)
     return False
 
-def premium_covers_plan(user_id, plan) -> bool:
+def _premium_covers_plan_core(user_id, plan) -> bool:
     """
     Whether the user's CURRENT premium tier includes a free deployment of
     `plan`. A monthly premium subscription covers monthly deployments only;
@@ -3156,6 +3166,58 @@ def premium_covers_plan(user_id, plan) -> bool:
     if tier == "yearly":
         return plan in ("monthly", "yearly")
     return plan == "monthly"
+
+def premium_covers_plan(user_id, plan) -> bool:
+    """True when a deployment of `plan` costs the user nothing: their premium tier covers it, OR they
+    hold an unused deployment credit for that plan (left over from deleting a bot they had paid for)."""
+    return _premium_covers_plan_core(user_id, plan) or get_deploy_credit(user_id, plan) is not None
+
+
+def get_deploy_credit(user_id, plan):
+    """Oldest unused credit for this plan → (credit_id, seconds_left) or None."""
+    if plan not in ("monthly", "yearly"):
+        return None
+    try:
+        row = db_execute("""SELECT credit_id, seconds_left FROM deploy_credits
+                            WHERE user_id = ? AND plan = ? AND used = 0 AND seconds_left > 60
+                            ORDER BY credit_id LIMIT 1""", (user_id, plan), fetch='one')
+        return (row[0], int(row[1])) if row else None
+    except Exception:
+        return None
+
+
+def grant_deploy_credit(user_id, plan, source_dep, expire_time):
+    """A PAID deployment is being deleted with time left → keep the unused time as a credit so
+    re-deploying the edited bot doesn't charge again. Returns seconds granted (0 = none)."""
+    try:
+        if not expire_time or plan not in ("monthly", "yearly"):
+            return 0
+        left = int((expire_time - datetime.now()).total_seconds())
+        if left <= 60:
+            return 0
+        db_execute("""INSERT INTO deploy_credits (user_id, plan, seconds_left, source_deployment, created_at, used)
+                      VALUES (?,?,?,?,?,0)""", (user_id, plan, left, source_dep, datetime.now().isoformat()))
+        return left
+    except Exception as e:
+        print(f"⚠️ grant_deploy_credit: {e}")
+        return 0
+
+
+def apply_deploy_credit(user_id, plan, start_time, expire_time, payment_method):
+    """Called when a paid-plan deployment is actually going live and it is 'free'. If that is because
+    of a credit (not real premium), the deployment runs for the credit's remaining time and the credit
+    is consumed. Returns (expire_time, payment_method, used_credit)."""
+    if payment_method != 'premium_free' or _premium_covers_plan_core(user_id, plan):
+        return expire_time, payment_method, False
+    cr = get_deploy_credit(user_id, plan)
+    if not cr:
+        return expire_time, payment_method, False
+    try:
+        db_execute("UPDATE deploy_credits SET used = 1 WHERE credit_id = ?", (cr[0],))
+    except Exception:
+        return expire_time, payment_method, False
+    return start_time + timedelta(seconds=cr[1]), 'credit', True
+
 
 def get_free_deployment_used_count(user_id):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -6819,6 +6881,31 @@ _MAIN_FILE_CANDIDATES = [
     'index.py', 'server.py', 'handler.py', '__main__.py',
 ]
 
+def _find_node_main(folder: Path):
+    """Entry point of a Node.js repo: package.json "main" / "start" script, else common names."""
+    try:
+        pj = folder / "package.json"
+        if pj.exists():
+            data = json.loads(pj.read_text(errors="replace"))
+            cand = []
+            if isinstance(data, dict):
+                if isinstance(data.get("main"), str):
+                    cand.append(data["main"])
+                m = re.search(r"node(?:mon)?\s+([\w./\\-]+\.(?:js|mjs|cjs))", str((data.get("scripts") or {}).get("start", "")))
+                if m:
+                    cand.append(m.group(1))
+            for c in cand:
+                f = (folder / c).resolve()
+                if f.is_file() and str(f).startswith(str(folder.resolve())):
+                    return f
+        for n in ("index.js", "bot.js", "main.js", "app.js", "server.js", "index.mjs"):
+            if (folder / n).is_file():
+                return folder / n
+    except Exception:
+        pass
+    return None
+
+
 def find_main_file(folder: Path) -> list[Path]:
     """
     Return a ranked list of Python file candidates for the bot entry point.
@@ -6884,17 +6971,15 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 pass
 
     try:
-        # ── Free-tier GitHub deployment limit: 1 concurrent slot ────
-        # Applies only to FREE-plan deployments; a paid monthly/yearly plan
-        # (or premium) is not limited to one GitHub bot.
-        if is_free and not is_user_premium(user_id) and not is_admin(user_id):
-            active_gh = count_github_deployments(user_id)
-            if active_gh >= 1:
+        # ── Same rules as a file-upload deployment ──────────────────
+        # Free GitHub bots use the SAME free slots (FREE_USER_MAX_DEPLOYMENTS) and the same
+        # resource quota (checked above) as uploaded bots — no separate 1-bot limit.
+        if is_free and not is_admin(user_id):
+            _can, _why = can_use_free_deployment(user_id)
+            if not _can:
                 send_message(chat_id,
-                    "⚠️ *GitHub Deployment Limit Reached*\n\n"
-                    "Free users can have *1 active GitHub deployment* at a time (24hrs).\n\n"
-                    "Stop or wait for your existing GitHub deployment to expire, "
-                    "or upgrade to Premium for unlimited deployments.",
+                    f"⚠️ *Free Deployment Limit Reached*\n\n{_why}\n\n"
+                    "Stop or delete a bot, wait for one to expire, or get a plan for more.",
                     {"inline_keyboard": [
                         [{"text": "📦 My Deployments", "callback_data": "my_deployments"}],
                         [{"text": "⭐ Get Premium",     "callback_data": "subscribe_premium"}],
@@ -6927,10 +7012,13 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         else:
             candidates = find_main_file(deploy_folder)
             dest_script = candidates[0] if candidates else None
+            if dest_script is None:
+                dest_script = _find_node_main(deploy_folder)      # Node.js repo (like an uploaded .js bot)
 
         if not dest_script or not dest_script.exists():
-            update_logs("❌ No main Python file found — cannot launch")
+            update_logs("❌ No main Python or Node.js file found — cannot launch")
             return False
+        _gh_is_node = dest_script.suffix.lower() in _NODE_EXTS
 
         update_logs(f"🎯 Entry point: {dest_script.relative_to(deploy_folder)}")
 
@@ -7027,6 +7115,8 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
         # only reads explicit manifest files; it has no equivalent of the
         # upload path's import-scanning fallback. Add one here too.
         try:
+            if _gh_is_node:
+                raise StopIteration      # no Python import scan for a Node bot
             _gh_already = {re.split(r'[=<>!~\[\s]', str(r).strip(), 1)[0].lower()
                            for r in (_installed_from_manifests or [])}
             _gh_auto = UniversalDependencyInstaller.scan_imports(code_content, update_logs, local_dir=deploy_folder)
@@ -7040,8 +7130,16 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                 _gh_tmp_reqs.write_text('\n'.join(_gh_gap))
                 install_dependencies_enhanced(_gh_tmp_reqs, update_logs, _gh_packages_dir)
                 _gh_tmp_reqs.unlink(missing_ok=True)
+        except StopIteration:
+            pass
         except Exception as _gh_gap_err:
             update_logs(f"⚠️ Gap-fill dependency scan error: {_gh_gap_err}")
+
+        if _gh_is_node:
+            try:
+                _install_npm(deploy_folder, update_logs)
+            except Exception as _ne:
+                update_logs(f"⚠️ npm install error: {_ne}")
 
         file_size = dest_script.stat().st_size
 
@@ -7060,16 +7158,21 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
 
         # ── Create launcher ──────────────────────────────────────────
         update_logs("🔧 Creating launcher...")
-        launcher_script, frameworks = create_enhanced_launcher_script(
-            deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
-            packages_dir=packages_dir)
+        if _gh_is_node:
+            start_script, frameworks = create_node_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, update_logs)
+            launcher_script = start_script
+        else:
+            launcher_script, frameworks = create_enhanced_launcher_script(
+                deploy_folder, dest_script, env_vars_dict, code_content, update_logs,
+                packages_dir=packages_dir)
 
-        # ── Start script ─────────────────────────────────────────────
-        start_script = deploy_folder / "start.sh"
-        start_script.write_text(
-            f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
-            f"setsid nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
-        start_script.chmod(0o755)
+            # ── Start script ─────────────────────────────────────────
+            start_script = deploy_folder / "start.sh"
+            start_script.write_text(
+                f"#!/bin/bash\ncd \"{deploy_folder}\"\nexport PYTHONUNBUFFERED=1\n"
+                f"setsid nohup {sys.executable} \"{launcher_script}\" > output.log 2>&1 &\necho $! > pid.txt\n")
+            start_script.chmod(0o755)
 
         update_logs("🚀 Starting bot...")
         subprocess.run([str(start_script)], cwd=str(deploy_folder),
@@ -7112,8 +7215,11 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             else:
                 expire_time = start_time + timedelta(hours=duration * 24)
                 # Free-because-of-premium → lasts for the subscription, not a flat 30/365 days.
-                expire_time, _premium_capped = cap_expiry_to_premium(
-                    user_id, expire_time, payment_method == 'premium_free')
+                expire_time, payment_method, _used_credit = apply_deploy_credit(
+                    user_id, plan, start_time, expire_time, payment_method)
+                if not _used_credit:
+                    expire_time, _premium_capped = cap_expiry_to_premium(
+                        user_id, expire_time, payment_method == 'premium_free')
 
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
@@ -7392,8 +7498,11 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             else:
                 expire_time = start_time + timedelta(days=duration)
                 # Free-because-of-premium → lasts for the subscription, not a flat 30/365 days.
-                expire_time, _premium_capped = cap_expiry_to_premium(
-                    user_id, expire_time, payment_method == 'premium_free')
+                expire_time, payment_method, _used_credit = apply_deploy_credit(
+                    user_id, plan, start_time, expire_time, payment_method)
+                if not _used_credit:
+                    expire_time, _premium_capped = cap_expiry_to_premium(
+                        user_id, expire_time, payment_method == 'premium_free')
 
             conn = sqlite3.connect(DATABASE_FILE)
             c = conn.cursor()
@@ -7582,14 +7691,20 @@ def delete_deployment(deployment_id, user_id, chat_id):
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
         
-        c.execute("SELECT proc_pid, file_name, user_id, is_free, plan FROM deployments WHERE deployment_id = ?", (deployment_id,))
+        c.execute("SELECT proc_pid, file_name, user_id, is_free, plan, payment_method, expire_time FROM deployments WHERE deployment_id = ?", (deployment_id,))
         row = c.fetchone()
         
         if not row:
             send_message(chat_id, "❌ Deployment not found")
             return False
         
-        proc_pid, file_name, owner_id, is_free, plan = row
+        proc_pid, file_name, owner_id, is_free, plan, _pay_method, _exp_str = row
+        _credit_secs = 0
+        if not is_free and _pay_method in ('coins', 'stars', 'credit') and _exp_str:
+            try:
+                _credit_secs = grant_deploy_credit(owner_id, plan, deployment_id, datetime.fromisoformat(_exp_str))
+            except Exception:
+                _credit_secs = 0
         
         if owner_id != user_id and not is_admin(user_id):
             send_message(chat_id, "❌ Permission denied")
@@ -7622,7 +7737,12 @@ def delete_deployment(deployment_id, user_id, chat_id):
                 f"📁 File: `{display_filename(file_name)}`\n"
                 f"🆓 Free slots left: `{remaining}/{FREE_USER_MAX_DEPLOYMENTS}`")
         else:
-            send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!\n\n📁 File: `{display_filename(file_name)}`")
+            _extra = ""
+            if _credit_secs:
+                _d, _h = divmod(_credit_secs // 3600, 24)
+                _extra = (f"\n\n💳 *Credit saved:* `{_d}d {_h}h` of your paid {plan} time. "
+                          f"Deploy your updated bot on the *{plan.capitalize()}* plan and it's free — no second payment.")
+            send_message(chat_id, f"✅ Deployment `{deployment_id}` deleted!\n\n📁 File: `{display_filename(file_name)}`{_extra}")
         
         with deployment_lock:
             if deployment_id in active_deployments:
@@ -8082,17 +8202,39 @@ def _edit_user_keys(env):
     return [k for k in env if k not in _PLATFORM_ENV_KEYS]
 
 
+def _edit_push(dep_id, what):
+    """Push the edited deployment to the GitHub files repo RIGHT NOW (and the platform DB, which holds
+    env vars / requirements). Returns a one-line status for the user. A failed push is retried by the
+    queue, so the edit is never lost."""
+    try:
+        async_backup(f"edit_{what}_{dep_id}")          # platform DB (env_vars / requirements columns)
+    except Exception:
+        pass
+    if not FILES_REPO_ENABLED:
+        return "ℹ️ GitHub files repo isn't configured — edit saved on the server only."
+    try:
+        r = files_repo_save_deployment(dep_id, f"edit {what}")
+    except Exception as e:
+        r = {"ok": False, "error": str(e)}
+    if r.get("ok"):
+        n = r.get("changed", 0)
+        return f"☁️ GitHub updated ({n} file(s) changed)." if n else "☁️ GitHub already up to date."
+    try:
+        files_repo_async_save(dep_id, f"edit {what} (retry)")
+    except Exception:
+        pass
+    return f"⚠️ Saved here, but GitHub update failed ({str(r.get('error'))[:80]}) — will retry automatically."
+
+
 def _edit_save_env(user_id, dep_id, env, folder):
+    """Save env vars to the DB + .env, then push to GitHub. Returns the GitHub status line."""
     db_execute("UPDATE deployments SET env_vars = ? WHERE deployment_id = ? AND user_id = ?",
                (json.dumps(env), dep_id, user_id))
     try:
         (folder / ".env").write_text(''.join(f"{k}={v}\n" for k, v in env.items()))
     except Exception as e:
         print(f"⚠️ edit: could not rewrite .env for #{dep_id}: {e}")
-    try:
-        files_repo_async_save(dep_id, "edit_env")
-    except Exception:
-        pass
+    return _edit_push(dep_id, "env")
 
 
 def _edit_after_kb(dep_id):
@@ -8165,9 +8307,9 @@ def edit_env_delete(chat_id, message_id, user_id, dep_id, key_hash):
         show_edit_env(chat_id, message_id, user_id, dep_id, note="⚠️ That variable was already removed.\n\n")
         return
     env = dict(d["env"]); env.pop(target, None)
-    _edit_save_env(user_id, dep_id, env, d["folder"])
+    gh = _edit_save_env(user_id, dep_id, env, d["folder"])
     show_edit_env(chat_id, message_id, user_id, dep_id,
-                  note=f"✅ Removed `{re.sub(r'[^A-Za-z0-9_]', '_', target)}` — restart to apply.\n\n")
+                  note=f"✅ Removed `{re.sub(r'[^A-Za-z0-9_]', '_', target)}` — restart to apply.\n{gh}\n\n")
 
 
 def edit_env_prompt(chat_id, message_id, user_id, dep_id):
@@ -8207,45 +8349,62 @@ def handle_edit_env_text(chat_id, user_id, text, user_message_id, dep_id):
     added = [k for k in new_vars if k not in env]
     updated = [k for k in new_vars if k in env]
     env.update(new_vars)
-    _edit_save_env(user_id, dep_id, env, d["folder"])
+    gh = _edit_save_env(user_id, dep_id, env, d["folder"])
     set_user_step(user_id, None)
     parts = []
     if added:   parts.append("➕ Added: " + ", ".join(f"`{k}`" for k in added[:15]))
     if updated: parts.append("♻️ Updated: " + ", ".join(f"`{k}`" for k in updated[:15]))
     if ignored: parts.append(f"⚠️ {ignored} line(s) ignored (not `KEY=VALUE`)")
-    send_message(chat_id, "✅ *Saved*\n\n" + "\n".join(parts) + "\n\nRestart to apply.", _edit_after_kb(dep_id))
+    send_message(chat_id, "✅ *Saved*\n\n" + "\n".join(parts) + f"\n{gh}\n\nRestart to apply.", _edit_after_kb(dep_id))
 
 
 # ---------- requirements / package.json ----------
 def show_edit_reqs(chat_id, message_id, user_id, dep_id):
+    """Clicking Edit → requirements/package.json goes straight to a FILE-UPLOAD prompt."""
     d = _edit_load(user_id, dep_id)
     if not d:
         _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
         return
-    set_user_step(user_id, None)
-    mf = d["folder"] / ("package.json" if d["is_node"] else "requirements.txt")
+    name = "package.json" if d["is_node"] else "requirements.txt"
+    mf = d["folder"] / name
     try:
         cur = mf.read_text(errors="replace").strip() if mf.exists() else ""
     except Exception:
         cur = ""
-    shown = (cur[:1200] + ("\n…" if len(cur) > 1200 else "")).replace("`", "'") if cur else "(none)"
-    name = "package.json" if d["is_node"] else "requirements.txt"
-    text = (f"*📦 {name.upper()} — #{dep_id}*\n\nCurrent:\n```\n{shown}\n```\n"
-            f"Send a new `{name}` *file*" + ("" if d["is_node"] else " (or paste the list as text)") +
-            " to replace it. The packages are reinstalled for you.")
-    _edit_reply(chat_id, message_id, text, {"inline_keyboard": [
-        [{"text": "📤 Replace it", "callback_data": f"edit_reqsnew_{dep_id}"}],
-        [{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}]]})
+    shown = (cur[:900] + ("\n…" if len(cur) > 900 else "")).replace("`", "'") if cur else "(none)"
+    set_user_step(user_id, 'edit_reqs', edit_dep=dep_id)
+    _edit_reply(chat_id, message_id,
+        f"*📦 REPLACE {name.upper()} — #{dep_id}*\n\nCurrent:\n```\n{shown}\n```\n"
+        f"📤 *Upload the new `{name}` file now.* It replaces the old one and the packages are reinstalled.",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_deploy_{dep_id}"}]]})
 
 
 def edit_reqs_prompt(chat_id, message_id, user_id, dep_id):
+    show_edit_reqs(chat_id, message_id, user_id, dep_id)
+
+
+def handle_edit_reqs_text(chat_id, user_id, text, dep_id):
+    d = _edit_load(user_id, dep_id)
+    name = "package.json" if (d and d["is_node"]) else "requirements.txt"
+    send_message(chat_id, f"📤 Please *upload* the `{name}` file (attach it as a document) — pasted text isn't accepted.",
+                 {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_deploy_{dep_id}"}]]})
+
+
+def handle_edit_reqs_document(chat_id, user_id, doc, file_name, dep_id):
     d = _edit_load(user_id, dep_id)
     if not d:
+        set_user_step(user_id, None)
+        send_message(chat_id, "❌ Deployment not found")
         return
-    set_user_step(user_id, 'edit_reqs', edit_dep=dep_id)
-    name = "package.json" if d["is_node"] else "requirements.txt"
-    _edit_reply(chat_id, message_id, f"📤 Send the new `{name}` now.",
-                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_reqs_{dep_id}"}]]})
+    ok_name = (file_name == "package.json") if d["is_node"] else file_name.lower().endswith(".txt")
+    if not ok_name:
+        send_message(chat_id, "❌ Please upload " + ("`package.json`." if d["is_node"] else "a `requirements.txt` file."))
+        return
+    raw = _download_telegram_file_bytes(doc.get("file_id"))
+    if raw is None:
+        send_message(chat_id, "❌ Could not download the file from Telegram.")
+        return
+    _edit_apply_manifest(chat_id, user_id, dep_id, raw.decode("utf-8", errors="replace"))
 
 
 def _edit_reinstall(chat_id, user_id, dep_id, d, what):
@@ -8269,10 +8428,6 @@ def _edit_reinstall(chat_id, user_id, dep_id, d, what):
         edit_message(chat_id, mid, msg, None)
     else:
         send_message(chat_id, msg)
-    try:
-        files_repo_async_save(dep_id, f"edit_{what}")
-    except Exception:
-        pass
 
 
 def _edit_apply_manifest(chat_id, user_id, dep_id, content):
@@ -8290,7 +8445,7 @@ def _edit_apply_manifest(chat_id, user_id, dep_id, content):
                 raise ValueError("top level must be an object")
         except Exception as e:
             send_message(chat_id, f"❌ That isn't a valid `package.json`: {safe_md(str(e))[:150]}",
-                         {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_reqs_{dep_id}"}]]})
+                         {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_deploy_{dep_id}"}]]})
             return
         (d["folder"] / "package.json").write_text(content)
         stored = content[:2000]
@@ -8306,63 +8461,31 @@ def _edit_apply_manifest(chat_id, user_id, dep_id, content):
     db_execute("UPDATE deployments SET requirements = ? WHERE deployment_id = ? AND user_id = ?",
                (stored, dep_id, user_id))
     set_user_step(user_id, None)
+    gh = _edit_push(dep_id, "requirements")          # the new file goes to GitHub immediately
     _edit_reinstall(chat_id, user_id, dep_id, d, "requirements")
-    send_message(chat_id, "✅ *Requirements updated.* Restart to apply.", _edit_after_kb(dep_id))
-
-
-def handle_edit_reqs_text(chat_id, user_id, text, dep_id):
-    d = _edit_load(user_id, dep_id)
-    if d and d["is_node"] and not text.strip().startswith("{"):
-        send_message(chat_id, "❌ Send the `package.json` as a file or as JSON text (starting with `{`).")
-        return
-    _edit_apply_manifest(chat_id, user_id, dep_id, text)
-
-
-def handle_edit_reqs_document(chat_id, user_id, doc, file_name, dep_id):
-    d = _edit_load(user_id, dep_id)
-    if not d:
-        set_user_step(user_id, None)
-        send_message(chat_id, "❌ Deployment not found")
-        return
-    expected = "package.json" if d["is_node"] else None
-    ok_name = (file_name == "package.json") if d["is_node"] else (file_name.endswith(".txt"))
-    if not ok_name:
-        send_message(chat_id, f"❌ Please send " + ("`package.json`." if d["is_node"] else "a `requirements.txt` file."))
-        return
-    raw = _download_telegram_file_bytes(doc.get("file_id"))
-    if raw is None:
-        send_message(chat_id, "❌ Could not download the file from Telegram.")
-        return
-    _edit_apply_manifest(chat_id, user_id, dep_id, raw.decode("utf-8", errors="replace"))
+    send_message(chat_id, f"✅ *Requirements updated.*\n{gh}\n\nRestart to apply.", _edit_after_kb(dep_id))
 
 
 # ---------- replace the bot's code ----------
 def show_edit_code(chat_id, message_id, user_id, dep_id):
+    """Clicking Edit → Replace code goes straight to a FILE-UPLOAD prompt."""
     d = _edit_load(user_id, dep_id)
     if not d:
         _edit_reply(chat_id, message_id, "❌ Deployment not found", None)
         return
-    set_user_step(user_id, None)
     ext = Path(d["file_name"]).suffix.lower()
     size = d["script"].stat().st_size if d["script"].exists() else 0
+    set_user_step(user_id, 'edit_code', edit_dep=dep_id)
     _edit_reply(chat_id, message_id,
         f"*📄 REPLACE CODE — #{dep_id}*\n\nCurrent: `{display_filename(d['file_name'])}` ({format_file_size(size)})\n\n"
-        f"Send the new version as a `{ext}` file. It replaces the old one (same name), goes through the same "
+        f"📤 *Upload the new `{ext}` file now.* It replaces the old one (same name), goes through the same "
         f"6-layer security scan, and its imports are installed automatically. Your data files, database and "
         f"env vars are untouched.",
-        {"inline_keyboard": [
-            [{"text": "📤 Upload new file", "callback_data": f"edit_codenew_{dep_id}"}],
-            [{"text": "🔙 Back", "callback_data": f"edit_deploy_{dep_id}"}]]})
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_deploy_{dep_id}"}]]})
 
 
 def edit_code_prompt(chat_id, message_id, user_id, dep_id):
-    d = _edit_load(user_id, dep_id)
-    if not d:
-        return
-    set_user_step(user_id, 'edit_code', edit_dep=dep_id)
-    ext = Path(d["file_name"]).suffix.lower()
-    _edit_reply(chat_id, message_id, f"📤 Send the new `{ext}` file now.",
-                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_code_{dep_id}"}]]})
+    show_edit_code(chat_id, message_id, user_id, dep_id)
 
 
 def handle_edit_code_document(chat_id, user_id, doc, file_name, dep_id):
@@ -8375,7 +8498,7 @@ def handle_edit_code_document(chat_id, user_id, doc, file_name, dep_id):
     if Path(file_name).suffix.lower() != want:
         send_message(chat_id, f"❌ This deployment runs a `{want}` file — please send a `{want}` file.\n"
                               f"To switch language, create a new deployment instead.",
-                     {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_code_{dep_id}"}]]})
+                     {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_deploy_{dep_id}"}]]})
         return
     raw = _download_telegram_file_bytes(doc.get("file_id"))
     if raw is None:
@@ -8400,8 +8523,10 @@ def handle_edit_code_document(chat_id, user_id, doc, file_name, dep_id):
                (len(raw), dep_id, user_id))
     set_user_step(user_id, None)
     note = (f"\n⚠️ {len(warnings)} warning(s) noted." if warnings else "\n✅ Security scan passed.")
-    send_message(chat_id, f"✅ *Code replaced* ({format_file_size(len(raw))}).{note}")
+    gh = _edit_push(dep_id, "code")                  # the new code goes to GitHub immediately
+    send_message(chat_id, f"✅ *Code replaced* ({format_file_size(len(raw))}).{note}\n{gh}")
     _edit_reinstall(chat_id, user_id, dep_id, d, "code")
+    gh2 = _edit_push(dep_id, "code deps")            # picks up anything the install added (e.g. package.json)
     send_message(chat_id, "Restart to run the new code.", _edit_after_kb(dep_id))
 
 
@@ -8794,6 +8919,18 @@ def handle_paid_deployment(chat_id, user_id, message_id, plan, duration, cost_co
             f"• Environment variables (KEY=VALUE, one per line)\n\n"
             f"*Note:* All environment variables will be available via os.environ.get('KEY')"
         )
+    elif (not _premium_covers_plan_core(user_id, plan)) and get_deploy_credit(user_id, plan):
+        _cr = get_deploy_credit(user_id, plan)
+        text = (
+            f"*💳 SAVED CREDIT*\n\n"
+            f"You deleted a paid {plan} bot, so its unused time is kept: *{_cr[1]//86400}d {(_cr[1]//3600)%24}h*.\n"
+            f"This deployment is *FREE* and runs for that remaining time.\n\n"
+            f"📤 *Send your file (.py, .js, etc.)*\n"
+            f"📦 Max size: `{MAX_FILE_SIZE_MB}MB`\n\n"
+            f"After sending the file, send:\n"
+            f"• requirements.txt / package.json (optional)\n"
+            f"• Environment variables (KEY=VALUE, one per line)"
+        )
     elif premium_covers_plan(user_id, plan):
         text = (
             f"*✨ PREMIUM BENEFIT!*\n\n"
@@ -8946,11 +9083,15 @@ def get_deploy_menu(user_id):
     is_premium = is_user_premium(user_id)
     covers_monthly = premium_covers_plan(user_id, "monthly")
     covers_yearly  = premium_covers_plan(user_id, "yearly")
+    _cm = (not _premium_covers_plan_core(user_id, "monthly")) and get_deploy_credit(user_id, "monthly")
+    _cy = (not _premium_covers_plan_core(user_id, "yearly")) and get_deploy_credit(user_id, "yearly")
 
     if covers_monthly or covers_yearly:
-        monthly_label = ("📅 Monthly (30 days) - FREE for Premium" if covers_monthly
+        monthly_label = (f"📅 Monthly - FREE (saved credit {_cm[1]//86400}d)" if _cm else
+                         "📅 Monthly (30 days) - FREE for Premium" if covers_monthly
                          else f"📅 Monthly (30 days) - {PRICE_MONTHLY_STARS}⭐ / {PRICE_MONTHLY_COINS}🪙")
-        yearly_label  = ("🌟 Yearly (365 days) - FREE for Premium" if covers_yearly
+        yearly_label  = (f"🌟 Yearly - FREE (saved credit {_cy[1]//86400}d)" if _cy else
+                         "🌟 Yearly (365 days) - FREE for Premium" if covers_yearly
                          else f"🌟 Yearly (365 days) - {PRICE_YEARLY_STARS}⭐ / {PRICE_YEARLY_COINS}🪙")
         rows = [
             [{"text": monthly_label, "callback_data": "plan_monthly"}],
