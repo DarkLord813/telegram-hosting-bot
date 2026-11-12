@@ -5,6 +5,7 @@ A self-hosted platform that lets users deploy their own bots through a Telegram 
 ## Features
 - Deploy Python & node js bots
 - Premium subscriptions with Stars/Coins
+- Subscription plans 512MB, 1GB, 2GB, 4GB
 - Free tier (3 deployments, 24h each)
 - GitHub deployment 
 - Environment variable support
