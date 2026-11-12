@@ -368,6 +368,14 @@ def init_db():
         github_branch TEXT DEFAULT 'main'
     )''')
     
+    c.execute('''CREATE TABLE IF NOT EXISTS expiry_reminders (
+        deployment_id INTEGER,
+        expire_time TEXT,
+        stage INTEGER,
+        sent_at TEXT,
+        PRIMARY KEY (deployment_id, expire_time, stage)
+    )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS deploy_credits (
         credit_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -525,6 +533,10 @@ def init_db():
         ("resource_tier_key",     "TEXT"),
         ("resource_tier_mb",      "INTEGER DEFAULT 0"),
         ("resource_tier_expires", "TEXT"),
+        ("is_banned",     "INTEGER DEFAULT 0"),
+        ("ban_reason",    "TEXT"),
+        ("banned_at",     "TEXT"),
+        ("banned_by",     "INTEGER"),
     ]:
         try:
             c.execute(f"ALTER TABLE deployments ADD COLUMN {_col} {_type}" if _col == "folder_name"
@@ -2421,10 +2433,14 @@ def _relaunch_followup(dep_id, reason, result):
     if not row:
         return
     try:
+        _tail = _log_tail_text(get_deploy_folder(row[0], dep_id), 15)
+        _logs = f"\n\n*Last log lines:*\n```\n{_tail}\n```" if _tail else ""
+        why = ("It crashed too many times in the last hour, so auto-restart stopped."
+               if result == "cap_exceeded" else "Automatic restart didn't succeed.")
         send_message(row[0],
             f"⚠️ *Bot #{dep_id} Crashed*\n\n"
-            f"Automatic restart didn't succeed. Your database is safe — "
-            f"click Restart to try again manually.",
+            f"{why} Your database is safe — fix the problem (see the log below) "
+            f"and click Restart.{_logs}",
             {"inline_keyboard": [
                 [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
                 [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}]]})
@@ -2489,6 +2505,73 @@ def _log_shows_missing_dependency(deploy_folder) -> bool:
         return False
     return any(s in tail for s in ("ModuleNotFoundError", "No module named", "ImportError",
                                    "Cannot find module", "MODULE_NOT_FOUND"))
+
+
+def _log_tail_text(deploy_folder, lines=15, max_chars=1400) -> str:
+    """Last `lines` lines of a bot's output.log, safe to drop inside a Markdown code block."""
+    try:
+        raw = (Path(deploy_folder) / "output.log").read_text(errors="replace")
+    except Exception:
+        return ""
+    tail = "\n".join(l for l in raw.splitlines() if l.strip())
+    tail = "\n".join(tail.splitlines()[-lines:])
+    return tail.replace("`", "'")[-max_chars:]
+
+
+_MISSING_PY  = re.compile(r"No module named ['\"]([A-Za-z0-9_\.\-]+)['\"]")
+_MISSING_NODE = re.compile(r"Cannot find (?:module|package) ['\"]([^'\"]+)['\"]")
+
+
+def _missing_modules_from_log(deploy_folder):
+    """-> (python_modules, node_packages) named in the last lines of the bot's log."""
+    try:
+        tail = (Path(deploy_folder) / "output.log").read_text(errors="replace")[-6000:]
+    except Exception:
+        return [], []
+    py = [m.split(".")[0] for m in _MISSING_PY.findall(tail)]
+    node = []
+    for m in _MISSING_NODE.findall(tail):
+        if m.startswith((".", "/")) or m.startswith("node:"):
+            continue                       # a relative file, not a package
+        parts = m.split("/")
+        node.append("/".join(parts[:2]) if m.startswith("@") else parts[0])
+    return list(dict.fromkeys(py)), list(dict.fromkeys(node))
+
+
+def _install_missing_from_log(deploy_folder, dest_script, log=lambda m: None):
+    """The bot crashed on `No module named X` / `Cannot find module X` → install just that package.
+    Returns the list of packages that were installed (empty when nothing was missing / installable)."""
+    py, node = _missing_modules_from_log(deploy_folder)
+    done = []
+    deploy_folder = Path(deploy_folder)
+    if py:
+        try:
+            reqs = []
+            for mod in py:
+                for r in UniversalDependencyInstaller.scan_imports(f"import {mod}\n", log, local_dir=deploy_folder):
+                    if r not in reqs:
+                        reqs.append(r)
+            reqs = drop_stdlib_requirements(reqs) if 'drop_stdlib_requirements' in globals() else reqs
+            if reqs:
+                packages_dir = deploy_folder / "packages"
+                packages_dir.mkdir(exist_ok=True)
+                tmp = deploy_folder / "_missing_mod_reqs.txt"
+                tmp.write_text("\n".join(reqs))
+                try:
+                    install_dependencies_enhanced(tmp, log, packages_dir)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                done += reqs
+        except Exception as e:
+            print(f"⚠️ missing-module install (python) failed: {e}")
+    if node and _cmd_exists('npm'):
+        try:
+            ok, out = _run(['npm', 'install', '--no-audit', '--no-fund', *node], cwd=str(deploy_folder), timeout=300)
+            if ok:
+                done += node
+        except Exception as e:
+            print(f"⚠️ missing-module install (node) failed: {e}")
+    return done
 
 
 def _find_available_port(preferred: int = 20000) -> int:
@@ -3946,6 +4029,7 @@ def mark_channel_joined(user_id):
                   (CHANNEL_SIGNATURE, user_id))
         conn.commit()
         conn.close()
+        grant_referral_reward(user_id)         # the referrer is paid now that this user is verified
         return True
     except Exception as e:
         print(f"❌ mark_channel_joined: {e}")
@@ -4179,15 +4263,43 @@ def process_referral(referrer_id, new_user_id):
     except sqlite3.IntegrityError:
         conn.close()
         return False  # user already referred
-    # Give coins to referrer
-    update_user_coins(referrer_id, REFERRAL_REWARD_COINS, "referral_reward", f"referred_{new_user_id}")
-    # Mark reward as given
-    conn2 = sqlite3.connect(DATABASE_FILE)
-    conn2.execute("UPDATE referrals SET reward_given = 1 WHERE referred_id = ?", (new_user_id,))
-    conn2.commit()
-    conn2.close()
+    # The reward is NOT paid yet — it is released by grant_referral_reward() once the new user has
+    # actually verified (joined the required channels). That stops throw-away accounts farming coins.
     async_backup(f"referral_{referrer_id}")
     return True
+
+
+def grant_referral_reward(new_user_id):
+    """Pay the referrer of `new_user_id` — once, and only after the new user is verified."""
+    try:
+        row = db_execute("SELECT referrer_id FROM referrals WHERE referred_id = ? AND reward_given = 0",
+                         (new_user_id,), fetch='one')
+        if not row:
+            return False
+        referrer_id = int(row[0])
+        if is_banned(referrer_id) or is_banned(new_user_id):
+            return False
+        conn = sqlite3.connect(DATABASE_FILE)
+        cur = conn.execute("UPDATE referrals SET reward_given = 1 WHERE referred_id = ? AND reward_given = 0",
+                           (new_user_id,))
+        conn.commit()
+        claimed = cur.rowcount
+        conn.close()
+        if not claimed:
+            return False                      # someone else already paid it
+        update_user_coins(referrer_id, REFERRAL_REWARD_COINS, "referral_reward", f"referred_{new_user_id}")
+        async_backup(f"referral_paid_{referrer_id}")
+        try:
+            send_message(referrer_id,
+                f"🎉 *Referral Bonus!*\n\nYour invited friend verified their account.\n"
+                f"You earned *{REFERRAL_REWARD_COINS} 🪙* coins.\n\nKeep sharing to earn more!",
+                {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"⚠️ grant_referral_reward: {e}")
+        return False
 
 def show_referral_menu(chat_id, user_id, message_id=None):
     code    = get_or_create_referral_code(user_id)
@@ -4211,7 +4323,7 @@ def show_referral_menu(chat_id, user_id, message_id=None):
 
     text = (
         f"*👥 REFERRAL PROGRAMME*\n\n"
-        f"Invite friends and earn *{REFERRAL_REWARD_COINS} 🪙* for every person who joins!\n\n"
+        f"Invite friends and earn *{REFERRAL_REWARD_COINS} 🪙* for every friend who joins *and verifies*!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔗 *Your referral link:*\n`{ref_link}`\n\n"
         f"📊 *Your stats:*\n"
@@ -8543,16 +8655,315 @@ def _download_telegram_file_bytes(file_id):
         return None
 
 
+# ==================== LIVE STATS / BACKUP / REMINDERS / ABUSE GUARD ====================
+_CLK_TCK = os.sysconf('SC_CLK_TCK') if hasattr(os, 'sysconf') else 100
+
+
+def _proc_tree_pids(root_pid):
+    """root_pid + every descendant, from /proc (no psutil needed)."""
+    children = {}
+    try:
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f'/proc/{name}/stat') as f:
+                    data = f.read()
+                ppid = int(data[data.rindex(')') + 2:].split()[1])
+                children.setdefault(ppid, []).append(int(name))
+            except Exception:
+                continue
+    except Exception:
+        return [root_pid]
+    out, stack = [], [int(root_pid)]
+    while stack:
+        pid = stack.pop()
+        out.append(pid)
+        stack.extend(children.get(pid, []))
+    return out
+
+
+def _tree_cpu_seconds(root_pid):
+    """Cumulative CPU time (user+system, seconds) of the process tree."""
+    total = 0.0
+    for pid in _proc_tree_pids(root_pid):
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                d = f.read()
+            fields = d[d.rindex(')') + 2:].split()
+            total += (int(fields[11]) + int(fields[12])) / _CLK_TCK      # utime + stime
+        except Exception:
+            pass
+    return total
+
+
+def _process_uptime_seconds(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            d = f.read()
+        start = int(d[d.rindex(')') + 2:].split()[19]) / _CLK_TCK
+        with open('/proc/uptime') as f:
+            up = float(f.read().split()[0])
+        return max(0, int(up - start))
+    except Exception:
+        return None
+
+
+def get_deployment_live_stats(pid, sample=0.5):
+    """{'ram_mb','cpu_pct','uptime_s','procs'} for a deployment's process tree, or None if it's gone.
+    cpu_pct: 100 = one full core."""
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except Exception:
+        return None
+    c0 = _tree_cpu_seconds(pid)
+    sleep(sample)
+    c1 = _tree_cpu_seconds(pid)
+    return {"ram_mb": get_process_tree_ram_mb(pid),
+            "cpu_pct": max(0.0, (c1 - c0) / sample * 100),
+            "uptime_s": _process_uptime_seconds(pid),
+            "procs": len(_proc_tree_pids(pid))}
+
+
+def _fmt_uptime(sec):
+    if sec is None:
+        return "—"
+    d, r = divmod(int(sec), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    return (f"{d}d " if d else "") + (f"{h}h " if (d or h) else "") + f"{m}m"
+
+
+def _live_stats_block(dep_id, pid, quota_mb=None):
+    st = get_deployment_live_stats(pid)
+    if not st:
+        return ""
+    restarts = (db_execute("SELECT crash_restart_count FROM deployments WHERE deployment_id = ?",
+                           (dep_id,), fetch='one') or [0])[0] or 0
+    ram = f"`{format_resource(st['ram_mb'])}`" + (f" / `{format_resource(quota_mb)}`" if quota_mb else "")
+    return (f"\n\n*📈 LIVE STATS*\n"
+            f"🧠 RAM: {ram}\n"
+            f"⚙️ CPU: `{st['cpu_pct']:.0f}%` of 1 core\n"
+            f"⏱️ Uptime: `{_fmt_uptime(st['uptime_s'])}`\n"
+            f"🧵 Processes: `{st['procs']}`\n"
+            f"🔁 Auto-restarts (last hour): `{restarts}`")
+
+
+# ---------- backup zip ----------
+_BACKUP_SKIP_DIRS  = {"packages", "node_modules", "venv", ".venv", "__pycache__", ".cache", ".npm",
+                      ".git", "site-packages", ".home", ".local", ".config"}
+_BACKUP_SKIP_FILES = {"run.py", "start.sh", "pid.txt", "output.log", "install.log"}
+BACKUP_ZIP_MAX_MB  = 48        # Telegram's bot upload cap is 50 MB
+
+
+def build_deployment_backup_zip(folder, zip_path):
+    """Zip a deployment's own files (code, data, database, manifests, .env) — not installed packages or
+    generated launchers. -> (file_count, total_bytes) of the zip."""
+    import zipfile
+    n = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in _BACKUP_SKIP_DIRS]
+            for fn in files:
+                if fn in _BACKUP_SKIP_FILES or fn.endswith((".pyc", ".sock")):
+                    continue
+                full = Path(root) / fn
+                try:
+                    if full.is_symlink() or not full.is_file():
+                        continue
+                    z.write(full, str(full.relative_to(folder)))
+                    n += 1
+                except Exception:
+                    continue
+    return n, Path(zip_path).stat().st_size
+
+
+def send_deployment_backup(chat_id, user_id, dep_id):
+    d = _edit_load(user_id, dep_id)
+    if not d:
+        send_message(chat_id, "❌ Deployment not found")
+        return
+    folder = d["folder"]
+    if not folder.exists():
+        send_message(chat_id, "❌ This deployment's files aren't on the server right now (restore it first by restarting it).")
+        return
+    tmp_dir = Path(tempfile.mkdtemp(prefix="bk_"))
+    try:
+        zp = tmp_dir / f"deployment_{dep_id}_backup.zip"
+        n, size = build_deployment_backup_zip(folder, zp)
+        if n == 0:
+            send_message(chat_id, "ℹ️ Nothing to back up yet.")
+        elif size > BACKUP_ZIP_MAX_MB * 1024 * 1024:
+            send_message(chat_id, f"⚠️ The backup is {format_file_size(size)} — over Telegram's upload limit "
+                                  f"({BACKUP_ZIP_MAX_MB} MB). Delete large data files and try again.")
+        else:
+            send_document(chat_id, str(zp),
+                          f"💾 Backup of #{dep_id} — {n} file(s), {format_file_size(size)}\n"
+                          f"Includes your code, data/database and .env. Installed packages are rebuilt automatically.",
+                          zp.name)
+    except Exception as e:
+        send_message(chat_id, f"❌ Backup failed: {str(e)[:150]}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------- expiry reminders ----------
+_REMINDER_STAGES_H = (72, 24, 1)        # hours before expiry (a 24h free bot only ever hits the 1h one)
+
+
+def expiry_reminder_monitor():
+    """Every 10 min: tell owners their bot is about to expire (72h / 24h / 1h before)."""
+    sleep(120)
+    print("✅ Expiry reminder monitor started")
+    while True:
+        try:
+            check_expiry_reminders()
+        except Exception as e:
+            print(f"⚠️ expiry reminder error: {e}")
+        sleep(600)
+
+
+def check_expiry_reminders(now=None):
+    now = now or datetime.now()
+    rows = db_execute("""SELECT deployment_id, user_id, plan, is_free, expire_time FROM deployments
+                         WHERE status = 'active' AND expire_time IS NOT NULL AND expire_time > ?
+                           AND expire_time <= ?""",
+                      (now.isoformat(), (now + timedelta(hours=max(_REMINDER_STAGES_H))).isoformat()),
+                      fetch='all') or []
+    sent = 0
+    for dep_id, uid, plan, is_free, exp_s in rows:
+        if is_banned(uid):
+            continue
+        try:
+            left_h = (datetime.fromisoformat(exp_s) - now).total_seconds() / 3600
+        except Exception:
+            continue
+        stages = [x for x in _REMINDER_STAGES_H if left_h <= x]
+        if not stages:
+            continue
+        stage = min(stages)                       # the tightest window we're in
+        if is_free and stage != 1:
+            continue                              # free 24h bots: only the last-hour warning
+        if db_execute("SELECT 1 FROM expiry_reminders WHERE deployment_id = ? AND expire_time = ? AND stage <= ?",
+                      (dep_id, exp_s, stage), fetch='one'):
+            continue                              # this (or a tighter) stage was already sent
+        db_execute("INSERT OR IGNORE INTO expiry_reminders (deployment_id, expire_time, stage, sent_at) "
+                   "VALUES (?,?,?,?)", (dep_id, exp_s, stage, now.isoformat()))
+        left = (f"{int(left_h * 60)} minutes" if left_h < 1.5 else
+                f"{left_h:.0f} hours" if left_h < 48 else f"{left_h / 24:.0f} days")
+        rows_kb = [[{"text": "📈 Resource Plans (renew)", "callback_data": "resource_tiers"}],
+                   [{"text": f"📦 Open Bot #{dep_id}", "callback_data": f"view_deploy_{dep_id}"}]]
+        if not is_free:
+            rows_kb.insert(0, [{"text": "💾 Download backup", "callback_data": f"backup_deploy_{dep_id}"}])
+        try:
+            send_message(uid,
+                f"⏰ *Bot #{dep_id} expires in about {left}*\n\n"
+                f"Plan: `{str(plan).upper()}`. When it expires the bot stops (your data is kept).\n"
+                + ("Get a resource plan to keep your bots running without limits." if is_free
+                   else "Renew with a resource plan so it keeps running, or download a backup."),
+                {"inline_keyboard": rows_kb})
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+# ---------- abuse guard (sustained CPU) ----------
+ABUSE_CPU_PERCENT = float(os.environ.get("ABUSE_CPU_PERCENT", 90))     # of one core
+ABUSE_WARN_MIN    = int(os.environ.get("ABUSE_WARN_MINUTES", 5))
+ABUSE_STOP_MIN    = int(os.environ.get("ABUSE_STOP_MINUTES", 10))
+_abuse_state = {}      # dep_id -> {"pid","cpu","t","minutes","warned"}
+
+
+def abuse_guard_tick(now_ts=None, cpu_probe=None):
+    """One pass of the guard. cpu_probe(pid)->cumulative CPU seconds (injectable for tests)."""
+    now_ts = now_ts if now_ts is not None else time.time()
+    cpu_probe = cpu_probe or _tree_cpu_seconds
+    rows = db_execute("SELECT deployment_id, user_id, proc_pid FROM deployments "
+                      "WHERE status = 'active' AND proc_pid IS NOT NULL", fetch='all') or []
+    live = set()
+    actions = []
+    for dep_id, uid, pid in rows:
+        live.add(dep_id)
+        if is_admin(uid):
+            continue
+        cpu = cpu_probe(pid)
+        st = _abuse_state.get(dep_id)
+        if not st or st["pid"] != pid:
+            _abuse_state[dep_id] = {"pid": pid, "cpu": cpu, "t": now_ts, "minutes": 0.0, "warned": False}
+            continue
+        dt = now_ts - st["t"]
+        if dt < 20:
+            continue
+        pct = max(0.0, (cpu - st["cpu"]) / dt * 100)
+        st["cpu"], st["t"] = cpu, now_ts
+        if pct >= ABUSE_CPU_PERCENT:
+            st["minutes"] += dt / 60
+        else:
+            st["minutes"] = max(0.0, st["minutes"] - dt / 60 * 2)      # cools down twice as fast
+            if st["minutes"] == 0:
+                st["warned"] = False
+        if st["minutes"] >= ABUSE_STOP_MIN:
+            actions.append(("stop", dep_id, uid))
+            st["minutes"] = 0.0
+            st["warned"] = False
+        elif st["minutes"] >= ABUSE_WARN_MIN and not st["warned"]:
+            st["warned"] = True
+            actions.append(("warn", dep_id, uid))
+    for gone in [d for d in _abuse_state if d not in live]:
+        _abuse_state.pop(gone, None)
+    for kind, dep_id, uid in actions:
+        try:
+            if kind == "warn":
+                send_message(uid,
+                    f"⚠️ *Bot #{dep_id} is using too much CPU*\n\n"
+                    f"It has been running at ~100% of a core for {ABUSE_WARN_MIN}+ minutes. "
+                    f"If this continues for {ABUSE_STOP_MIN} minutes it will be stopped automatically.\n"
+                    f"Check for infinite loops or busy-waiting (use `sleep` / async waits).",
+                    {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{dep_id}"}]]})
+            else:
+                stop_deployment(dep_id)
+                send_message(uid,
+                    f"🛑 *Bot #{dep_id} was stopped*\n\n"
+                    f"It held the CPU at ~100% for {ABUSE_STOP_MIN} minutes, which slows down every other bot on the host.\n"
+                    f"Fix the busy loop and restart it.",
+                    {"inline_keyboard": [[{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
+                                         [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}]]})
+                for a in ADMIN_IDS:
+                    try:
+                        send_message(a, f"🛡️ Abuse guard stopped bot #{dep_id} (user `{uid}`): sustained CPU.")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"⚠️ abuse guard action failed: {e}")
+    return actions
+
+
+def abuse_guard_monitor():
+    sleep(150)
+    print(f"✅ Abuse guard started (stop after {ABUSE_STOP_MIN} min ≥ {ABUSE_CPU_PERCENT:.0f}% of a core)")
+    while True:
+        try:
+            abuse_guard_tick()
+        except Exception as e:
+            print(f"⚠️ abuse guard error: {e}")
+        sleep(60)
+
+
 def view_deployment(chat_id, message_id, user_id, dep_id):
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute("SELECT file_name, file_size, plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, is_free, requirements, env_vars, error_log, is_paused, framework FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
+    c.execute("SELECT file_name, file_size, plan, payment_method, cost_coins, cost_stars, start_time, expire_time, status, is_free, requirements, env_vars, error_log, is_paused, framework, proc_pid FROM deployments WHERE deployment_id = ? AND user_id = ?", (dep_id, user_id))
     row = c.fetchone()
     conn.close()
     
     if not row:
         edit_message(chat_id, message_id, "❌ Not found", {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "my_deployments"}]]})
         return
+    _proc_pid = row[15]
+    row = row[:15]
     
     fname, fsize, plan, payment, cost_coins, cost_stars, start_str, expire_str, status, is_free, requirements, env_vars_json, error_log, is_paused, framework = row
     start_time = datetime.fromisoformat(start_str)
@@ -8631,6 +9042,9 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
                 [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
     
     keyboard["inline_keyboard"].append([{"text": "✏️ Edit (env · requirements · code)", "callback_data": f"edit_deploy_{dep_id}"}])
+    keyboard["inline_keyboard"].append([{"text": "💾 Download Backup (zip)", "callback_data": f"backup_deploy_{dep_id}"}])
+    if status == "active":
+        keyboard["inline_keyboard"].append([{"text": "🔄 Refresh stats", "callback_data": f"view_deploy_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "📋 View Install Logs", "callback_data": f"view_install_logs_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "📄 View Runtime Logs", "callback_data": f"view_runtime_logs_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "🗑️ Delete Deployment", "callback_data": f"delete_deploy_{dep_id}"}])
@@ -8659,7 +9073,12 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         f"📦 Requirements:\n`{reqs_text}`\n\n"
         f"🔧 Environment Variables: {len(env_vars)}\n{env_text}{error_text}{free_status_text}"
     )
-    edit_message(chat_id, message_id, text, keyboard)
+    if status == "active" and _proc_pid:
+        try:
+            text += _live_stats_block(dep_id, _proc_pid, None if is_admin(user_id) else get_user_quota_mb(user_id))
+        except Exception as _e:
+            print(f"⚠️ live stats failed: {_e}")
+    edit_message(chat_id, message_id, text[:4096], keyboard)
 
 # ========== HANDLERS ==========
 def build_main_menu_text(user_id, first_name=None) -> str:
@@ -8748,13 +9167,10 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
         try:
             referrer_id = int(start_param[3:])  # "ref7713987088" → 7713987088
             credited = process_referral(referrer_id, user_id)
-            if credited:
-                # Notify referrer
+            if credited and not is_user_verified(user_id):
                 send_message(referrer_id,
-                    f"🎉 *Referral Bonus!*\n\n"
-                    f"Someone joined using your referral link!\n"
-                    f"You earned *{REFERRAL_REWARD_COINS} 🪙* coins.\n\n"
-                    f"Keep sharing to earn more!",
+                    f"👋 *Someone joined with your referral link!*\n\n"
+                    f"You'll earn *{REFERRAL_REWARD_COINS} 🪙* as soon as they verify their account.",
                     {"inline_keyboard": [[{"text": "👥 My Referrals", "callback_data": "my_referral"}]]})
         except Exception as _re:
             print(f"⚠️ Referral processing error: {_re}")
@@ -8768,6 +9184,7 @@ def handle_start(chat_id, user_id, username, first_name, start_param=""):
     get_or_create_referral_code(user_id)   # eagerly create code so it's ready
 
     if is_user_verified(user_id):
+        grant_referral_reward(user_id)     # no channel gate (or already verified) → pay right away
         if not has_accepted_tos(user_id):
             show_tos_prompt(chat_id, user_id)
             return
@@ -8793,22 +9210,34 @@ def handle_balance(chat_id, user_id, message_id=None):
     used_free = get_free_deployment_used_count(user_id)
     free_remaining = FREE_USER_MAX_DEPLOYMENTS - used_free
     
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "main_menu"}]]}
+    keyboard = {"inline_keyboard": [
+        [{"text": "📈 Resource Plans", "callback_data": "resource_tiers"}],
+        [{"text": "🔙 Back", "callback_data": "main_menu"}]]}
+    tier = get_user_tier(user_id)
+    if is_admin(user_id):
+        plan_line = "👑 Admin — whole resource pool"
+    elif tier:
+        t_label = RESOURCE_TIERS.get(tier[0], (0, format_resource(tier[1]), 0))[1]
+        plan_line = f"⭐ *{t_label}* until `{tier[2].strftime('%Y-%m-%d')}`"
+    else:
+        plan_line = f"🆓 Shared pool (`{format_resource(get_user_quota_mb(user_id))}`)"
     premium_badge = "⭐ PREMIUM ⭐" if is_premium else "🆓 FREE"
-    
+    price_lines = "\n".join(
+        f"• {label}: `{stars}⭐`/mo · `{tier_price_stars(key, 'y')}⭐`/yr"
+        for key, (mb, label, stars) in RESOURCE_TIERS.items())
+
     text = (
         f"*💰 YOUR BALANCE*\n\n"
         f"🪙 Coins: `{balances['coins']}`\n"
         f"⭐ Stars: `{balances['stars']}`\n"
         f"🎫 Status: {premium_badge}\n"
+        f"📈 Resource plan: {plan_line}\n"
         f"🆓 Free Slots: `{free_remaining}/{FREE_USER_MAX_DEPLOYMENTS}`\n"
         f"🪙 Earned: `{row[0] if row else 0}`\n"
         f"🪙 Spent: `{row[1] if row else 0}`\n"
         f"⭐ Earned: `{row[2] if row else 0}`\n"
         f"⭐ Spent: `{row[3] if row else 0}`\n\n"
-        f"*Premium Pricing:*\n"
-        f"📅 Monthly: `{PRICE_MONTHLY_STARS}⭐` / `{PRICE_MONTHLY_COINS}🪙`\n"
-        f"🌟 Yearly: `{PRICE_YEARLY_STARS}⭐` / `{PRICE_YEARLY_COINS}🪙`"
+        f"*Resource Plans (include Premium):*\n{price_lines}"
     )
     
     if message_id:
@@ -9598,12 +10027,14 @@ def show_admin_panel(chat_id, message_id):
         "inline_keyboard": [
             [{"text": f"🔒 Security Reviews{sec_badge}", "callback_data": "admin_sec_reviews"},
              {"text": f"🐛 Bug Reports{open_badge}",     "callback_data": "admin_bug_reports"}],
+            [{"text": "📊 Dashboard",                    "callback_data": "admin_dashboard"}],
             [{"text": "👥 Referral Stats",               "callback_data": "admin_referral_stats"},
              {"text": "📢 Broadcast",                    "callback_data": "admin_broadcast"}],
             [{"text": "🎫 Create Redeem Code",           "callback_data": "admin_create_code"}],
             [{"text": "🪙 Add Coins",                    "callback_data": "admin_add_coins"}],
             [{"text": "📋 List Redeem Codes",            "callback_data": "admin_list_codes"}],
-            [{"text": "👥 List Users",                   "callback_data": "admin_list_users"}],
+            [{"text": "👥 List Users",                   "callback_data": "admin_list_users"},
+             {"text": "🚫 Banned Users",                 "callback_data": "admin_banned_list"}],
             [{"text": "📊 View Subscriptions",           "callback_data": "admin_subscriptions"}],
             [{"text": "💾 Database Backup",              "callback_data": "admin_database"}],
             [{"text": "📊 Resource Usage",               "callback_data": "admin_resources"}],
@@ -9734,10 +10165,11 @@ def _user_plan_label(uid, premium, expires, plan):
 
 
 def _user_card(row, number=None):
-    uid, username, first, coins, stars, premium, expires, plan, join_date, last_active = row
+    uid, username, first, coins, stars, premium, expires, plan, join_date, last_active = row[:10]
+    banned = bool(row[10]) if len(row) > 10 else False
     name = safe_md(first or 'Unknown')
     head = f"*{number}.* " if number else ""
-    lines = [f"{head}👤 `{name}`" + (f"  `@{safe_md(username)}`" if username else ""),
+    lines = [f"{head}👤 `{name}`" + (f"  `@{safe_md(username)}`" if username else "") + ("  🚫 *BANNED*" if banned else ""),
              f"🆔 `{uid}`",
              f"💎 {_user_plan_label(uid, premium, expires, plan)}",
              f"🪙 `{coins or 0}`   ⭐ `{stars or 0}`",
@@ -9746,7 +10178,7 @@ def _user_card(row, number=None):
 
 
 _USER_COLS = ("user_id, username, first_name, coins_balance, stars_balance, is_premium, "
-              "premium_expires, premium_plan, join_date, last_active")
+              "premium_expires, premium_plan, join_date, last_active, is_banned")
 
 
 def admin_list_users(chat_id, message_id, page=0):
@@ -9793,10 +10225,136 @@ def admin_user_detail(chat_id, target_id):
                      "FROM deployments WHERE user_id = ?", (target_id,), fetch='one') or (0, 0)
     text = (f"*👤 USER DETAILS*\n━━━━━━━━━━━━━━━━━━━━━━\n{_user_card(row)}\n"
             f"📦 Deployments: `{dep[0] or 0}` (🟢 `{dep[1] or 0}` running)")
+    info = get_ban_info(target_id)
+    if info:
+        text += f"\n🚫 Ban reason: `{safe_md(info['reason'] or 'none given')}`"
+    if is_admin(target_id):
+        ban_row = []
+    elif info:
+        ban_row = [{"text": "✅ Unban user", "callback_data": f"admin_unban_{target_id}"}]
+    else:
+        ban_row = [{"text": "🚫 Ban user", "callback_data": f"admin_ban_{target_id}"}]
     send_message(chat_id, text,
-                 {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": f"admin_user_view_{target_id}"}],
+                 {"inline_keyboard": ([ban_row] if ban_row else []) + [[{"text": "🔄 Refresh", "callback_data": f"admin_user_view_{target_id}"}],
                                       [{"text": "🔍 Search again", "callback_data": "admin_search_user"}],
                                       [{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
+
+
+# ==================== BANNING ====================
+def get_ban_info(user_id):
+    """None if the user isn't banned, else {'reason','at','by'}. Admins can never be banned."""
+    if is_admin(user_id):
+        return None
+    try:
+        row = db_execute("SELECT is_banned, ban_reason, banned_at, banned_by FROM users WHERE user_id = ?",
+                         (int(user_id),), fetch='one')
+        if row and row[0]:
+            return {"reason": row[1], "at": row[2], "by": row[3]}
+    except Exception:
+        pass
+    return None
+
+
+def is_banned(user_id) -> bool:
+    return get_ban_info(user_id) is not None
+
+
+def banned_text(info=None):
+    t = "🚫 *Your account has been banned.*\n\nYou can no longer use this bot."
+    if info and info.get("reason"):
+        t += f"\n\n📝 Reason: `{safe_md(info['reason'])[:300]}`"
+    t += "\n\nIf you think this is a mistake, contact the admin."
+    return t
+
+
+def ban_user(admin_id, target_id, reason=None):
+    """Ban a user: flag the account, STOP every one of their bots, notify them. -> (ok, message)."""
+    target_id = int(target_id)
+    if is_admin(target_id):
+        return False, "⛔ Admins can't be banned."
+    if target_id == int(admin_id):
+        return False, "⛔ You can't ban yourself."
+    if not db_execute("SELECT 1 FROM users WHERE user_id = ?", (target_id,), fetch='one'):
+        return False, f"❌ No user with ID `{target_id}`."
+    reason = (reason or "").strip()[:300] or None
+    db_execute("UPDATE users SET is_banned = 1, ban_reason = ?, banned_at = ?, banned_by = ?, step = NULL, "
+               "pending_json = '{}' WHERE user_id = ?",
+               (reason, datetime.now().isoformat(), int(admin_id), target_id))
+    stopped = 0
+    for (dep_id,) in (db_execute("SELECT deployment_id FROM deployments WHERE user_id = ? "
+                                 "AND status IN ('active','paused')", (target_id,), fetch='all') or []):
+        try:
+            stop_deployment(dep_id)
+            stopped += 1
+        except Exception as e:
+            print(f"⚠️ ban: could not stop dep#{dep_id}: {e}")
+    try:
+        send_message(target_id, banned_text({"reason": reason}))
+    except Exception:
+        pass
+    async_backup(f"ban_{target_id}")
+    return True, f"🚫 User `{target_id}` banned. `{stopped}` bot(s) stopped."
+
+
+def unban_user(admin_id, target_id):
+    target_id = int(target_id)
+    if not get_ban_info(target_id):
+        return False, "ℹ️ That user isn't banned."
+    db_execute("UPDATE users SET is_banned = 0, ban_reason = NULL, banned_at = NULL, banned_by = NULL "
+               "WHERE user_id = ?", (target_id,))
+    try:
+        send_message(target_id, "✅ *Your account has been unbanned.* You can use the bot again.\n\n"
+                                "Your stopped bots were not restarted automatically — start them from *My Deployments*.",
+                     {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]})
+    except Exception:
+        pass
+    async_backup(f"unban_{target_id}")
+    return True, f"✅ User `{target_id}` unbanned."
+
+
+def admin_prompt_ban(chat_id, message_id, admin_id, target_id):
+    if is_admin(target_id):
+        send_message(chat_id, "⛔ Admins can't be banned.")
+        return
+    set_user_step(admin_id, 'awaiting_ban_reason', ban_target=int(target_id))
+    edit_message(chat_id, message_id,
+        f"*🚫 BAN USER* `{target_id}`\n\nSend the *reason* (shown to the user), or ban without one.\n"
+        f"_Their running bots will be stopped immediately._",
+        {"inline_keyboard": [
+            [{"text": "🚫 Ban without reason", "callback_data": f"admin_ban_go_{target_id}"}],
+            [{"text": "❌ Cancel", "callback_data": f"admin_user_view_{target_id}"}]]})
+
+
+def admin_list_banned(chat_id, message_id):
+    rows = db_execute("SELECT user_id, first_name, username, ban_reason, banned_at FROM users "
+                      "WHERE is_banned = 1 ORDER BY banned_at DESC LIMIT 25", fetch='all') or []
+    if not rows:
+        text = "*🚫 BANNED USERS*\n\nNobody is banned."
+        kb = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
+    else:
+        lines, btns = [], []
+        for uid, fn, un, why, at in rows:
+            lines.append(f"• `{safe_md(fn or 'Unknown')}`" + (f" `@{safe_md(un)}`" if un else "") +
+                         f" — `{uid}`\n   📝 {safe_md(why or 'no reason')[:80]}  ·  `{(at or '')[:10]}`")
+            btns.append([{"text": f"✅ Unban {uid}", "callback_data": f"admin_unban_{uid}"}])
+        text = f"*🚫 BANNED USERS* ({len(rows)})\n\n" + "\n".join(lines)
+        kb = {"inline_keyboard": btns + [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
+    edit_message(chat_id, message_id, text, kb)
+
+
+def admin_handle_ban_command(chat_id, admin_id, text):
+    """/ban <user_id> [reason]   and   /unban <user_id>"""
+    parts = text.split(maxsplit=2)
+    cmd = parts[0].lower().split("@")[0]
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        send_message(chat_id, "Usage:\n`/ban <user_id> [reason]`\n`/unban <user_id>`")
+        return
+    tid = int(parts[1])
+    if cmd == "/ban":
+        ok, msg = ban_user(admin_id, tid, parts[2] if len(parts) > 2 else None)
+    else:
+        ok, msg = unban_user(admin_id, tid)
+    send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{tid}"}]]})
 
 
 def admin_handle_user_search(chat_id, admin_id, text):
@@ -10417,13 +10975,14 @@ def _launch_github_deploy(chat_id, user_id, step, main_file_name=None, skip_secu
 
 # ==================== BROADCAST SYSTEM ====================
 
-def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons):
+def _send_broadcast_preview(chat_id, btype, file_id, caption, buttons, audience="all"):
     """Send a live preview of the broadcast to the admin before confirming."""
     if not isinstance(buttons, list):
         buttons = []
+    audience = _broadcast_audience.get(chat_id, audience)
 
     confirm_kb = {"inline_keyboard": (buttons if buttons else []) + [
-        [{"text": "✅ Send to All Users", "callback_data": "broadcast_confirm"}],
+        [{"text": f"✅ Send to: {BROADCAST_AUDIENCES.get(audience, 'Everyone')}", "callback_data": "broadcast_confirm"}],
         [{"text": "✏️ Edit Caption",       "callback_data": "broadcast_edit_caption"}],
         [{"text": "❌ Cancel",              "callback_data": "admin_panel"}],
     ]}
@@ -10484,7 +11043,98 @@ def _tg_send_media(chat_id, media_type, file_id, caption, keyboard=None):
     return None
 
 
-def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
+BROADCAST_AUDIENCES = {
+    "all":      "👥 Everyone",
+    "premium":  "⭐ Premium / plan holders",
+    "free":     "🆓 Free users",
+    "running":  "🟢 Users with a running bot",
+    "expiring": "⏰ Bots expiring within 72h",
+    "recent":   "🕒 Active in the last 7 days",
+}
+_broadcast_audience = {}          # admin_id -> audience key chosen for the broadcast being composed
+
+
+def broadcast_audience_ids(key="all"):
+    """User IDs for an audience. Banned users and admins are never included."""
+    now = datetime.now()
+    nowi = now.isoformat()
+    queries = {
+        "all":      ("SELECT user_id FROM users WHERE user_id IS NOT NULL AND user_id != 0", ()),
+        "premium":  ("SELECT user_id FROM users WHERE (is_premium = 1 AND premium_expires > ?) "
+                     "OR (resource_tier_mb > 0 AND resource_tier_expires > ?)", (nowi, nowi)),
+        "free":     ("SELECT user_id FROM users WHERE user_id != 0 AND NOT ((is_premium = 1 AND premium_expires > ?) "
+                     "OR (resource_tier_mb > 0 AND resource_tier_expires > ?))", (nowi, nowi)),
+        "running":  ("SELECT DISTINCT user_id FROM deployments WHERE status = 'active'", ()),
+        "expiring": ("SELECT DISTINCT user_id FROM deployments WHERE status = 'active' AND expire_time IS NOT NULL "
+                     "AND expire_time > ? AND expire_time <= ?", (nowi, (now + timedelta(hours=72)).isoformat())),
+        "recent":   ("SELECT user_id FROM users WHERE last_active > ?", ((now - timedelta(days=7)).isoformat(),)),
+    }
+    q, params = queries.get(key, queries["all"])
+    ids = [r[0] for r in (db_execute(q, params, fetch='all') or []) if r and r[0]]
+    banned = {r[0] for r in (db_execute("SELECT user_id FROM users WHERE is_banned = 1", fetch='all') or [])}
+    return sorted({int(i) for i in ids if int(i) not in banned and int(i) not in ADMIN_IDS})
+
+
+def show_broadcast_audience_menu(chat_id, message_id):
+    rows = [[{"text": f"{label} ({len(broadcast_audience_ids(k))})", "callback_data": f"broadcast_aud_{k}"}]
+            for k, label in BROADCAST_AUDIENCES.items()]
+    rows.append([{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}])
+    edit_message(chat_id, message_id, "*📢 BROADCAST*\n\nWho should receive it?\n_(banned users are never included)_",
+                 {"inline_keyboard": rows})
+
+
+# ==================== ADMIN DASHBOARD ====================
+def admin_dashboard_text():
+    now = datetime.now()
+    d1, d7, d30 = ((now - timedelta(days=n)).isoformat() for n in (1, 7, 30))
+    q1 = lambda sql, *a: (db_execute(sql, a, fetch='one') or [0])[0] or 0
+    users_total  = q1("SELECT COUNT(*) FROM users")
+    new_24h      = q1("SELECT COUNT(*) FROM users WHERE join_date > ?", d1)
+    new_7d       = q1("SELECT COUNT(*) FROM users WHERE join_date > ?", d7)
+    active_24h   = q1("SELECT COUNT(*) FROM users WHERE last_active > ?", d1)
+    premium_n    = len(broadcast_audience_ids("premium"))
+    banned_n     = q1("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+    bots_active  = q1("SELECT COUNT(*) FROM deployments WHERE status = 'active'")
+    bots_total   = q1("SELECT COUNT(*) FROM deployments")
+    expiring     = q1("SELECT COUNT(*) FROM deployments WHERE status = 'active' AND expire_time IS NOT NULL "
+                      "AND expire_time > ? AND expire_time <= ?", now.isoformat(), (now + timedelta(hours=72)).isoformat())
+    pool_mb      = get_resource_pool_mb()
+    sold_mb, sold_users = tier_sold_mb()
+    sellable     = pool_mb * TIER_POOL_MAX_FRACTION
+    unalloc      = max(0.0, sellable - sold_mb)
+    shared       = max(0.0, pool_mb - sold_mb)
+    sharers      = count_pool_sharers()
+    used_mb = sum(get_process_tree_ram_mb(r[0]) for r in
+                  (db_execute("SELECT proc_pid FROM deployments WHERE status = 'active' AND proc_pid IS NOT NULL",
+                              fetch='all') or []))
+
+    def revenue(since):
+        # real money = Stars paid for plans + Stars paid per deployment; coins are tracked separately
+        sub = db_execute("SELECT COALESCE(SUM(amount_stars),0), COALESCE(SUM(amount_coins),0), COUNT(*) "
+                         "FROM subscriptions WHERE start_date > ?", (since,), fetch='one') or (0, 0, 0)
+        dep = db_execute("SELECT COALESCE(SUM(CASE WHEN payment_method='stars' THEN cost_stars ELSE 0 END),0), "
+                         "COALESCE(SUM(CASE WHEN payment_method='coins' THEN cost_coins ELSE 0 END),0), COUNT(*) "
+                         "FROM deployments WHERE payment_method IN ('stars','coins') AND is_free = 0 AND start_time > ? "
+                         "AND (cost_stars > 0 OR cost_coins > 0)",
+                         (since,), fetch='one') or (0, 0, 0)
+        return int(sub[0]) + int(dep[0]), int(sub[1]) + int(dep[1]), int(sub[2]) + int(dep[2])
+
+    r1, r7, r30 = revenue(d1), revenue(d7), revenue(d30)
+    line = lambda label, r: f"{label}: `{r[0]}⭐` · `{r[1]}🪙` · {r[2]} sale(s)"
+    return (
+        "*📊 DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*👥 Users*\nTotal `{users_total}` · New 24h `{new_24h}` · 7d `{new_7d}`\n"
+        f"Active 24h `{active_24h}` · ⭐ Plan holders `{premium_n}` · 🚫 Banned `{banned_n}`\n\n"
+        f"*🤖 Bots*\nRunning `{bots_active}` of `{bots_total}` · ⏰ Expiring ≤72h `{expiring}`\n\n"
+        f"*🧮 RAM pool*\nTotal `{format_resource(pool_mb)}` · In use now `{format_resource(used_mb)}`\n"
+        f"Sold as plans `{format_resource(sold_mb)}` ({sold_users} user(s)) of `{format_resource(sellable)}` sellable\n"
+        f"Still unallocated `{format_resource(unalloc)}`\n"
+        f"Shared by free users `{format_resource(shared)}` ({sharers} sharer(s))\n\n"
+        f"*💰 Revenue*\n{line('Today', r1)}\n{line('7 days', r7)}\n{line('30 days', r30)}"
+    )
+
+
+def do_broadcast(admin_id, btype, file_id, caption, buttons_json, audience="all"):
     """
     Send a message/photo/video to all users.
     Returns (success_count, fail_count, skipped_count).
@@ -10508,24 +11158,15 @@ def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
         print(f"⚠️ do_broadcast: {btype} broadcast has no file_id — aborting")
         return 0, 0, 0
 
-    # Fetch ALL users (not just verified — we want everyone who ever used the bot)
     try:
-        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        c = conn.cursor()
-        # Get every user that has interacted (has a join_date or last_active)
-        c.execute("""SELECT DISTINCT user_id FROM users
-                     WHERE user_id IS NOT NULL AND user_id != 0
-                     ORDER BY user_id""")
-        all_users = [r[0] for r in c.fetchall()]
-        conn.close()
+        all_users = broadcast_audience_ids(audience)
     except Exception as e:
         print(f"❌ do_broadcast user fetch error: {e}")
         return 0, 0, 0
 
     total    = len(all_users)
     success  = fail = skipped = 0
-    print(f"📢 Starting broadcast to {total} users | type={btype} | file_id={bool(file_id)}")
+    print(f"📢 Starting broadcast to {total} users | audience={audience} | type={btype} | file_id={bool(file_id)}")
 
     for i, uid in enumerate(all_users):
         # Skip the admin who triggered the broadcast
@@ -10585,17 +11226,18 @@ def do_broadcast(admin_id, btype, file_id, caption, buttons_json):
     return success, fail, skipped
 
 
-def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_raw):
+def _run_broadcast_and_notify(chat_id, admin_id, btype, file_id, caption, btns_raw, audience="all"):
     """Thread target: run broadcast and notify the admin with results."""
     try:
-        success, fail, skipped = do_broadcast(admin_id, btype, file_id, caption, btns_raw)
+        success, fail, skipped = do_broadcast(admin_id, btype, file_id, caption, btns_raw, audience)
         total = success + fail
         send_message(chat_id,
             f"✅ *Broadcast Complete*\n\n"
             f"✅ Delivered: `{success}`\n"
             f"❌ Failed:    `{fail}`\n"
             f"⏭ Skipped:   `{skipped}` (blocked/admin)\n"
-            f"📊 Total users: `{total + skipped}`",
+            f"🎯 Audience: {BROADCAST_AUDIENCES.get(audience, audience)}\n"
+            f"📊 Recipients: `{total + skipped}`",
             {"inline_keyboard": [[{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
     except Exception as e:
         print(f"❌ _run_broadcast_and_notify error: {e}")
@@ -10659,6 +11301,10 @@ def handle_callback(callback):
     touch_user(callback.get('from') or {})
     callback_id = callback['id']
     user_id = callback['from']['id']
+    _ban = get_ban_info(user_id)
+    if _ban:
+        answer_callback(callback_id, "🚫 Your account is banned.", True)
+        return
     message = callback.get('message', {})
     chat_id = message.get('chat', {}).get('id')
     message_id = message.get('message_id')
@@ -10736,7 +11382,33 @@ def handle_callback(callback):
 
     if data.startswith("admin_user_view_"):
         if is_admin(user_id):
+            set_user_step(user_id, None)
             admin_user_detail(chat_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data.startswith("admin_ban_go_"):
+        if is_admin(user_id):
+            set_user_step(user_id, None)
+            ok, msg = ban_user(user_id, int(data.rsplit("_", 1)[1]))
+            send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{data.rsplit('_', 1)[1]}"}]]})
+        return
+
+    if data.startswith("admin_ban_"):
+        if is_admin(user_id):
+            admin_prompt_ban(chat_id, message_id, user_id, int(data.rsplit("_", 1)[1]))
+        return
+
+    if data.startswith("admin_unban_"):
+        if is_admin(user_id):
+            tid = int(data.rsplit("_", 1)[1])
+            ok, msg = unban_user(user_id, tid)
+            send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{tid}"}],
+                                                            [{"text": "🚫 Banned list", "callback_data": "admin_banned_list"}]]})
+        return
+
+    if data == "admin_banned_list":
+        if is_admin(user_id):
+            admin_list_banned(chat_id, message_id)
         return
     
     if data == "admin_subscriptions":
@@ -11182,6 +11854,15 @@ def handle_callback(callback):
         view_deployment(chat_id, message_id, user_id, dep_id)
         return
 
+    if data.startswith("backup_deploy_"):
+        try:
+            _bd = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        send_message(chat_id, "💾 Preparing your backup…")
+        send_deployment_backup(chat_id, user_id, _bd)
+        return
+
     # ── Edit deployment (env · requirements · code) ──
     if data.startswith("edit_"):
         try:
@@ -11521,14 +12202,34 @@ def handle_callback(callback):
     # ========== BROADCAST ==========
     if data == "admin_broadcast":
         if not is_admin(user_id): return
+        _broadcast_audience.pop(user_id, None)
+        show_broadcast_audience_menu(chat_id, message_id)
+        return
+
+    if data.startswith("broadcast_aud_"):
+        if not is_admin(user_id): return
+        key = data[len("broadcast_aud_"):]
+        if key not in BROADCAST_AUDIENCES:
+            return
+        _broadcast_audience[user_id] = key
         edit_message(chat_id, message_id,
-            "*📢 BROADCAST TO ALL USERS*\n\nChoose message type:",
+            f"*📢 BROADCAST — {BROADCAST_AUDIENCES[key]}*\n"
+            f"Recipients: `{len(broadcast_audience_ids(key))}`\n\nChoose message type:",
             {"inline_keyboard": [
                 [{"text": "✉️ Text Message",   "callback_data": "broadcast_type_text"}],
                 [{"text": "🖼 Photo + Caption", "callback_data": "broadcast_type_photo"}],
                 [{"text": "🎬 Video + Caption", "callback_data": "broadcast_type_video"}],
+                [{"text": "🎯 Change audience", "callback_data": "admin_broadcast"}],
                 [{"text": "🔙 Admin Panel",     "callback_data": "admin_panel"}],
             ]})
+        return
+
+    if data == "admin_dashboard":
+        if not is_admin(user_id): return
+        edit_message(chat_id, message_id, admin_dashboard_text(),
+                     {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "admin_dashboard"}],
+                                          [{"text": "📊 Host Resources", "callback_data": "admin_resources"}],
+                                          [{"text": "🔙 Admin Panel", "callback_data": "admin_panel"}]]})
         return
 
     if data == "broadcast_type_text":
@@ -11587,11 +12288,12 @@ def handle_callback(callback):
         file_id  = step.get('temp_broadcast_file', '')
         caption  = step.get('temp_broadcast_caption', '')
         btns_raw = step.get('temp_broadcast_buttons', '[]')
+        aud = _broadcast_audience.pop(user_id, 'all')
         set_user_step(user_id, None)
-        send_message(chat_id, "📤 *Sending to all users…*", None)
+        send_message(chat_id, f"📤 *Sending to {BROADCAST_AUDIENCES.get(aud, 'all users')}…*", None)
         threading.Thread(
             target=_run_broadcast_and_notify,
-            args=(chat_id, user_id, btype, file_id, caption, btns_raw),
+            args=(chat_id, user_id, btype, file_id, caption, btns_raw, aud),
             daemon=True, name="Broadcast").start()
         return
 
@@ -12079,6 +12781,14 @@ def handle_message(message):
     chat_id = message['chat']['id']
     user_id = message['from']['id']
     first_name = message['from'].get('first_name', 'User')
+    _ban = get_ban_info(user_id)
+    if _ban:
+        send_message(chat_id, banned_text(_ban))
+        return
+
+    if is_admin(user_id) and message.get('text', '').split(maxsplit=1)[:1] in (['/ban'], ['/unban']):
+        admin_handle_ban_command(chat_id, user_id, message['text'])
+        return
     
     print(f"📨 Message from {first_name} ({user_id})")
     
@@ -12099,6 +12809,15 @@ def handle_message(message):
             return
         if user_step.get('step') == 'edit_reqs' and user_step.get('edit_dep'):
             handle_edit_reqs_text(chat_id, user_id, text, int(user_step['edit_dep']))
+            return
+
+        # ── Admin: ban reason ────────────────────────────────────────
+        if user_step.get('step') == 'awaiting_ban_reason':
+            tgt = user_step.get('ban_target')
+            set_user_step(user_id, None)
+            if is_admin(user_id) and tgt:
+                ok, msg = ban_user(user_id, int(tgt), text)
+                send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{tgt}"}]]})
             return
 
         # ── Admin: search a user ─────────────────────────────────────
@@ -12803,7 +13522,9 @@ def handle_pre_checkout_query(pre_checkout_query):
         url = f"{TELEGRAM_API}/answerPreCheckoutQuery"
         data = {"pre_checkout_query_id": query_id, "ok": True}
         _pl = str(pre_checkout_query.get('invoice_payload', ''))
-        if _pl.startswith("tier_"):
+        if is_banned(pre_checkout_query['from']['id']):
+            data = {"pre_checkout_query_id": query_id, "ok": False, "error_message": "Your account is banned."}
+        elif _pl.startswith("tier_"):
             try:
                 _why = _tier_blocked_reason(int(pre_checkout_query['from']['id']), _pl.split("_")[1])
             except Exception:
@@ -12931,6 +13652,12 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
      crash_count, last_crash_str) = row
     crash_count = crash_count or 0
 
+    if get_ban_info(owner_id):
+        c.execute("UPDATE deployments SET status='stopped', proc_pid=NULL WHERE deployment_id=?", (deployment_id,))
+        conn.commit()
+        conn.close()
+        return "banned"
+
     # Never resurrect a deployment whose time is genuinely up.
     if expire_time_str:
         try:
@@ -13000,6 +13727,21 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
     # Make sure the dependencies are actually there (cheap no-op when they are).
     _install_deps_for_folder(deploy_folder, dest_script, lambda m: None, only_if_missing=True)
 
+    # The previous run may have died on a package that isn't in any manifest (an import the
+    # author never listed). Read its log and install exactly that package BEFORE relaunching.
+    auto_installed = []
+    crash_tail = _log_tail_text(deploy_folder, 15) if reason in ("crash", "watchdog") else ""   # before the launch overwrites it
+    if reason in ("crash", "watchdog"):
+        auto_installed = _install_missing_from_log(deploy_folder, dest_script)
+        # Exponential backoff between crash restarts: 5s, 10s, 20s, 40s, then 60s.
+        if crash_count > 0 and last_crash_str:
+            try:
+                wait = min(60, 5 * 2 ** (crash_count - 1)) - (now - datetime.fromisoformat(last_crash_str)).total_seconds()
+                if wait > 0:
+                    sleep(min(wait, 60))
+            except Exception:
+                pass
+
     # Branch on file type exactly like the original deploy path does — a
     # Node.js deployment must NOT be regenerated through the Python launcher,
     # or its start.sh gets silently overwritten with a script that tries to
@@ -13025,8 +13767,10 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
 
     is_running, new_pid = _launch_and_check(start_script, deploy_folder)
     if not is_running and _log_shows_missing_dependency(deploy_folder):
-        # Died on an import/require error — reinstall everything from the manifests and try once more.
-        print(f"📦 dep#{deployment_id}: launch failed on a missing dependency — reinstalling and retrying once")
+        # Died on an import/require error — install the exact missing package(s), reinstall the
+        # manifests, and try once more.
+        print(f"📦 dep#{deployment_id}: launch failed on a missing dependency — fixing and retrying once")
+        auto_installed += _install_missing_from_log(deploy_folder, dest_script)
         _install_deps_for_folder(deploy_folder, dest_script, lambda m: None)
         is_running, new_pid = _launch_and_check(start_script, deploy_folder)
 
@@ -13042,10 +13786,13 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
             active_deployments[deployment_id] = new_pid
         print(f"🔄 Auto-restarted deployment {deployment_id} ({reason})")
         try:
+            _inst = (f"\n📦 Installed missing package(s): `{', '.join(dict.fromkeys(auto_installed))[:200]}`"
+                     if auto_installed else "")
             send_message(owner_id,
                 f"🔄 *Bot #{deployment_id} auto-restarted*\n\n"
-                f"It stopped unexpectedly and has been brought back online automatically.\n"
-                f"Your database and settings are untouched.",
+                f"It stopped unexpectedly and has been brought back online automatically.{_inst}\n"
+                f"Your database and settings are untouched."
+                + (f"\n\n*Why it crashed (last log lines):*\n```\n{crash_tail}\n```" if crash_tail else ""),
                 {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]})
         except Exception:
             pass
@@ -13398,6 +14145,8 @@ def main():
     threading.Thread(target=_self_ping_thread,          daemon=True, name="KeepAlive").start()
     threading.Thread(target=_hosted_bot_watchdog,       daemon=True, name="BotWatchdog").start()
     threading.Thread(target=quota_monitor,              daemon=True, name="QuotaMonitor").start()
+    threading.Thread(target=expiry_reminder_monitor,    daemon=True, name="ExpiryReminders").start()
+    threading.Thread(target=abuse_guard_monitor,        daemon=True, name="AbuseGuard").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
