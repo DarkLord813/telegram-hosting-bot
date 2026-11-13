@@ -822,9 +822,11 @@ class SecurityScanner:
         if lang == 'python':
             c, w = self._scan_python(data, text, path)
             critical.extend(c); warnings.extend(w)
+            critical.extend(self._scan_data_access(text, path, 'python'))
         elif lang in ('javascript', 'typescript'):
             c, w = self._scan_js(text, path)
             critical.extend(c); warnings.extend(w)
+            critical.extend(self._scan_data_access(text, path, 'js'))
         elif filename.lower() == 'package.json':
             c, w = self._scan_package_json(text)
             critical.extend(c); warnings.extend(w)
@@ -838,6 +840,125 @@ class SecurityScanner:
             warnings.append(f"Sensitive credential file: `{path}`")
 
         return critical, warnings
+
+    # ── Data-theft scanner: code that goes after OTHER users' data / the host's database ────────
+    # Every finding is prefixed "[DATA-THEFT]" — such files are REJECTED outright (no admin review).
+    _ABS_SENSITIVE = (r'(?:/proc/|/etc/(?:passwd|shadow|sudoers|hosts\.allow)|/root\b|/home\b|/opt\b|/app\b|'
+                      r'/srv\b|/mnt\b|/data\b|/var\b|/usr/src\b|~/\.ssh|\.aws/credentials|\.git-credentials)')
+    _THEFT_COMMON = [
+        # another process' environment / command line / memory (leaks other users' secrets)
+        (r'/proc/(?:self|\d+|\*|\{[^}]*\}|["\'`]\s*\+|%[sd])[^\n]{0,30}(?:environ|cmdline|maps|mem|fd\b|cwd|root)',
+         "reads another process' environment/memory (/proc)"),
+        (r'/proc/[^\s"\'`)]*/(?:environ|cmdline|mem|maps)', "reads another process' environment/memory (/proc)"),
+        (r'/etc/(?:passwd|shadow|sudoers)', "reads system account files"),
+        (r'(?:~|/root|/home/[^/\s"\']+)/\.(?:ssh|aws|git-credentials|netrc|docker|kube)', "reads credential directories"),
+        # shell commands that read outside the bot's own folder
+        (r'\b(?:cat|ls|find|tar|cp|zip|sqlite3|strings|grep|rsync|scp|curl\s+-F|base64)\s+(?:-[\w-]+\s+)*["\']?'
+         r'(?:\.\./|/proc/|/etc/(?:passwd|shadow)|/root|/home|/data|/opt/|/app/|/var/|/mnt/|~/)',
+         "shell command reading outside the bot's own folder"),
+    ]
+    _THEFT_COMMON += [
+        # other deployed bots' runtime files, reached by an absolute / ../ path
+        (r'["\'`](?:/|\.\./)[^"\'`\n]*(?:\.env\b|pid\.txt|output\.log|start\.sh|/run\.py|\.home/|\.tmp/|pending_review_)',
+         "reads another deployed bot's files (.env / logs / launcher)"),
+        # probing other bots' web ports on this machine (the platform hands out ports from 20000 up)
+        (r'(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])\s*:\s*(?:2\d{4}|[3-6]\d{4})\b',
+         "connects to another deployed bot's local port"),
+        (r'\bconnect_ex\s*\(|\b(?:nmap|masscan)\b', "port-scans this machine"),
+        (r'\bpsutil\.(?:pids|net_connections|wait_procs|pid_exists)\b|\bpsutil\.Process\s*\(\s*\d+',
+         "inspects other deployed bots' processes"),
+    ]
+    _THEFT_PY = [
+        # walking up/out of the bot's own folder
+        (r'\b(?:open|listdir|scandir|walk|glob|iglob|rglob|iterdir|read_text|read_bytes|copy2?|copytree|move|'
+         r'chdir|connect|send_file|FileInput)\s*\([^)\n]{0,200}["\'](?:\.\./|\.\.[\\/])',
+         "path traversal out of the bot's own folder (..)"),
+        (r'\bos\.chdir\s*\(\s*["\']\.\.', "changes directory out of the bot's own folder"),
+        (r'\bos\.path\.join\s*\([^\n]{0,160}["\']\.\.["\']', "path traversal out of the bot's own folder (..)"),
+        (r'\bPath\s*\([^\n]{0,160}["\']\.\.["\']', "path traversal out of the bot's own folder (..)"),
+        (r'(?:getcwd\(\)|Path\.cwd\(\)|os\.getcwd\(\))\s*\)?\s*\.?(?:parent|parents)\b[^\n]{0,60}'
+         r'(?:listdir|scandir|walk|glob|iterdir|open|connect)', "walks up from its own folder"),
+        # listing / globbing absolute locations (other users' folders, temp files, the host's data)
+        (r'\b(?:listdir|scandir|walk|glob|iglob|rglob|iterdir)\s*\(\s*(?:Path\s*\(\s*)?["\'](?:/|~)[^"\']*["\']',
+         "lists/searches absolute locations outside the bot's own folder"),
+        # reading sensitive absolute locations
+        (r'\b(?:open|read_text|read_bytes|connect|copy2?|copytree|send_file)\s*\(\s*(?:Path\s*\(\s*)?["\']'
+         + _ABS_SENSITIVE, "reads files outside the bot's own folder"),
+        # inspecting other processes
+        (r'\bpsutil\.process_iter\b', "inspects other users' processes"),
+        (r'\.environ\s*\(\s*\)', "reads another process' environment"),
+        (r'\bpsutil\.Process\s*\([^)]*\)\s*\.(?:cmdline|environ|cwd|open_files|connections)', "inspects other users' processes"),
+        # climbing 4+ levels above the script = out of the deployment into the host's folders
+        (r'(?:\.parent\s*){4,}|\.parents\s*\[\s*[3-9]\s*\]|dirname\s*\(\s*(?:os\.path\.)?dirname\s*\(\s*'
+         r'(?:os\.path\.)?dirname\s*\(\s*(?:os\.path\.)?dirname\s*\(', "climbs out of its own folder into the host's folders"),
+        (r'(?:\.parent\s*){3}[^\n]{0,40}(?:listdir|iterdir|glob|rglob|walk|open|read_text|read_bytes|scandir)',
+         "climbs out of its own folder into the host's folders"),
+        (r'os\.kill(?:pg)?\s*\(\s*(?:\d+|int\s*\()', "signals another process by number"),
+    ]
+    _THEFT_JS = [
+        (r'\b(?:readFile|readFileSync|readdir|readdirSync|opendir|opendirSync|createReadStream|copyFile|copyFileSync|'
+         r'cp|cpSync|rename|renameSync)\s*\(\s*[^)\n]{0,80}["\'`](?:\.\./|\.\.[\\/])',
+         "path traversal out of the bot's own folder (..)"),
+        (r'\bprocess\.chdir\s*\(\s*["\'`]\.\.', "changes directory out of the bot's own folder"),
+        (r'\.(?:join|resolve)\s*\([^\n]{0,160}["\'`]\.\.["\'`]', "path traversal out of the bot's own folder (..)"),
+        (r'\b(?:readdir|readdirSync|opendir|opendirSync|glob|globSync)\s*\(\s*["\'`](?:/|~)[^"\'`]*["\'`]',
+         "lists/searches absolute locations outside the bot's own folder"),
+        (r'\b(?:readFile|readFileSync|createReadStream|copyFile|copyFileSync)\s*\(\s*["\'`]' + _ABS_SENSITIVE,
+         "reads files outside the bot's own folder"),
+    ]
+
+    def _host_names(self):
+        """Names that only exist on the host: its database file, data directory, deployments root."""
+        names = set()
+        try:
+            for n in (DATABASE_FILE.name, BASE_DIR.name, DEPLOYMENTS_DIR.name, USER_FILES_DIR.name, "hosting_bot"):
+                if n and len(n) >= 6:
+                    names.add(n)
+        except Exception:
+            names.add("hosting_bot")
+        return names
+
+    _VENDOR_DIRS = ("node_modules", "site-packages", "dist-packages", "packages", "venv", ".venv",
+                    "vendor", "__pycache__", ".git", ".home", ".tmp", "bower_components")
+
+    def _scan_data_access(self, text: str, path: str, lang: str) -> list:
+        """Looks ONLY at what the bot's own code does to reach other deployed bots' data. Which packages
+        it imports / lists as dependencies is never a reason to reject, and bundled third-party
+        folders (node_modules, site-packages, vendor …) are not examined at all."""
+        if not text:
+            return []
+        parts = re.split(r'[\\/]', str(path).lower())
+        if any(d in parts[:-1] for d in self._VENDOR_DIRS):
+            return []
+        # drop comments so a "../" in a comment isn't flagged
+        if lang == 'python':
+            body = re.sub(r'(?m)^\s*#.*$', '', text)
+            rules = self._THEFT_COMMON + self._THEFT_PY
+        else:
+            body = re.sub(r'(?m)^\s*//.*$', '', text)
+            body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+            rules = self._THEFT_COMMON + self._THEFT_JS
+        found = []
+        for pat, why in rules:
+            try:
+                if re.search(pat, body, re.IGNORECASE | re.DOTALL):
+                    msg = f"[DATA-THEFT] {why} in `{path}`"
+                    if msg not in found:
+                        found.append(msg)
+            except re.error:
+                continue
+        # shell tools that list / control other processes or inspect the machine
+        tool_re = re.compile(r'["\'`]\s*(?:sudo\s+)?(?:ps|pgrep|pkill|killall|lsof|netstat|ss|fuser|pidof|nsenter|strace|ltrace|gdb|'
+                             r'nmap|masscan|docker|kubectl|top|htop)(?:\s[^"\'`\n]*)?["\'`]')
+        exec_re = re.compile(r'(?:system|popen|subprocess|Popen|check_output|check_call|\.run|\bexec|execSync|spawn|spawnSync|shell)\b')
+        for line in body.splitlines():
+            if exec_re.search(line) and tool_re.search(line):
+                found.append(f"[DATA-THEFT] runs a command that lists/controls other deployed bots' processes in `{path}`")
+                break
+        for name in self._host_names():
+            if re.search(r'["\'`][^"\'`\n]*' + re.escape(name) + r'[^"\'`\n]*["\'`]', body):
+                found.append(f"[DATA-THEFT] references the host's database / data folder (`{name}`) in `{path}`")
+        return found
 
     # ── Python scanner (Layer 1 + 2) ─────────────────────────────────
     def _scan_python(self, data: bytes, text: str, path: str) -> tuple[list, list]:
@@ -1096,6 +1217,73 @@ def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, lis
         lines.append("✅ No issues found — file is clean")
 
     return blocked, critical, warnings, '\n'.join(lines)
+
+
+def data_theft_findings(critical) -> list:
+    """The subset of scanner findings that mean 'trying to reach other users' data / the host's database'."""
+    return [c for c in (critical or []) if str(c).startswith("[DATA-THEFT]")]
+
+
+def scan_repo_data_theft(folder, skip=None, max_files=400) -> list:
+    """Scan EVERY .py/.js/.ts file of a cloned repo (not just the entry point) for data-theft code."""
+    out = []
+    folder = Path(folder)
+    skip_dirs = {"packages", "node_modules", "venv", ".venv", "__pycache__", ".git", ".home", ".tmp", "site-packages"}
+    n = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in SecurityScanner.SUPPORTED_BOT_EXTS:
+                continue
+            fp = Path(root) / fn
+            if skip and fp == skip:
+                continue
+            n += 1
+            if n > max_files:
+                return out
+            try:
+                lang = 'python' if ext == '.py' else 'js'
+                text = fp.read_bytes()[:2_000_000].decode('utf-8', errors='ignore')
+                out.extend(SECURITY_SCANNER._scan_data_access(text, str(fp.relative_to(folder)), lang))
+            except Exception:
+                continue
+    return out
+
+
+def reject_data_theft(chat_id, user_id, file_name, findings, message_id=None):
+    """Hard reject: no admin review queue. Tell the user, log the incident, alert admins (with a Ban button)."""
+    try:
+        db_execute("""CREATE TABLE IF NOT EXISTS security_incidents (
+            incident_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_name TEXT,
+            findings_json TEXT, created_at TEXT)""")
+        db_execute("INSERT INTO security_incidents (user_id, file_name, findings_json, created_at) VALUES (?,?,?,?)",
+                   (user_id, str(file_name)[:200], json.dumps(findings[:20]), datetime.now().isoformat()))
+        strikes = (db_execute("SELECT COUNT(*) FROM security_incidents WHERE user_id = ?", (user_id,), fetch='one') or [1])[0]
+    except Exception:
+        strikes = 1
+    text = (f"🚫 *File rejected*\n\n`{safe_md(file_name)}` tries to access data that isn't yours "
+            f"(other users' files, the host's database or system secrets), so it was *automatically rejected*.\n\n"
+            + "\n".join(f"• `{safe_md(f)[:160]}`" for f in findings[:6]) +
+            "\n\nBots may only use their own folder. Remove that code and upload again. "
+            "Repeated attempts can lead to a ban.")
+    kb = {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "main_menu"}]]}
+    try:
+        if message_id:
+            edit_message(chat_id, message_id, text, kb)
+        else:
+            send_message(chat_id, text, kb)
+    except Exception:
+        pass
+    for a in ADMIN_IDS:
+        try:
+            send_message(a,
+                f"🛡️ *Data-theft attempt blocked*\n\n👤 User `{user_id}` · strike *{strikes}*\n📁 `{safe_md(file_name)}`\n\n"
+                + "\n".join(f"• `{safe_md(f)[:140]}`" for f in findings[:5]),
+                {"inline_keyboard": [[{"text": "🚫 Ban user", "callback_data": f"admin_ban_{user_id}"},
+                                      {"text": "👤 User", "callback_data": f"admin_user_view_{user_id}"}]]})
+        except Exception:
+            pass
 
 
 # ==================== GITHUB BACKUP SYSTEM ====================
@@ -7141,6 +7329,17 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
           try:
             scan_bytes = dest_script.read_bytes()
             blocked, crit, scan_w, scan_report = run_security_scan(scan_bytes, dest_script.name)
+            # the WHOLE repo is checked for data-theft code, not just the entry point
+            _more = scan_repo_data_theft(deploy_folder, skip=dest_script)
+            if _more:
+                crit = list(crit) + _more
+                blocked = True
+            _theft = data_theft_findings(crit)
+            if _theft:
+                update_logs("🚫 REJECTED: code tries to access other users' data / the host database")
+                shutil.rmtree(deploy_folder, ignore_errors=True)
+                reject_data_theft(chat_id, user_id, f"{owner}/{repo}", _theft)
+                return False
             if blocked:
                 update_logs(f"🚫 SECURITY BLOCK: {len(crit)} critical issue(s)")
                 for c in crit[:5]:
@@ -8618,6 +8817,11 @@ def handle_edit_code_document(chat_id, user_id, doc, file_name, dep_id):
         return
     send_message(chat_id, "🔒 *Running 6-layer security scan…*")
     blocked, critical, warnings, report = run_security_scan(raw, file_name)
+    _theft = data_theft_findings(critical)
+    if _theft:
+        set_user_step(user_id, None)
+        reject_data_theft(chat_id, user_id, file_name, _theft)
+        return
     if blocked:
         set_user_step(user_id, None)
         send_message(chat_id,
@@ -10325,12 +10529,20 @@ def admin_prompt_ban(chat_id, message_id, admin_id, target_id):
             [{"text": "❌ Cancel", "callback_data": f"admin_user_view_{target_id}"}]]})
 
 
+def admin_prompt_ban_by_id(chat_id, message_id, admin_id):
+    set_user_step(admin_id, 'awaiting_ban_id')
+    edit_message(chat_id, message_id,
+        "*🚫 BAN A USER*\n\nSend the user's *numeric ID*.",
+        {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "admin_banned_list"}]]})
+
+
 def admin_list_banned(chat_id, message_id):
     rows = db_execute("SELECT user_id, first_name, username, ban_reason, banned_at FROM users "
                       "WHERE is_banned = 1 ORDER BY banned_at DESC LIMIT 25", fetch='all') or []
     if not rows:
         text = "*🚫 BANNED USERS*\n\nNobody is banned."
-        kb = {"inline_keyboard": [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
+        kb = {"inline_keyboard": [[{"text": "➕ Ban a user by ID", "callback_data": "admin_ban_by_id"}],
+                                  [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
     else:
         lines, btns = [], []
         for uid, fn, un, why, at in rows:
@@ -10338,23 +10550,9 @@ def admin_list_banned(chat_id, message_id):
                          f" — `{uid}`\n   📝 {safe_md(why or 'no reason')[:80]}  ·  `{(at or '')[:10]}`")
             btns.append([{"text": f"✅ Unban {uid}", "callback_data": f"admin_unban_{uid}"}])
         text = f"*🚫 BANNED USERS* ({len(rows)})\n\n" + "\n".join(lines)
-        kb = {"inline_keyboard": btns + [[{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
+        kb = {"inline_keyboard": btns + [[{"text": "➕ Ban a user by ID", "callback_data": "admin_ban_by_id"}],
+                                         [{"text": "🔙 Back to Admin", "callback_data": "admin_panel"}]]}
     edit_message(chat_id, message_id, text, kb)
-
-
-def admin_handle_ban_command(chat_id, admin_id, text):
-    """/ban <user_id> [reason]   and   /unban <user_id>"""
-    parts = text.split(maxsplit=2)
-    cmd = parts[0].lower().split("@")[0]
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        send_message(chat_id, "Usage:\n`/ban <user_id> [reason]`\n`/unban <user_id>`")
-        return
-    tid = int(parts[1])
-    if cmd == "/ban":
-        ok, msg = ban_user(admin_id, tid, parts[2] if len(parts) > 2 else None)
-    else:
-        ok, msg = unban_user(admin_id, tid)
-    send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{tid}"}]]})
 
 
 def admin_handle_user_search(chat_id, admin_id, text):
@@ -11393,7 +11591,7 @@ def handle_callback(callback):
             send_message(chat_id, msg, {"inline_keyboard": [[{"text": "👤 User", "callback_data": f"admin_user_view_{data.rsplit('_', 1)[1]}"}]]})
         return
 
-    if data.startswith("admin_ban_"):
+    if data.startswith("admin_ban_") and data.rsplit("_", 1)[1].lstrip("-").isdigit():
         if is_admin(user_id):
             admin_prompt_ban(chat_id, message_id, user_id, int(data.rsplit("_", 1)[1]))
         return
@@ -11408,7 +11606,13 @@ def handle_callback(callback):
 
     if data == "admin_banned_list":
         if is_admin(user_id):
+            set_user_step(user_id, None)
             admin_list_banned(chat_id, message_id)
+        return
+
+    if data == "admin_ban_by_id":
+        if is_admin(user_id):
+            admin_prompt_ban_by_id(chat_id, message_id, user_id)
         return
     
     if data == "admin_subscriptions":
@@ -12786,9 +12990,6 @@ def handle_message(message):
         send_message(chat_id, banned_text(_ban))
         return
 
-    if is_admin(user_id) and message.get('text', '').split(maxsplit=1)[:1] in (['/ban'], ['/unban']):
-        admin_handle_ban_command(chat_id, user_id, message['text'])
-        return
     
     print(f"📨 Message from {first_name} ({user_id})")
     
@@ -12809,6 +13010,19 @@ def handle_message(message):
             return
         if user_step.get('step') == 'edit_reqs' and user_step.get('edit_dep'):
             handle_edit_reqs_text(chat_id, user_id, text, int(user_step['edit_dep']))
+            return
+
+        # ── Admin: ban by user ID (button flow) ──────────────────────
+        if user_step.get('step') == 'awaiting_ban_id':
+            set_user_step(user_id, None)
+            if is_admin(user_id):
+                q = text.strip()
+                if q.lstrip('-').isdigit() and db_execute("SELECT 1 FROM users WHERE user_id = ?", (int(q),), fetch='one'):
+                    admin_prompt_ban(chat_id, None, user_id, int(q))
+                else:
+                    send_message(chat_id, "❌ No user with that ID.",
+                                 {"inline_keyboard": [[{"text": "➕ Try again", "callback_data": "admin_ban_by_id"}],
+                                                      [{"text": "🚫 Banned list", "callback_data": "admin_banned_list"}]]})
             return
 
         # ── Admin: ban reason ────────────────────────────────────────
@@ -12887,7 +13101,7 @@ def handle_message(message):
             return
 
         # ── Admin replying to a bug report ───────────────────────────
-        if is_admin(user_id) and user_step.get('step', '').startswith('awaiting_bug_reply_'):
+        if is_admin(user_id) and (user_step.get('step') or '').startswith('awaiting_bug_reply_'):
             report_id = int(user_step['step'].split('_')[-1])
             if text.strip():
                 ok, result = reply_to_bug_report(report_id, user_id, text.strip())
@@ -13284,6 +13498,12 @@ def handle_message(message):
             # ── Security scan ─────────────────────────────────────────
             blocked, critical, scan_warnings, report = run_security_scan(
                 file_bytes_content, file_name)
+
+            _theft = data_theft_findings(critical)
+            if _theft:
+                set_user_step(user_id, None)
+                reject_data_theft(chat_id, user_id, file_name, _theft, scan_msg_id)
+                return
 
             if blocked:
                 # Save blocked file to disk so admin can approve and deploy it later
