@@ -3881,6 +3881,7 @@ def resume_paused_deployments(user_id):
                 deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(folder_name_val)
             else:
                 deploy_folder = DEPLOYMENTS_DIR / str(user_id) / str(dep_id)
+            file_name = _sane_entry(deploy_folder, file_name, dep_id)
             dest_script = deploy_folder / file_name
             
             if dest_script.exists():
@@ -4051,7 +4052,7 @@ def answer_callback(callback_id, text=None, show_alert=False):
     url = f"{TELEGRAM_API}/answerCallbackQuery"
     data = {"callback_query_id": callback_id}
     if text:
-        data["text"] = text
+        data["text"] = localize(getattr(_fp_ctx, "uid", None), text, None)[0][:200]
     if show_alert:
         data["show_alert"] = True
     try:
@@ -4067,6 +4068,8 @@ def send_document(chat_id, file_path, caption=None, filename=None):
     encoding — no extra dependencies (mirrors send_message's style).
     """
     file_path = Path(file_path)
+    if caption:
+        caption = localize(chat_id, caption, None)[0]
     if not file_path.exists():
         print(f"❌ send_document: file not found: {file_path}")
         return None
@@ -6613,7 +6616,8 @@ print(f"Dir: {{os.getcwd()}}")
 sys.stdout.flush()
 
 # Skip noisy cloud/system env vars — only show what the user actually set
-_SKIP_PREFIXES = ('KUBERNETES_', 'RENDER_', 'UV_', 'PIPENV_', 'NPM_', 'NODE_',
+_SKIP_PREFIXES = ('KUBERNETES_', 'RENDER_', 'UV_', 'PIPENV_', 'NPM_', 'NODE_', 'HB_', 'MALLOC_', 'OMP_',
+                   'OPENBLAS_', 'MKL_', 'NUMEXPR_', 'VECLIB_', 'TOKENIZERS_', 'PYTHONDONTWRITE', 'PYTHONOPTIMIZE',
                    'BUN_', 'GUNICORN_', 'YARN_', 'DEFAULT_', 'PYTHON_')
 _SKIP_EXACT = frozenset([
     'PATH', 'PYTHONPATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM',
@@ -7315,10 +7319,46 @@ def _find_node_main(folder: Path):
     return None
 
 
+# Folders that hold installed libraries / tooling — never a bot's own entry point.
+_JUNK_DIRS = {'packages', 'site-packages', 'dist-packages', '.home', '.local', '.cache', 'venv', '.venv', 'env',
+              'node_modules', '__pycache__', '.git', '.github', 'tests', 'test', 'docs', 'build', 'dist',
+              '.tmp', 'tmp', 'lib', 'lib64', 'bin', 'include'}
+
+
+def _in_junk_dir(folder: Path, p: Path) -> bool:
+    try:
+        parts = p.relative_to(folder).parts[:-1]
+    except ValueError:
+        parts = p.parts[:-1]
+    return any(x in _JUNK_DIRS or x.endswith(('.dist-info', '.egg-info')) for x in parts)
+
+
+def _sane_entry(deploy_folder: Path, file_name: str, deployment_id=None) -> str:
+    """A saved entry point that lives inside packages/ (an old bug picked e.g. packages/anyio/to_process.py) is
+    replaced by a real one found in the bot's own files; the fix is saved so it sticks."""
+    try:
+        deploy_folder = Path(deploy_folder)
+        if not file_name or not _in_junk_dir(deploy_folder, deploy_folder / file_name):
+            return file_name
+        cands = find_main_file(deploy_folder)
+        new = cands[0] if cands else _find_node_main(deploy_folder)
+        if not new:
+            return file_name
+        rel = str(Path(new).relative_to(deploy_folder))
+        print(f"🔧 dep#{deployment_id}: entry point {file_name!r} was inside a library folder → using {rel!r}")
+        if deployment_id:
+            db_execute("UPDATE deployments SET file_name = ? WHERE deployment_id = ?", (rel, deployment_id))
+        return rel
+    except Exception as e:
+        print(f"⚠️ _sane_entry: {e}")
+        return file_name
+
+
 def find_main_file(folder: Path) -> list[Path]:
     """
     Return a ranked list of Python file candidates for the bot entry point.
-    Priority: known names → files with if __name__ == '__main__' → other .py
+    Priority: known names → files with if __name__ == '__main__' (shallowest first) → other top-level .py.
+    Library folders (packages/, venvs, node_modules …) are never searched.
     """
     found = []
 
@@ -7329,8 +7369,8 @@ def find_main_file(folder: Path) -> list[Path]:
             found.append(p)
 
     # 2. Any .py file with an if __name__ == '__main__' block
-    for p in sorted(folder.rglob('*.py')):
-        if p in found:
+    for p in sorted(folder.rglob('*.py'), key=lambda q: (len(q.relative_to(folder).parts), str(q))):
+        if p in found or _in_junk_dir(folder, p):
             continue
         try:
             txt = p.read_text(errors='ignore')
@@ -8269,6 +8309,7 @@ def restart_deployment(deployment_id, user_id, chat_id, force_free_downgrade=Fal
             c = conn.cursor()
 
         deploy_folder = get_deploy_folder(owner_id, deployment_id)
+        file_name     = _sane_entry(deploy_folder, file_name, deployment_id)
         dest_script   = deploy_folder / file_name
 
         # Files gone (disk wiped)? Bring them back from the GitHub files repo first.
@@ -11436,7 +11477,8 @@ def admin_dashboard_text():
         "*📊 DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"*👥 Users*\nTotal `{users_total}` · New 24h `{new_24h}` · 7d `{new_7d}`\n"
         f"Active 24h `{active_24h}` · ⭐ Plan holders `{premium_n}` · 🚫 Banned `{banned_n}`\n"
-        f"🛠 Maintenance: `{'ON' if maintenance_on() else 'off'}` · 🛡 Isolation: `{isolation_status()}`\n\n"
+        f"🛠 Maintenance: `{'ON' if maintenance_on() else 'off'}` · 🛡 Isolation: `{isolation_status()}`\n"
+        f"🌐 Translation: `{translation_status()}`\n\n"
         f"*🤖 Bots*\nRunning `{bots_active}` of `{bots_total}` · ⏰ Expiring ≤72h `{expiring}`\n\n"
         f"*🧮 RAM pool*\nTotal `{format_resource(pool_mb)}` · In use now `{format_resource(used_mb)}`\n"
         f"Sold as plans `{format_resource(sold_mb)}` ({sold_users} user(s)) of `{format_resource(sellable)}` sellable\n"
@@ -11618,6 +11660,8 @@ def touch_user(tg_user):
 
 def handle_callback(callback):
     touch_user(callback.get('from') or {})
+    _fp_ctx.uid = (callback.get('from') or {}).get('id')
+    _fp_ctx.shared = False
     callback = _fp_share_remap(callback)
     if _fp_pre_callback(callback):
         return
@@ -14040,6 +14084,7 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
             return "cap_exceeded"
 
     deploy_folder = get_deploy_folder(owner_id, deployment_id)
+    file_name     = _sane_entry(deploy_folder, file_name, deployment_id)
     dest_script   = deploy_folder / file_name
     restored_env  = None
 
@@ -14187,10 +14232,12 @@ def _fp_init_tables(c):
         "max_uses INTEGER DEFAULT 0, used INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, created_by INTEGER)",
         "CREATE TABLE IF NOT EXISTS promo_redemptions (code TEXT, user_id INTEGER, ts TEXT, PRIMARY KEY (code, user_id))",
         "CREATE TABLE IF NOT EXISTS user_discounts (user_id INTEGER PRIMARY KEY, percent INTEGER, code TEXT)",
+        "CREATE TABLE IF NOT EXISTS tr_cache (lang TEXT, src TEXT, out TEXT, PRIMARY KEY (lang, src))",
     ):
         c.execute(ddl)
     for _ddl in ("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'en'",
-                 "ALTER TABLE dep_settings ADD COLUMN hang_off INTEGER DEFAULT 0"):
+                 "ALTER TABLE dep_settings ADD COLUMN hang_off INTEGER DEFAULT 0",
+                 "ALTER TABLE dep_settings ADD COLUMN compress INTEGER DEFAULT 0"):
         try:
             c.execute(_ddl)
         except Exception:
@@ -14247,8 +14294,9 @@ def _fp_settings(dep_id):
     db_execute("INSERT OR IGNORE INTO dep_settings (deployment_id) VALUES (?)", (dep_id,))
     r = db_execute("SELECT restart_hours, last_sched, hook_secret, auto_deploy, health_url, health_fails, hang_off "
                    "FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    r = tuple(r) + (db_execute("SELECT compress FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')[0],)
     return {"restart_hours": r[0] or 0, "last_sched": r[1], "secret": r[2], "auto": r[3] or 0,
-            "health_url": r[4], "fails": r[5] or 0, "hang_off": r[6] or 0}
+            "health_url": r[4], "fails": r[5] or 0, "hang_off": r[6] or 0, "compress": r[7] or 0}
 
 
 # ---------------------------------------------------------------- maintenance mode
@@ -14346,11 +14394,35 @@ def _harden_perms():
         print(f"⚠️ harden perms: {e}")
 
 
+def strip_foreign_symlinks(folder):
+    """Delete symlinks inside a bot folder that point outside it. A bot could otherwise plant `.env -> /etc/...`
+    and trick the (root) host into writing through the link. Returns how many were removed."""
+    n = 0
+    try:
+        root = os.path.realpath(folder)
+        for dp, dns, fns in os.walk(folder, topdown=True, followlinks=False):
+            for name in list(dns) + list(fns):
+                fp = os.path.join(dp, name)
+                if os.path.islink(fp):
+                    tgt = os.path.realpath(fp)
+                    if tgt != root and not tgt.startswith(root + os.sep):
+                        os.unlink(fp)
+                        n += 1
+                        if name in dns:
+                            dns.remove(name)
+    except Exception as e:
+        print(f"⚠️ strip symlinks: {e}")
+    if n:
+        print(f"🔒 removed {n} symlink(s) pointing outside {folder}")
+    return n
+
+
 def _prepare_uid_folder(deploy_folder):
     """chown the bot's folder tree to its owner's private unix user and lock the owner's dir to that user.
     -> uid, or None if the folder isn't reachable by that user (isolation then isn't applied to this launch)."""
     try:
         df = Path(deploy_folder).resolve()
+        strip_foreign_symlinks(df)
         user_dir = df.relative_to(DEPLOYMENTS_DIR.resolve()).parts[0]
         uid = _bot_uid(user_dir)
         ud = DEPLOYMENTS_DIR / user_dir
@@ -14368,8 +14440,8 @@ def _prepare_uid_folder(deploy_folder):
         os.chown(df, uid, uid)
         for pre in ("pid.txt", "output.log"):
             fp = df / pre
-            if fp.exists():
-                os.chown(fp, uid, uid)
+            if fp.exists() and not fp.is_symlink():
+                os.lchown(fp, uid, uid)
         if subprocess.run(["test", "-x", str(df)], preexec_fn=_uid_drop(uid)).returncode != 0:
             print(f"⚠️ unix-user isolation skipped for {df}: not reachable by the bot user (check parent dir permissions)")
             return None
@@ -14391,28 +14463,127 @@ def isolation_status():
     return " + ".join(parts)
 
 
-def _fp_preexec():
+def _fp_preexec(compress=False):
     try:
         import resource
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_FSIZE, (2 << 30, 2 << 30))
         resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
-        os.nice(5)
+        os.nice(19 if compress else 5)
     except Exception:
         pass
+    if compress:                                     # one CPU core only → can't hog the host's CPUs
+        try:
+            cpus = sorted(os.sched_getaffinity(0))
+            os.sched_setaffinity(0, {cpus[os.getpid() % len(cpus)]})
+        except Exception:
+            pass
+
+
+# ---- "Ultra compress": lowest RAM / CPU footprint for a hosted bot --------------------------------------
+_SITE_CODE = '''# Loaded automatically by every Python process of a compressed bot (via PYTHONPATH).
+import os
+if os.environ.get("HB_COMPRESS") == "1":
+    try:
+        import sys, gc, threading, time
+        sys.setswitchinterval(0.05)              # fewer GIL hand-offs -> less CPU
+        gc.collect()
+        try:
+            gc.freeze()                          # startup objects never need re-scanning
+        except Exception:
+            pass
+        def _hb_trim():
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+            except Exception:
+                libc = None
+            every = float(os.environ.get("HB_TRIM_SECS", "45"))
+            while True:
+                time.sleep(every)
+                try:
+                    gc.collect()
+                    if libc is not None:
+                        libc.malloc_trim(0)      # hand freed heap pages back to the OS
+                except Exception:
+                    pass
+        threading.Thread(target=_hb_trim, daemon=True, name="hb-trim").start()
+    except Exception:
+        pass
+'''
+
+
+def _site_dir():
+    d = BASE_DIR / "_hb_site"
+    f = d / "sitecustomize.py"
+    try:
+        if not f.exists() or f.read_text() != _SITE_CODE:
+            d.mkdir(parents=True, exist_ok=True)
+            f.write_text(_SITE_CODE)
+            os.chmod(d, 0o755)
+            os.chmod(f, 0o644)
+    except Exception as e:
+        print(f"⚠️ site dir: {e}")
+    return str(d)
+
+
+def compress_env(base_env=None):
+    """Environment variables that shrink a bot's memory and CPU use (Python + Node + native libs)."""
+    e = {
+        "HB_COMPRESS": "1",
+        "MALLOC_ARENA_MAX": "1",                 # glibc: one heap instead of one per thread
+        "MALLOC_TRIM_THRESHOLD_": "65536",
+        "MALLOC_TOP_PAD_": "0",
+        "MALLOC_MMAP_THRESHOLD_": "131072",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONOPTIMIZE": "1",
+        "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1", "VECLIB_MAXIMUM_THREADS": "1", "TOKENIZERS_PARALLELISM": "false",
+        "UV_THREADPOOL_SIZE": "2",
+        "NODE_OPTIONS": "--max-old-space-size=128 --max-semi-space-size=1",
+    }
+    pp = (base_env or {}).get("PYTHONPATH", "")
+    e["PYTHONPATH"] = _site_dir() + (os.pathsep + pp if pp else "")
+    return e
+
+
+def compress_on(dep_id):
+    try:
+        return bool(dep_id) and bool(_fp_settings(dep_id)["compress"])
+    except Exception:
+        return False
+
+
+def _dep_id_from_folder(folder):
+    try:
+        f = Path(folder).resolve()
+        user, name = f.relative_to(DEPLOYMENTS_DIR.resolve()).parts[:2]
+        r = db_execute("SELECT deployment_id FROM deployments WHERE user_id = ? AND (folder_name = ? OR deployment_id = ?) "
+                       "ORDER BY deployment_id DESC LIMIT 1", (int(user), name, int(name) if name.isdigit() else -1),
+                       fetch='one')
+        return r[0] if r else None
+    except Exception:
+        return None
 
 
 def _run_start(start_script, deploy_folder, **kw):
     """Run a deployment's start.sh with per-process limits and, when the host allows it, inside a bubblewrap
     sandbox that hides the platform's data dir (database, other users' bots) — only this bot's folder is visible."""
     cmd = [str(start_script)]
+    comp = compress_on(_dep_id_from_folder(deploy_folder))
+    if comp:
+        _env = dict(kw.get("env") or os.environ)
+        _env.update(compress_env(_env))
+        kw["env"] = _env
+    def _base_pre(_c=comp):
+        _fp_preexec(_c)
     uid = _prepare_uid_folder(deploy_folder) if _uid_iso_ok() else None
     if uid is not None:
         _harden_perms()
         _drop = _uid_drop(uid)
-        def _pre(_drop=_drop):
+        def _pre(_drop=_drop, _c=comp):
             _drop()
-            _fp_preexec()
+            _fp_preexec(_c)
         kw.setdefault("preexec_fn", _pre)
         kw.setdefault("cwd", str(deploy_folder))
         return subprocess.run(cmd, **kw)
@@ -14421,7 +14592,7 @@ def _run_start(start_script, deploy_folder, **kw):
         cmd = ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
                "--tmpfs", str(BASE_DIR), "--bind", df, df, "--chdir", df, str(start_script)]
     kw.setdefault("cwd", str(deploy_folder))
-    kw.setdefault("preexec_fn", _fp_preexec)
+    kw.setdefault("preexec_fn", _base_pre)
     return subprocess.run(cmd, **kw)
 
 
@@ -14563,6 +14734,7 @@ def apply_zip_to_deployment(dep, zip_path, label="restore"):
             return False, "🚫 Rejected: the files try to access other users' bots or data."
         snapshot_create(dep["id"], f"before-{label}")
         dep["folder"].mkdir(parents=True, exist_ok=True)
+        strip_foreign_symlinks(dep["folder"])
         shutil.copytree(root, dep["folder"], dirs_exist_ok=True)
         envf = root / ".env"
         if envf.exists():
@@ -14638,6 +14810,7 @@ def _autodeploy_run(dep_id):
             audit(owner_id, "autodeploy_rejected", dep_id, d["repo"])
             return
         snapshot_create(dep_id, "before-auto-deploy")
+        strip_foreign_symlinks(d["folder"])
         shutil.copytree(tmp, d["folder"], dirs_exist_ok=True)
         try:
             install_from_repo_requirements(d["folder"], lambda m: None)
@@ -14725,6 +14898,10 @@ def metrics_sampler():
             n += 1
             if n % 12 == 0:
                 db_execute("DELETE FROM dep_metrics WHERE ts < ?", (int(now) - 8 * 86400,))
+                # keep the database (which is backed up to GitHub) small
+                if (db_execute("SELECT COUNT(*) FROM tr_cache", fetch='one') or (0,))[0] > 20000:
+                    db_execute("DELETE FROM tr_cache WHERE rowid IN (SELECT rowid FROM tr_cache ORDER BY RANDOM() LIMIT 8000)")
+                db_execute("DELETE FROM audit_log WHERE id < (SELECT COALESCE(MAX(id), 0) - 5000 FROM audit_log)")
         except Exception as e:
             print(f"❌ metrics sampler: {e}")
         sleep(300)
@@ -14850,8 +15027,11 @@ def health_check_monitor():
                     continue
                 ok = False
                 try:
+                    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                        def redirect_request(self, *a, **k):
+                            return None
                     req = urllib.request.Request(url, headers={"User-Agent": "BotHosting-HealthCheck/1.0"})
-                    with urllib.request.urlopen(req, timeout=10) as r:
+                    with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as r:
                         ok = r.status < 500
                 except urllib.error.HTTPError as e:
                     ok = e.code < 500
@@ -14980,6 +15160,23 @@ def redeem_promo(user_id, code):
         return False, "🔒 That promo code has been fully used."
     if db_execute("SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, user_id), fetch='one'):
         return False, "ℹ️ You've already used that code."
+    # Claim the code atomically BEFORE paying out, so two simultaneous taps can't both win.
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE promo_codes SET used = used + 1 WHERE code = ? AND active = 1 "
+                           "AND (max_uses = 0 OR used < max_uses)", (code,))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "🔒 That promo code has been fully used."
+        try:
+            conn.execute("INSERT INTO promo_redemptions (code, user_id, ts) VALUES (?, ?, ?)",
+                         (code, user_id, datetime.now().isoformat(timespec='seconds')))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False, "ℹ️ You've already used that code."
+        conn.commit()
+    finally:
+        conn.close()
     if kind == "discount":
         db_execute("INSERT INTO user_discounts (user_id, percent, code) VALUES (?, ?, ?) "
                    "ON CONFLICT(user_id) DO UPDATE SET percent = excluded.percent, code = excluded.code",
@@ -14988,9 +15185,6 @@ def redeem_promo(user_id, code):
     else:
         update_user_coins(user_id, int(value), "promo_code", code)
         msg = f"🪙 *+{int(value)} coins* added to your balance!"
-    db_execute("INSERT INTO promo_redemptions (code, user_id, ts) VALUES (?, ?, ?)",
-               (code, user_id, datetime.now().isoformat(timespec='seconds')))
-    db_execute("UPDATE promo_codes SET used = used + 1 WHERE code = ?", (code,))
     return True, f"✅ Code `{code}` accepted!\n\n{msg}"
 
 
@@ -15050,8 +15244,12 @@ def send_receipts_file(chat_id, user_id):
 
 
 # ---------------------------------------------------------------- languages
-LANGS = {"en": "🇬🇧 English", "es": "🇪🇸 Español", "fr": "🇫🇷 Français", "pt": "🇧🇷 Português",
-         "ru": "🇷🇺 Русский", "ar": "🇸🇦 العربية"}
+LANGS = {"en": "🇬🇧 English", "es": "🇪🇸 Español", "fr": "🇫🇷 Français", "pt": "🇧🇷 Português", "de": "🇩🇪 Deutsch",
+         "it": "🇮🇹 Italiano", "nl": "🇳🇱 Nederlands", "pl": "🇵🇱 Polski", "uk": "🇺🇦 Українська", "ru": "🇷🇺 Русский",
+         "tr": "🇹🇷 Türkçe", "ar": "🇸🇦 العربية", "fa": "🇮🇷 فارسی", "hi": "🇮🇳 हिन्दी", "bn": "🇧🇩 বাংলা",
+         "ur": "🇵🇰 اردو", "id": "🇮🇩 Indonesia", "vi": "🇻🇳 Tiếng Việt", "th": "🇹🇭 ไทย", "zh-CN": "🇨🇳 中文",
+         "ja": "🇯🇵 日本語", "ko": "🇰🇷 한국어", "sw": "🇰🇪 Kiswahili", "ha": "🇳🇬 Hausa", "yo": "🇳🇬 Yorùbá",
+         "ig": "🇳🇬 Igbo", "am": "🇪🇹 አማርኛ"}
 _TR = {
     "es": {"Deploy New Bot": "Desplegar nuevo bot", "Deploy from GitHub": "Desplegar desde GitHub",
            "Free Deployment": "Despliegue gratis", "My Deployments": "Mis despliegues", "Back": "Atrás",
@@ -15194,18 +15392,217 @@ def _tr_text(lang, s):
     return rx.sub(lambda m: tbl[m.group(1)], s)
 
 
+# --- full-message machine translation (cached). Dictionary above = quality override + offline fallback.
+_mt_state = {"fails": 0, "until": 0.0, "last_error": "", "ok": 0}
+_mt_cache = {}
+_mt_lock = threading.Lock()
+_TOK = "ZQ{}Z"
+_CODE_OR_MARK = re.compile(r'(`[^`\n]*`)|(\*[^*\n]+\*)|((?<![\w])_[^_\n]+_(?![\w]))')
+_PROT = re.compile(r'(`[^`\n]*`|https?://\S+|[\w.+-]+@[\w-]+\.[\w.-]+|@\w+|'
+                   r'(?<![\w])[A-Za-z0-9_\-:.=]{20,}(?![\w])|(?<![\w.])\d[\d,.:/-]*(?!\w))')
+_HAS_LETTER = re.compile(r'[^\W\d_]')
+
+
+def _mt_google(text, lang):
+    from urllib.parse import quote
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=" + quote(lang) +
+           "&dt=t&q=" + quote(text))
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=4) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return "".join(seg[0] for seg in data[0] if seg and seg[0])
+
+
+def _mt_libre(text, lang):
+    base = os.environ["LIBRETRANSLATE_URL"].rstrip("/")
+    body = {"q": text, "source": "en", "target": lang.split("-")[0], "format": "text"}
+    if os.environ.get("LIBRETRANSLATE_KEY"):
+        body["api_key"] = os.environ["LIBRETRANSLATE_KEY"]
+    req = urllib.request.Request(base + "/translate", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        return json.loads(r.read().decode("utf-8"))["translatedText"]
+
+
+def machine_translate(text, lang):
+    """One string -> translated string, or None (backend down / disabled). Fails fast after repeated errors."""
+    if os.environ.get("DISABLE_TRANSLATION") or time.time() < _mt_state["until"]:
+        return None
+    try:
+        out = (_mt_libre if os.environ.get("LIBRETRANSLATE_URL") else _mt_google)(text, lang)
+        if out and out.strip():
+            _mt_state["fails"] = 0
+            _mt_state["ok"] += 1
+            return out
+        raise RuntimeError("empty result")
+    except Exception as e:
+        _mt_state["fails"] += 1
+        _mt_state["last_error"] = str(e)[:100]
+        if _mt_state["fails"] >= 4:
+            _mt_state["until"] = time.time() + 300
+            _mt_state["fails"] = 0
+        return None
+
+
+def translation_status():
+    if os.environ.get("DISABLE_TRANSLATION"):
+        return "off"
+    b = "LibreTranslate" if os.environ.get("LIBRETRANSLATE_URL") else "Google"
+    if time.time() < _mt_state["until"]:
+        return f"{b}: paused after errors ({_mt_state['last_error']})"
+    return f"{b}: {_mt_state['ok']} ok" + (f", last error: {_mt_state['last_error']}" if _mt_state["last_error"] else "")
+
+
+def _mask_line(line):
+    """-> (masked, toks, pairs). toks: [(token, original)], pairs: [(open_token, close_token)]."""
+    toks, pairs = [], []
+    def add(orig):
+        t = _TOK.format(len(toks))
+        toks.append((t, orig))
+        return t
+    def pass1(m):
+        if m.group(1):
+            return m.group(1)
+        span = m.group(2) or m.group(3)
+        o, c = add(span[0]), add(span[-1])
+        pairs.append((o, c))
+        return o + span[1:-1] + c
+    line = _CODE_OR_MARK.sub(pass1, line)
+    line = _PROT.sub(lambda m: add(m.group(0)), line)
+    return line, toks, pairs
+
+
+def _unmask(out, toks, pairs):
+    """Put originals back; None if the translator dropped/duplicated a token or flipped a marker pair."""
+    for t, _o in toks:
+        if out.count(t) != 1:
+            return None
+    for o, c in pairs:
+        if out.index(o) > out.index(c):
+            return None
+    for o, c in pairs:                                   # '* word *' -> '*word*' so Markdown still parses
+        out = re.sub(re.escape(o) + r'\s*', o, out)
+        out = re.sub(r'\s*' + re.escape(c), c, out)
+    for t, orig in toks:
+        out = out.replace(t, orig)
+    return re.sub(r'(?<=\S)  +(?=\S)', ' ', out)
+
+
+def _cache_get(lang, key):
+    k = (lang, key)
+    hit = _mt_cache.get(k)
+    if hit is not None:
+        return hit
+    r = db_execute("SELECT out FROM tr_cache WHERE lang = ? AND src = ?", (lang, key), fetch='one')
+    if r:
+        _mt_cache[k] = r[0]
+        return r[0]
+    return None
+
+
+def _cache_put(lang, key, out):
+    with _mt_lock:
+        if len(_mt_cache) > 20000:
+            _mt_cache.clear()
+        _mt_cache[(lang, key)] = out
+    db_execute("INSERT OR REPLACE INTO tr_cache (lang, src, out) VALUES (?, ?, ?)", (lang, key[:1500], out))
+
+
+def _tr_one(lang, masked):
+    """Translate one masked line (cache → dictionary override → machine). Caches machine results."""
+    hit = _cache_get(lang, masked)
+    if hit is not None:
+        return hit
+    tbl = _TR.get(lang) or {}
+    bare = re.sub(r'^[^\w]+', '', masked).strip()
+    if bare in tbl:
+        return masked.replace(bare, tbl[bare], 1)
+    out = machine_translate(masked, lang)
+    if out is not None:
+        _cache_put(lang, masked, out)
+    return out
+
+
+def _tr_batch(lang, masked_lines, deadline=6.0):
+    """{masked: translated|None} — unseen lines are translated in parallel; stragglers finish in the background."""
+    res, todo = {}, []
+    for m in set(masked_lines):
+        hit = _cache_get(lang, m)
+        if hit is not None:
+            res[m] = hit
+        else:
+            todo.append(m)
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor, wait
+        ex = ThreadPoolExecutor(max_workers=min(8, len(todo)))
+        futs = {ex.submit(_tr_one, lang, m): m for m in todo}
+        done, _pending = wait(futs, timeout=deadline)
+        for f in done:
+            try:
+                res[futs[f]] = f.result()
+            except Exception:
+                res[futs[f]] = None
+        for f in _pending:
+            res[futs[f]] = None
+        ex.shutdown(wait=False)
+    return res
+
+
+def _prep_lines(text):
+    """Split text into [(kind, payload)]: 'raw' (code fences / blank / untranslatable) or 'line' (lead, masked, toks, pairs, trail)."""
+    items = []
+    in_fence = False
+    for raw in str(text).split("\n"):
+        if raw.strip().startswith("```"):
+            in_fence = not in_fence
+            items.append(("raw", raw)); continue
+        if in_fence or not raw.strip():
+            items.append(("raw", raw)); continue
+        lead = raw[:len(raw) - len(raw.lstrip())]
+        trail = raw[len(raw.rstrip()):]
+        masked, toks, pairs = _mask_line(raw.strip())
+        probe = masked
+        for t, _o in toks:
+            probe = probe.replace(t, "")
+        if not _HAS_LETTER.search(probe):
+            items.append(("raw", raw)); continue
+        items.append(("line", (lead, masked, toks, pairs, trail, raw)))
+    return items
+
+
 def localize(chat_id, text, keyboard):
-    """Translate common UI phrases for users whose language isn't English."""
+    """Translate a whole message (and its buttons) into the user's language. Never raises; falls back to English."""
     try:
         lang = user_lang(chat_id)
-        if lang == "en" or lang not in _TR:
+        if lang == "en" or lang not in LANGS:
             return text, keyboard
-        text = _tr_text(lang, text)
+        items = _prep_lines(text)
+        btns = []
         if keyboard and keyboard.get("inline_keyboard"):
-            keyboard = {"inline_keyboard": [[dict(b, text=_tr_text(lang, b.get("text", ""))) for b in row]
+            for row in keyboard["inline_keyboard"]:
+                for b in row:
+                    if str(b.get("callback_data", "")).startswith("fp_setlang_"):
+                        btns.append(("raw", b.get("text", "")))          # language names stay in their own language
+                    else:
+                        btns.append(_prep_lines(b.get("text", ""))[0])
+        want = [it[1][1] for it in items + btns if it[0] == "line"]
+        res = _tr_batch(lang, want) if want else {}
+
+        def render(it):
+            if it[0] == "raw":
+                return it[1]
+            lead, masked, toks, pairs, trail, raw = it[1]
+            out = res.get(masked)
+            done = _unmask(out, toks, pairs) if out else None
+            if done is None:                              # offline / bad output → dictionary → English
+                return _tr_text(lang, raw) if lang in _TR else raw
+            return lead + done.strip() + trail
+        text = "\n".join(render(it) for it in items)
+        if btns:
+            it_iter = iter(btns)
+            keyboard = {"inline_keyboard": [[dict(b, text=render(next(it_iter))) for b in row]
                                             for row in keyboard["inline_keyboard"]]}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ localize: {e}")
     return text, keyboard
 
 
@@ -15255,6 +15652,9 @@ def _fp_filter_shared_kb(keyboard, dep_id):
 _CONFIRM = (
     (re.compile(r'^stop_deploy_(\d+)$'), "🛑 *Stop this bot?*\n\nIt will go offline until you restart it.", "view_deploy_{0}"),
     (re.compile(r'^edit_envdel_(\d+)_\w+$'), "🗑️ *Delete this environment variable?*", "edit_env_{0}"),
+    (re.compile(r'^fp_pcdel_([A-Za-z0-9_-]{3,24})$'),
+     "🗑️ *Delete this promo code?*\n\nIt stops working immediately and any unused discount it gave users is removed.",
+     "fp_apromo"),
 )
 
 
@@ -15309,6 +15709,7 @@ def fp_tools_menu(chat_id, message_id, uid, dep_id):
                         [_fp_btn("⏰ Schedule", f"fp_sched_{dep_id}"), _fp_btn("🩺 Health check", f"fp_health_{dep_id}")],
                         [_fp_btn("🔗 Auto-deploy", f"fp_hook_{dep_id}"), _fp_btn("🤝 Share", f"fp_share_{dep_id}")],
                         [_fp_btn("🕘 Versions / rollback", f"fp_ver_{dep_id}"), _fp_btn("♻️ Restore zip", f"fp_restore_{dep_id}")],
+                        [_fp_btn(f"🗜 Ultra compress: {'ON' if st['compress'] else 'OFF'}", f"fp_comp_{dep_id}")],
                         [_fp_btn("🔙 Deployment", f"view_deploy_{dep_id}")]))
 
 
@@ -15405,9 +15806,10 @@ def fp_shared_list(chat_id, message_id, uid):
 
 def fp_lang_menu(chat_id, message_id, uid):
     cur = user_lang(uid)
-    rows = [[_fp_btn(("✅ " if c == cur else "") + n, f"fp_setlang_{c}")] for c, n in LANGS.items()]
-    edit_message(chat_id, message_id, "*🌐 LANGUAGE*\n\nMenus and common labels will be shown in your language "
-                 "(some messages stay in English).", _fp_kb(*rows, [_fp_btn("🔙 More", "fp_more")]))
+    items = [_fp_btn(("✅ " if c == cur else "") + n, f"fp_setlang_{c}") for c, n in LANGS.items()]
+    rows = [items[i:i + 2] for i in range(0, len(items), 2)]
+    edit_message(chat_id, message_id, "*🌐 LANGUAGE*\n\nChoose your language — every message and button is translated "
+                 "automatically.", _fp_kb(*rows, [_fp_btn("🔙 More", "fp_more")]))
 
 
 def fp_admin_promo_menu(chat_id, message_id):
@@ -15415,7 +15817,8 @@ def fp_admin_promo_menu(chat_id, message_id):
                       fetch='all') or []
     lines = [f"{'✅' if a else '❌'} `{c}` · {k} {v}{'%' if k == 'discount' else '🪙'} · {u}/{m or '∞'}"
              for c, k, v, m, u, a in rows]
-    btns = [[_fp_btn(f"{'⏸ Disable' if a else '▶️ Enable'} {c}", f"fp_pctog_{c}")] for c, k, v, m, u, a in rows[:6]]
+    btns = [[_fp_btn(f"{'⏸ Disable' if a else '▶️ Enable'} {c}", f"fp_pctog_{c}"),
+             _fp_btn("🗑 Delete", f"fp_pcdel_{c}")] for c, k, v, m, u, a in rows[:8]]
     edit_message(chat_id, message_id, "*🏷️ PROMO CODES*\n\n" + ("\n".join(lines) or "_None yet._"),
                  _fp_kb([_fp_btn("➕ New code", "fp_pcnew")], *btns, [_fp_btn("🔙 Admin Panel", "admin_panel")]))
 
@@ -15438,7 +15841,8 @@ def fp_admin_audit(chat_id, message_id, page=0):
 def _fp_admin_rows():
     on = maintenance_on()
     return [[_fp_btn(f"🛠 Maintenance: {'ON 🔴' if on else 'OFF 🟢'}", "fp_maint")],
-            [_fp_btn("🏷️ Promo Codes", "fp_apromo"), _fp_btn("🧾 Audit Log", "fp_audit_0")]]
+            [_fp_btn("🏷️ Promo Codes", "fp_apromo"), _fp_btn("🧾 Audit Log", "fp_audit_0")],
+            [_fp_btn("🧪 Test translation", "fp_trtest")]]
 
 
 # ---------------------------------------------------------------- callback router
@@ -15502,10 +15906,14 @@ def _fp_route(callback, data, uid, chat_id, mid):
         fp_shared_list(chat_id, mid, uid); return True
 
     # ---- admin-level
-    if data in ("fp_maint", "fp_apromo", "fp_pcnew") or cmd in ("audit", "pctog"):
+    if data in ("fp_maint", "fp_apromo", "fp_pcnew", "fp_trtest") or cmd in ("audit", "pctog", "pcdel"):
         if not is_admin(uid):
             return True
-        if data == "fp_maint":
+        if data == "fp_trtest":
+            r = machine_translate("Hello! Your bot is running.", "es")
+            edit_message(chat_id, mid, f"*🧪 TRANSLATION TEST*\n\nEnglish → Spanish:\n`{r or 'FAILED'}`\n\n"
+                         f"Status: `{translation_status()}`", _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")]))
+        elif data == "fp_maint":
             kv_set("maintenance", "0" if maintenance_on() else "1")
             audit(uid, "maintenance", "on" if maintenance_on() else "off")
             show_admin_panel(chat_id, mid)
@@ -15517,6 +15925,15 @@ def _fp_route(callback, data, uid, chat_id, mid):
                          "KIND = `coins` (bonus coins) or `discount` (percent off the user's next coin payment)\n"
                          "Examples:\n`WELCOME50 coins 50 100 30`\n`SAVE20 discount 20 50`",
                          _fp_kb([_fp_btn("❌ Cancel", "fp_apromo")]))
+        elif cmd == "pcdel":
+            code = "_".join(p[2:]).upper()
+            existed = db_execute("SELECT 1 FROM promo_codes WHERE code = ?", (code,), fetch='one')
+            db_execute("DELETE FROM promo_codes WHERE code = ?", (code,))
+            db_execute("DELETE FROM promo_redemptions WHERE code = ?", (code,))
+            db_execute("DELETE FROM user_discounts WHERE code = ?", (code,))
+            if existed:
+                audit(uid, "promo_delete", code)
+            fp_admin_promo_menu(chat_id, mid)
         elif cmd == "pctog":
             code = "_".join(p[2:])
             db_execute("UPDATE promo_codes SET active = 1 - active WHERE code = ?", (code,))
@@ -15556,6 +15973,27 @@ def _fp_route(callback, data, uid, chat_id, mid):
 
     if cmd == "tools":
         fp_tools_menu(chat_id, mid, uid, dep_id)
+    elif cmd == "comp":
+        st = _fp_settings(dep_id)
+        edit_message(chat_id, mid, f"*🗜 ULTRA COMPRESS — #{dep_id}*\n\nStatus: `{'ON' if st['compress'] else 'OFF'}`\n\n"
+                     "Squeezes the bot's RAM and CPU as far as it will go:\n"
+                     "• memory handed back to the system every ~45s, one memory arena, startup objects frozen\n"
+                     "• one CPU core, lowest priority, single-threaded math libraries\n"
+                     "• Node.js heap capped at 128 MB, no bytecode files, asserts stripped\n\n"
+                     "_Trade-off: the bot may respond a little slower under heavy load, and a Node.js bot needing more "
+                     "than 128 MB of heap will crash — turn it off if that happens. Takes effect on the next restart._",
+                     _fp_kb([_fp_btn("🔴 Turn off" if st["compress"] else "🟢 Turn on", f"fp_compset_{dep_id}")],
+                            [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+    elif cmd == "compset":
+        st = _fp_settings(dep_id)
+        db_execute("UPDATE dep_settings SET compress = ? WHERE deployment_id = ?", (0 if st["compress"] else 1, dep_id))
+        audit(uid, "compress", dep_id, "off" if st["compress"] else "on")
+        edit_message(chat_id, mid, f"✅ Ultra compress is now *{'OFF' if st['compress'] else 'ON'}* for bot #{dep_id}.\n\n"
+                     "Restart the bot to apply it.", _fp_kb([_fp_btn("🔄 Restart now", f"fp_comprs_{dep_id}")],
+                                                            [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+    elif cmd == "comprs":
+        res = _fp_restart(dep_id, "compress")
+        edit_message(chat_id, mid, f"🔄 Restart: `{res}`", _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
     elif cmd == "sched":
         fp_sched_menu(chat_id, mid, dep_id)
     elif cmd == "schedset" and len(p) > 3:
