@@ -564,7 +564,8 @@ def init_db():
         c.execute("ALTER TABLE security_reviews ADD COLUMN user_step_json TEXT")
     except Exception:
         pass
-    
+
+    _fp_init_tables(c)
     conn.commit()
     conn.close()
     print("✅ Database initialized with enhanced schema")
@@ -1217,6 +1218,95 @@ def run_security_scan(file_bytes: bytes, filename: str) -> tuple[bool, list, lis
         lines.append("✅ No issues found — file is clean")
 
     return blocked, critical, warnings, '\n'.join(lines)
+
+
+def _safe_remove_fresh_clone(folder, user_id, deploy_id):
+    """Delete ONLY the just-created clone of a rejected repo: it must be exactly
+    DEPLOYMENTS_DIR/<user>/<deploy_id> and must not belong to any deployment row. Anything else is left alone,
+    so a rejection can never touch another bot's files."""
+    try:
+        folder = Path(folder).resolve()
+        expected = (DEPLOYMENTS_DIR / str(user_id) / str(deploy_id)).resolve()
+        if folder != expected:
+            print(f"⚠️ refusing to delete {folder}: not the fresh clone {expected}")
+            return
+        if db_execute("SELECT 1 FROM deployments WHERE user_id = ? AND folder_name = ?",
+                      (user_id, str(deploy_id)), fetch='one'):
+            print(f"⚠️ refusing to delete {folder}: it belongs to an existing deployment")
+            return
+        shutil.rmtree(folder, ignore_errors=True)
+    except Exception as e:
+        print(f"⚠️ fresh-clone cleanup skipped: {e}")
+
+
+# ---------- local files guard: self-heal a deployment whose files vanished from disk ----------
+_guard_busy = set()
+_guard_last = {}                       # dep_id -> last attempt (epoch)
+FILES_GUARD_INTERVAL = 120
+FILES_GUARD_COOLDOWN = 900
+
+
+def files_guard_tick(max_per_cycle=3, now_ts=None):
+    """Any non-expired bot whose script is missing locally is restored from its GitHub backup right away
+    (no need for the owner to press Restart). Bots that were running are relaunched afterwards.
+    Returns the list of deployment ids restored."""
+    if not FILES_REPO_ENABLED:
+        return []
+    now_ts = now_ts if now_ts is not None else time.time()
+    rows = db_execute("""SELECT deployment_id, user_id, file_name, status FROM deployments
+                         WHERE status IN ('active','stopped','paused') AND file_name IS NOT NULL
+                           AND (expire_time IS NULL OR expire_time > ?)""",
+                      (datetime.now().isoformat(),), fetch='all') or []
+    restored = []
+    for dep_id, uid, fname, status in rows:
+        if len(restored) >= max_per_cycle:
+            break
+        try:
+            folder = get_deploy_folder(uid, dep_id)
+            script = folder / fname
+            if script.exists():
+                _guard_last.pop(dep_id, None)
+                continue
+            if dep_id in _guard_busy or now_ts - _guard_last.get(dep_id, 0) < FILES_GUARD_COOLDOWN:
+                continue
+            if is_banned(uid):
+                continue
+            _guard_busy.add(dep_id)
+            _guard_last[dep_id] = now_ts
+            try:
+                print(f"♻️ files guard: dep#{dep_id} files missing locally — restoring from GitHub")
+                ok, _env = _files_restore_for_relaunch(uid, dep_id, folder, script,
+                                                       log=lambda m, _d=dep_id: print(f"   [guard dep#{_d}] {m}"))
+            finally:
+                _guard_busy.discard(dep_id)
+            if ok and script.exists():
+                restored.append(dep_id)
+                if status == 'active':
+                    try:
+                        enqueue_relaunch(dep_id, reason="startup", bypass_cap=True)
+                    except Exception:
+                        pass
+                try:
+                    send_message(uid, f"♻️ *Bot #{dep_id}*: its files were missing on the server, so they were "
+                                      f"restored from your GitHub backup automatically."
+                                      + ("\nIt is being started again." if status == 'active' else ""),
+                                 {"inline_keyboard": [[{"text": f"📦 Open Bot #{dep_id}", "callback_data": f"view_deploy_{dep_id}"}]]})
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"⚠️ files guard error (dep#{dep_id}): {e}")
+    return restored
+
+
+def files_guard_monitor():
+    sleep(90)
+    print("✅ Files guard started (auto-restores bots whose files vanished from disk)")
+    while True:
+        try:
+            files_guard_tick()
+        except Exception as e:
+            print(f"⚠️ files guard error: {e}")
+        sleep(FILES_GUARD_INTERVAL)
 
 
 def data_theft_findings(critical) -> list:
@@ -2667,7 +2757,7 @@ def _relaunch_worker():
 
 def _launch_and_check(start_script, deploy_folder):
     """Run a deployment's start.sh and wait until its process has stayed up. -> (is_running, pid)."""
-    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+    _run_start(start_script, deploy_folder, capture_output=True)
     _wait_for_launch(deploy_folder, timeout=20, settle=4)
     new_pid = None
     pid_file = Path(deploy_folder) / "pid.txt"
@@ -3579,7 +3669,7 @@ def resume_premium_deployment(user_id, duration_days):
         return dep_id, False
 
     # Re-run the bot
-    result = subprocess.run([str(start_script)], cwd=str(deploy_folder),
+    result = _run_start(start_script, deploy_folder,
                             capture_output=True, text=True)
     _wait_for_launch(deploy_folder, timeout=15)
 
@@ -3645,7 +3735,7 @@ def continue_deployment_as_free(deployment_id, user_id, chat_id):
         except Exception:
             pass
 
-    subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True)
+    _run_start(start_script, deploy_folder, capture_output=True)
     _wait_for_launch(deploy_folder, timeout=15)
 
     pid_file = deploy_folder / "pid.txt"
@@ -3795,12 +3885,25 @@ def resume_paused_deployments(user_id):
             
             if dest_script.exists():
                 env_vars = json.loads(env_vars_json) if env_vars_json else {}
-                env = os.environ.copy()
+                env = {k: v for k, v in os.environ.items() if k not in _HOST_SECRET_KEYS}
                 for k, v in env_vars.items():
                     env[k] = v
                 
                 launcher_script = deploy_folder / "run.py"
                 log_file_path = deploy_folder / "output.log"
+                _uid = _prepare_uid_folder(deploy_folder) if _uid_iso_ok() else None
+                _pre = None
+                if _uid is not None:
+                    _d = _uid_drop(_uid)
+                    def _pre(_d=_d):
+                        _d()
+                        _fp_preexec()
+                try:
+                    log_file_path.touch()
+                    if _uid is not None:
+                        os.chown(log_file_path, _uid, _uid)
+                except Exception:
+                    pass
                 with open(log_file_path, "a") as log_f:
                     if launcher_script.exists():
                         proc = subprocess.Popen(
@@ -3808,7 +3911,8 @@ def resume_paused_deployments(user_id):
                             cwd=str(deploy_folder),
                             env=env,
                             stdout=log_f,
-                            stderr=subprocess.STDOUT
+                            stderr=subprocess.STDOUT,
+                            preexec_fn=_pre
                         )
                     else:
                         proc = subprocess.Popen(
@@ -3816,7 +3920,8 @@ def resume_paused_deployments(user_id):
                             cwd=str(deploy_folder),
                             env=env,
                             stdout=log_f,
-                            stderr=subprocess.STDOUT
+                            stderr=subprocess.STDOUT,
+                            preexec_fn=_pre
                         )
                 
                 c.execute('''UPDATE deployments SET status = 'active', is_paused = 0, proc_pid = ? 
@@ -3848,7 +3953,8 @@ _send_err = threading.local()
 def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
     _send_err.code = None
     url  = f"{TELEGRAM_API}/sendMessage"
-    text = str(text or '')[:4096]
+    text, keyboard = localize(chat_id, str(text or ''), keyboard)
+    text = text[:4096]
     data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
@@ -3897,6 +4003,7 @@ def edit_message(chat_id, message_id, text, keyboard=None):
         send_message(chat_id, str(text or '')[:4096], keyboard)
         return None
     url  = f"{TELEGRAM_API}/editMessageText"
+    text, keyboard = localize(chat_id, str(text or ''), keyboard)
     data = {"chat_id": chat_id, "message_id": message_id,
             "text": str(text or '')[:4096], "parse_mode": "Markdown"}
     if keyboard:
@@ -4907,6 +5014,7 @@ def purchase_tier_coins(chat_id, user_id, key, period="m"):
         return
     update_user_coins(user_id, -cost, "resource_tier", f"tier_{key}_{period}")
     end = activate_resource_tier(user_id, key, period, stars, cost)
+    apply_discount_cashback(user_id, cost)
     send_message(chat_id,
         f"✅ *{label} {pname.upper()} PLAN ACTIVE*\n\n💾 Guaranteed: `{label}`\n📅 Until: `{end.strftime('%Y-%m-%d')}`\n"
         f"Paid: `{cost}🪙`\n\nThank you! 🙏",
@@ -4928,6 +5036,7 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
         success, resumed = activate_premium(user_id, plan, cost_coins // STARS_PER_COIN, cost_coins, duration_days)
         
         if success:
+            apply_discount_cashback(user_id, cost_coins)
             resume_msg = f"\n\n✅ Resumed {resumed} paused deployment(s)!" if resumed > 0 else ""
             send_message(chat_id,
                 f"✅ *PREMIUM ACTIVATED!*{resume_msg}\n\n"
@@ -7337,7 +7446,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             _theft = data_theft_findings(crit)
             if _theft:
                 update_logs("🚫 REJECTED: code tries to access other users' data / the host database")
-                shutil.rmtree(deploy_folder, ignore_errors=True)
+                _safe_remove_fresh_clone(deploy_folder, user_id, deploy_id)
                 reject_data_theft(chat_id, user_id, f"{owner}/{repo}", _theft)
                 return False
             if blocked:
@@ -7486,7 +7595,7 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             start_script.chmod(0o755)
 
         update_logs("🚀 Starting bot...")
-        subprocess.run([str(start_script)], cwd=str(deploy_folder),
+        _run_start(start_script, deploy_folder,
                        capture_output=True, text=True)
 
         update_logs("⏳ Waiting for initialization (12s)...")
@@ -7763,7 +7872,7 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
         
         # Start the bot
         update_logs("🚀 Starting bot process...")
-        subprocess.run([str(start_script)], cwd=str(deploy_folder), capture_output=True, text=True)
+        _run_start(start_script, deploy_folder, capture_output=True, text=True)
         
         # Give the process time to start (or fail fast on syntax errors)
         update_logs("⏳ Waiting for bot to initialize (10s)...")
@@ -8630,7 +8739,7 @@ def edit_env_prompt(chat_id, message_id, user_id, dep_id):
     _edit_reply(chat_id, message_id,
         "*➕ ADD / UPDATE VARIABLES*\n\nSend one per line:\n```\nBOT_TOKEN=12345:ABC\nADMIN_ID=123456\n```\n"
         "A name that already exists is *updated*; new names are *added*. Your message is deleted afterwards "
-        "so secrets don't stay in the chat.",
+        "so secrets don't stay in the chat.\n\n📄 You can also *upload a `.env` file* instead.",
         {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"edit_env_{dep_id}"}]]})
 
 
@@ -9246,6 +9355,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
                 [{"text": "🆓 Continue Free (24h)", "callback_data": f"continue_as_free_{dep_id}"}])
     
     keyboard["inline_keyboard"].append([{"text": "✏️ Edit (env · requirements · code)", "callback_data": f"edit_deploy_{dep_id}"}])
+    keyboard["inline_keyboard"].append([{"text": "🧰 Tools (logs · usage · schedule · share…)", "callback_data": f"fp_tools_{dep_id}"}])
     keyboard["inline_keyboard"].append([{"text": "💾 Download Backup (zip)", "callback_data": f"backup_deploy_{dep_id}"}])
     if status == "active":
         keyboard["inline_keyboard"].append([{"text": "🔄 Refresh stats", "callback_data": f"view_deploy_{dep_id}"}])
@@ -9282,6 +9392,7 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
             text += _live_stats_block(dep_id, _proc_pid, None if is_admin(user_id) else get_user_quota_mb(user_id))
         except Exception as _e:
             print(f"⚠️ live stats failed: {_e}")
+    keyboard = _fp_filter_shared_kb(keyboard, dep_id)
     edit_message(chat_id, message_id, text[:4096], keyboard)
 
 # ========== HANDLERS ==========
@@ -9695,7 +9806,8 @@ def get_main_menu(user_id):
             [{"text": "📤 Deploy New Bot",                       "callback_data": "deploy_new"}],
             [{"text": "🐙 Deploy from GitHub",                   "callback_data": "github_deploy"}],
             [{"text": f"{premium_badge} Free Deployment (24h)", "callback_data": "free_deployment"}],
-            [{"text": "📦 My Deployments",                      "callback_data": "my_deployments"}],
+            [{"text": "📦 My Deployments",                      "callback_data": "my_deployments"},
+             {"text": "🧰 More",                                 "callback_data": "fp_more"}],
             [{"text": f"💰 {balances['coins']}🪙 | {balances['stars']}⭐", "callback_data": "my_balance"}],
             [{"text": "🎫 Redeem Code",                         "callback_data": "redeem_code"},
              {"text": "👥 Referral",                             "callback_data": "my_referral"}],
@@ -10232,6 +10344,7 @@ def show_admin_panel(chat_id, message_id):
             [{"text": f"🔒 Security Reviews{sec_badge}", "callback_data": "admin_sec_reviews"},
              {"text": f"🐛 Bug Reports{open_badge}",     "callback_data": "admin_bug_reports"}],
             [{"text": "📊 Dashboard",                    "callback_data": "admin_dashboard"}],
+            *_fp_admin_rows(),
             [{"text": "👥 Referral Stats",               "callback_data": "admin_referral_stats"},
              {"text": "📢 Broadcast",                    "callback_data": "admin_broadcast"}],
             [{"text": "🎫 Create Redeem Code",           "callback_data": "admin_create_code"}],
@@ -11322,7 +11435,8 @@ def admin_dashboard_text():
     return (
         "*📊 DASHBOARD*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"*👥 Users*\nTotal `{users_total}` · New 24h `{new_24h}` · 7d `{new_7d}`\n"
-        f"Active 24h `{active_24h}` · ⭐ Plan holders `{premium_n}` · 🚫 Banned `{banned_n}`\n\n"
+        f"Active 24h `{active_24h}` · ⭐ Plan holders `{premium_n}` · 🚫 Banned `{banned_n}`\n"
+        f"🛠 Maintenance: `{'ON' if maintenance_on() else 'off'}` · 🛡 Isolation: `{isolation_status()}`\n\n"
         f"*🤖 Bots*\nRunning `{bots_active}` of `{bots_total}` · ⏰ Expiring ≤72h `{expiring}`\n\n"
         f"*🧮 RAM pool*\nTotal `{format_resource(pool_mb)}` · In use now `{format_resource(used_mb)}`\n"
         f"Sold as plans `{format_resource(sold_mb)}` ({sold_users} user(s)) of `{format_resource(sellable)}` sellable\n"
@@ -11456,6 +11570,13 @@ def _dispatch_deploy(chat_id, user_id, message_id, user_step, env_vars):
     cost_stars   = user_step.get('cost_stars')
     cost_coins   = user_step.get('cost_coins')
 
+    # Stale button (session expired / bot restarted): no pending upload.
+    if not temp_file or not os.path.exists(str(temp_file)):
+        set_user_step(user_id, None)
+        send_message(chat_id, "⚠️ *Session expired*\n\nYour pending upload is no longer available. "
+                              "Please start the deployment again.")
+        return
+
     if plan == 'free':
         set_user_step(user_id, None)
         deploy_free_bot_with_logs(chat_id, user_id, temp_file, requirements, env_vars)
@@ -11497,6 +11618,9 @@ def touch_user(tg_user):
 
 def handle_callback(callback):
     touch_user(callback.get('from') or {})
+    callback = _fp_share_remap(callback)
+    if _fp_pre_callback(callback):
+        return
     callback_id = callback['id']
     user_id = callback['from']['id']
     _ban = get_ban_info(user_id)
@@ -11928,6 +12052,8 @@ def handle_callback(callback):
             # Deployment failed after coins were charged — refund them.
             update_user_coins(user_id, cost_coins, "deployment_refund", f"plan_{plan}")
             send_message(chat_id, f"↩️ Deployment failed — `{cost_coins}🪙` refunded.")
+        elif _deployed:
+            apply_discount_cashback(user_id, cost_coins)
         return
     
     # ========== REQUIREMENTS HANDLING ==========
@@ -12286,9 +12412,10 @@ def handle_callback(callback):
         set_user_step(user_id, 'github_paying')
         update_user_coins(user_id, -price_coins, "deployment", f"github_{plan}")
         edit_message(chat_id, message_id, "🪙 Payment received — starting deployment…", None)
-        _launch_github_deploy(chat_id, user_id, step,
-                              main_file_name=step.get('temp_main_file') or None,
-                              paid_method='coins')
+        if _launch_github_deploy(chat_id, user_id, step,
+                                 main_file_name=step.get('temp_main_file') or None,
+                                 paid_method='coins'):
+            apply_discount_cashback(user_id, price_coins)
         return
 
     # ---- GitHub: pay for a monthly/yearly plan with Telegram Stars ----
@@ -13000,6 +13127,9 @@ def handle_message(message):
         return
     
     user_step = get_user_step(user_id)
+
+    if 'text' in message and _fp_text(message, user_step):
+        return
     
     if 'text' in message:
         text = message['text']
@@ -13404,6 +13534,12 @@ def handle_message(message):
         
         if not is_user_verified(user_id):
             send_verification_required(chat_id, user_id, first_name, None)
+            return
+
+        if maintenance_on() and not is_admin(user_id):
+            send_message(chat_id, MAINT_TEXT)
+            return
+        if _fp_document(message, user_step, doc, file_name):
             return
 
         # ── Edit deployment: new requirements / package.json / code file ──
@@ -14029,6 +14165,1578 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
         return "launch_failed"
 
 
+# ==================== FEATURE PACK ====================
+# Auto-deploy webhook · scheduled restarts · isolation · log search · versions/restore · .env import
+# promo codes/receipts · usage graphs · audit log · maintenance mode · bot sharing · confirmations
+# · languages · health checks.   Everything here is button-driven (callbacks prefixed "fp_").
+_fp_ctx = threading.local()          # .shared = True while a collaborator is viewing someone else's bot
+
+
+def _fp_init_tables(c):
+    for ddl in (
+        "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)",
+        "CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor INTEGER, "
+        "action TEXT, target TEXT, detail TEXT)",
+        "CREATE TABLE IF NOT EXISTS dep_settings (deployment_id INTEGER PRIMARY KEY, restart_hours INTEGER DEFAULT 0, "
+        "last_sched TEXT, hook_secret TEXT, auto_deploy INTEGER DEFAULT 0, health_url TEXT, health_fails INTEGER DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS dep_shares (deployment_id INTEGER, user_id INTEGER, added_by INTEGER, "
+        "added_at TEXT, PRIMARY KEY (deployment_id, user_id))",
+        "CREATE TABLE IF NOT EXISTS dep_metrics (deployment_id INTEGER, ts INTEGER, cpu REAL, ram REAL)",
+        "CREATE INDEX IF NOT EXISTS idx_dep_metrics ON dep_metrics (deployment_id, ts)",
+        "CREATE TABLE IF NOT EXISTS promo_codes (code TEXT PRIMARY KEY, kind TEXT, value INTEGER, "
+        "max_uses INTEGER DEFAULT 0, used INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, created_by INTEGER)",
+        "CREATE TABLE IF NOT EXISTS promo_redemptions (code TEXT, user_id INTEGER, ts TEXT, PRIMARY KEY (code, user_id))",
+        "CREATE TABLE IF NOT EXISTS user_discounts (user_id INTEGER PRIMARY KEY, percent INTEGER, code TEXT)",
+    ):
+        c.execute(ddl)
+    for _ddl in ("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'en'",
+                 "ALTER TABLE dep_settings ADD COLUMN hang_off INTEGER DEFAULT 0"):
+        try:
+            c.execute(_ddl)
+        except Exception:
+            pass
+
+
+def kv_get(key, default=None):
+    r = db_execute("SELECT value FROM kv WHERE key = ?", (key,), fetch='one')
+    return r[0] if r else default
+
+
+def kv_set(key, value):
+    db_execute("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+               (key, str(value)))
+
+
+def audit(actor, action, target="", detail=""):
+    """Append an entry to the admin audit log (never raises)."""
+    try:
+        db_execute("INSERT INTO audit_log (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
+                   (datetime.now().isoformat(timespec='seconds'), actor, str(action)[:60], str(target)[:80],
+                    str(detail)[:300]))
+    except Exception:
+        pass
+
+
+def _fp_kb(*rows):
+    return {"inline_keyboard": [list(r) for r in rows]}
+
+
+def _fp_btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def _fp_dep(dep_id):
+    r = db_execute("SELECT user_id, file_name, status, source_type, github_repo, github_branch, env_vars, proc_pid, "
+                   "expire_time FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    if not r:
+        return None
+    return {"id": dep_id, "owner": r[0], "file": r[1], "status": r[2], "source": r[3], "repo": r[4],
+            "branch": r[5] or "main", "env": (json.loads(r[6]) if r[6] else {}), "pid": r[7], "expire": r[8],
+            "folder": get_deploy_folder(r[0], dep_id)}
+
+
+def _fp_own(uid, dep_id):
+    """The deployment if `uid` owns it (or is an admin), else None."""
+    d = _fp_dep(dep_id)
+    if d and (d["owner"] == uid or is_admin(uid)):
+        return d
+    return None
+
+
+def _fp_settings(dep_id):
+    db_execute("INSERT OR IGNORE INTO dep_settings (deployment_id) VALUES (?)", (dep_id,))
+    r = db_execute("SELECT restart_hours, last_sched, hook_secret, auto_deploy, health_url, health_fails, hang_off "
+                   "FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    return {"restart_hours": r[0] or 0, "last_sched": r[1], "secret": r[2], "auto": r[3] or 0,
+            "health_url": r[4], "fails": r[5] or 0, "hang_off": r[6] or 0}
+
+
+# ---------------------------------------------------------------- maintenance mode
+def maintenance_on():
+    return kv_get("maintenance") == "1"
+
+
+MAINT_TEXT = ("🛠️ *Maintenance mode*\n\nThe host is being updated, so new deployments, uploads and restarts are "
+              "paused for a moment. Your running bots are *not* affected. Please try again shortly.")
+
+_MAINT_BLOCKED = ("deploy_new", "github_deploy", "free_deployment", "restart_deploy_", "restart_free_",
+                  "reactivate_premium_", "continue_as_free_", "gh_pay_", "fp_rbok_", "fp_restore_")
+
+
+# ---------------------------------------------------------------- isolation
+_bwrap_state = {"ok": None}
+
+
+def _bwrap_ok():
+    if _bwrap_state["ok"] is None:
+        ok = False
+        try:
+            if shutil.which("bwrap"):
+                ok = subprocess.run(["bwrap", "--bind", "/", "/", "true"], capture_output=True,
+                                    timeout=8).returncode == 0
+        except Exception:
+            ok = False
+        _bwrap_state["ok"] = ok
+        print("🛡️ Container isolation (bubblewrap): " + ("ENABLED" if ok else
+              "unavailable on this host — using resource limits + file-scan guard"))
+    return _bwrap_state["ok"]
+
+
+_HOST_SECRET_KEYS = ('BOT_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TOKEN', 'API_TOKEN', 'TG_BOT_TOKEN',
+                     'TGBOT_TOKEN', 'DISCORD_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'GITHUB_TOKEN',
+                     'GITHUB_REPO_OWNER', 'GITHUB_REPO_NAME', 'GITHUB_BACKUP_BRANCH', 'GITHUB_BACKUP_PATH',
+                     'GITHUB_FILES_REPO_NAME', 'DATABASE_URL', 'DATABASE_FILE', 'ADMIN_IDS', 'REQUIRED_CHANNEL',
+                     'CHANNEL_LINK', 'PUBLIC_BASE_URL')
+_UID_BASE = 200000
+_uid_state = {"ok": None}
+
+
+def _bot_uid(user_id):
+    return _UID_BASE + (int(user_id) % 1_000_000)
+
+
+def _uid_drop(uid):
+    def _f():
+        os.setgroups([])
+        os.setgid(uid)
+        os.setuid(uid)
+    return _f
+
+
+def _uid_iso_ok():
+    """True when the host is root and a throw-away unprivileged user can run our interpreters."""
+    if _uid_state["ok"] is None:
+        ok = False
+        try:
+            if os.name == "posix" and os.geteuid() == 0 and not os.environ.get("DISABLE_UID_ISOLATION"):
+                ok = subprocess.run([sys.executable, "-c", "import os, sys"], capture_output=True, timeout=15,
+                                    preexec_fn=_uid_drop(_UID_BASE - 1)).returncode == 0
+                node = shutil.which("node")
+                if ok and node:
+                    ok = subprocess.run([node, "--version"], capture_output=True, timeout=15,
+                                        preexec_fn=_uid_drop(_UID_BASE - 1)).returncode == 0
+        except Exception:
+            ok = False
+        _uid_state["ok"] = ok
+        print("🛡️ Per-user unix-user isolation: " + ("ENABLED" if ok else "unavailable (host isn't root or interpreters aren't "
+              "world-executable)"))
+    return _uid_state["ok"]
+
+
+def _harden_perms():
+    """Platform data is root-only; bots can traverse to their own folder but not list or read anything else."""
+    if not _uid_iso_ok():
+        return
+    try:
+        for d in (BASE_DIR, DEPLOYMENTS_DIR):
+            os.chmod(d, 0o711)
+        for ud in DEPLOYMENTS_DIR.iterdir():          # lock every owner's dir now, not only at their next launch
+            if ud.is_dir() and ud.name.isdigit():
+                u = _bot_uid(ud.name)
+                os.chown(ud, u, u)
+                os.chmod(ud, 0o700)
+        for d in (USER_FILES_DIR, LOGS_DIR, PIP_CACHE_DIR, BASE_DIR / "snapshots"):
+            if Path(d).exists():
+                os.chmod(d, 0o700)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            f = Path(str(DATABASE_FILE) + suffix)
+            if f.exists():
+                os.chmod(f, 0o600)
+    except Exception as e:
+        print(f"⚠️ harden perms: {e}")
+
+
+def _prepare_uid_folder(deploy_folder):
+    """chown the bot's folder tree to its owner's private unix user and lock the owner's dir to that user.
+    -> uid, or None if the folder isn't reachable by that user (isolation then isn't applied to this launch)."""
+    try:
+        df = Path(deploy_folder).resolve()
+        user_dir = df.relative_to(DEPLOYMENTS_DIR.resolve()).parts[0]
+        uid = _bot_uid(user_dir)
+        ud = DEPLOYMENTS_DIR / user_dir
+        os.chown(ud, uid, uid)
+        os.chmod(ud, 0o700)
+        for root, dirs, files in os.walk(df):
+            for n in dirs + files:
+                fp = os.path.join(root, n)
+                try:
+                    st = os.lstat(fp)
+                    if st.st_uid != uid:
+                        os.lchown(fp, uid, uid)
+                except OSError:
+                    pass
+        os.chown(df, uid, uid)
+        for pre in ("pid.txt", "output.log"):
+            fp = df / pre
+            if fp.exists():
+                os.chown(fp, uid, uid)
+        if subprocess.run(["test", "-x", str(df)], preexec_fn=_uid_drop(uid)).returncode != 0:
+            print(f"⚠️ unix-user isolation skipped for {df}: not reachable by the bot user (check parent dir permissions)")
+            return None
+        return uid
+    except Exception as e:
+        print(f"⚠️ prepare uid folder: {e}")
+        return None
+
+
+def isolation_status():
+    parts = []
+    if _uid_iso_ok():
+        parts.append("per-user unix users ✅")
+    if _bwrap_ok():
+        parts.append("bubblewrap ✅")
+    parts.append("resource limits")
+    if len(parts) == 1:
+        parts.append("data-theft scanner (no OS-level sandbox on this host)")
+    return " + ".join(parts)
+
+
+def _fp_preexec():
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (2 << 30, 2 << 30))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+        os.nice(5)
+    except Exception:
+        pass
+
+
+def _run_start(start_script, deploy_folder, **kw):
+    """Run a deployment's start.sh with per-process limits and, when the host allows it, inside a bubblewrap
+    sandbox that hides the platform's data dir (database, other users' bots) — only this bot's folder is visible."""
+    cmd = [str(start_script)]
+    uid = _prepare_uid_folder(deploy_folder) if _uid_iso_ok() else None
+    if uid is not None:
+        _harden_perms()
+        _drop = _uid_drop(uid)
+        def _pre(_drop=_drop):
+            _drop()
+            _fp_preexec()
+        kw.setdefault("preexec_fn", _pre)
+        kw.setdefault("cwd", str(deploy_folder))
+        return subprocess.run(cmd, **kw)
+    if _bwrap_ok():
+        df = str(Path(deploy_folder).resolve())
+        cmd = ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+               "--tmpfs", str(BASE_DIR), "--bind", df, df, "--chdir", df, str(start_script)]
+    kw.setdefault("cwd", str(deploy_folder))
+    kw.setdefault("preexec_fn", _fp_preexec)
+    return subprocess.run(cmd, **kw)
+
+
+# ---------------------------------------------------------------- snapshots / restore
+SNAP_KEEP = 5
+
+
+def _snap_dir(dep_id):
+    d = BASE_DIR / "snapshots" / str(dep_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+_snap_synced = set()
+SNAP_REMOTE_MAX_MB = 20
+
+
+def _snap_remote_prefix(dep_id):
+    return f"{FILES_REPO_ROOT}/_snapshots/{int(dep_id)}"     # not <digits>/<digits>: the orphan purge never touches it
+
+
+def _snap_remote_push(dep_id, path):
+    """Copy a rollback point to the GitHub files repo (so a redeploy/disk wipe can't lose it) and prune old ones."""
+    try:
+        if not _files_repo_ready() or path.stat().st_size > SNAP_REMOTE_MAX_MB << 20:
+            return
+        pre = _snap_remote_prefix(dep_id)
+        with _files_lock:
+            changes = {f"{pre}/{path.name}": path.read_bytes()}
+            names = sorted((k for k in _files_list_remote(pre) if k.endswith(".zip")), reverse=True)
+            names = sorted(set(names) | set(changes), reverse=True)
+            for old in names[SNAP_KEEP:]:
+                changes[old] = None
+            _files_commit(changes, f"rollback point #{dep_id}")
+    except Exception as e:
+        print(f"⚠️ snapshot push failed: {e}")
+
+
+def _snap_remote_pull(dep_id):
+    """After a disk wipe: bring the saved rollback points back from the files repo."""
+    try:
+        if not _files_repo_ready():
+            return
+        pre = _snap_remote_prefix(dep_id)
+        with _files_lock:
+            remote = _files_list_remote(pre)
+            for pth, sha in sorted(remote.items(), reverse=True)[:SNAP_KEEP]:
+                if not pth.endswith(".zip"):
+                    continue
+                dest = _snap_dir(dep_id) / pth.rsplit("/", 1)[-1]
+                if not dest.exists():
+                    data = _files_fetch_blob(sha)
+                    if data:
+                        dest.write_bytes(data)
+    except Exception as e:
+        print(f"⚠️ snapshot pull failed: {e}")
+
+
+def snapshot_list(dep_id):
+    d = BASE_DIR / "snapshots" / str(dep_id)
+    if (not d.exists() or not any(d.glob("*.zip"))) and dep_id not in _snap_synced:
+        _snap_synced.add(dep_id)
+        _snap_remote_pull(dep_id)
+    return sorted(d.glob("*.zip"), reverse=True) if d.exists() else []
+
+
+def snapshot_create(dep_id, label="manual"):
+    """Zip the deployment's own files into a rollback point (last SNAP_KEEP kept). -> path or None."""
+    try:
+        d = _fp_dep(dep_id)
+        if not d or not d["folder"].exists():
+            return None
+        slug = re.sub(r'[^a-z0-9]+', '-', label.lower()).strip('-')[:24] or "snap"
+        p = _snap_dir(dep_id) / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}__{slug}.zip"
+        n, size = build_deployment_backup_zip(d["folder"], p)
+        if n == 0:
+            p.unlink(missing_ok=True)
+            return None
+        for old in snapshot_list(dep_id)[SNAP_KEEP:]:
+            old.unlink(missing_ok=True)
+        threading.Thread(target=_snap_remote_push, args=(dep_id, p), daemon=True, name="SnapPush").start()
+        return p
+    except Exception as e:
+        print(f"⚠️ snapshot failed: {e}")
+        return None
+
+
+def _snap_label(p):
+    stamp, _, slug = p.stem.partition("__")
+    try:
+        t = datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime("%d %b %H:%M")
+    except Exception:
+        t = stamp
+    return f"{t} · {slug.replace('-', ' ')}"
+
+
+def safe_extract_zip(zip_path, dest, max_files=5000, max_bytes=300 << 20):
+    """Extract a zip into `dest` refusing traversal, absolute paths, symlinks and zip bombs. -> (ok, error)."""
+    import zipfile
+    dest = Path(dest).resolve()
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            infos = z.infolist()
+            if len(infos) > max_files:
+                return False, "too many files in the zip"
+            if sum(i.file_size for i in infos) > max_bytes:
+                return False, "the zip is too large when unpacked"
+            for i in infos:
+                name = i.filename
+                if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+                    return False, f"unsafe path `{name[:60]}`"
+                if (i.external_attr >> 16) & 0o170000 == 0o120000:
+                    return False, "the zip contains a symlink"
+                target = (dest / name).resolve()
+                if dest not in target.parents and target != dest:
+                    return False, f"unsafe path `{name[:60]}`"
+            z.extractall(dest)
+        return True, ""
+    except zipfile.BadZipFile:
+        return False, "that isn't a valid zip file"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def apply_zip_to_deployment(dep, zip_path, label="restore"):
+    """Validate (path safety + data-theft scan) then overlay a zip onto a deployment. -> (ok, message)."""
+    tmp = Path(tempfile.mkdtemp(prefix="rs_"))
+    try:
+        ok, err = safe_extract_zip(zip_path, tmp)
+        if not ok:
+            return False, f"❌ {err}"
+        inner = [p for p in tmp.iterdir()]
+        root = inner[0] if len(inner) == 1 and inner[0].is_dir() else tmp
+        try:
+            findings = scan_repo_data_theft(root)
+        except Exception:
+            findings = []
+        if findings:
+            return False, "🚫 Rejected: the files try to access other users' bots or data."
+        snapshot_create(dep["id"], f"before-{label}")
+        dep["folder"].mkdir(parents=True, exist_ok=True)
+        shutil.copytree(root, dep["folder"], dirs_exist_ok=True)
+        envf = root / ".env"
+        if envf.exists():
+            new_env, _ = parse_env_input(envf.read_text(errors="replace"))
+            new_env = {k: v for k, v in new_env.items() if k not in _PLATFORM_ENV_KEYS}
+            if new_env:
+                env = dict(dep["env"])
+                env.update(new_env)
+                _edit_save_env(dep["owner"], dep["id"], env, dep["folder"])
+        return True, "✅ Files restored."
+    except Exception as e:
+        return False, f"❌ Restore failed: {str(e)[:120]}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- auto-deploy (GitHub webhook)
+def _public_base_url():
+    u = os.environ.get("PUBLIC_BASE_URL") or kv_get("public_url") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+    if not u and os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
+        u = "https://" + os.environ["RENDER_EXTERNAL_HOSTNAME"]
+    return u.rstrip("/")
+
+
+def handle_github_webhook(dep_id, body, signature, event):
+    """Called by the HTTP server. -> (status_code, text)."""
+    d = _fp_dep(dep_id)
+    st = _fp_settings(dep_id) if d else None
+    if not d or not st or not st["auto"] or not st["secret"]:
+        return 404, "not found"
+    import hmac as _hmac
+    want = "sha256=" + _hmac.new(st["secret"].encode(), body, hashlib.sha256).hexdigest()
+    if not signature or not _hmac.compare_digest(want, signature):
+        return 401, "bad signature"
+    if event == "ping":
+        return 200, "pong"
+    if event != "push":
+        return 202, "ignored"
+    try:
+        ref = (json.loads(body.decode("utf-8", "replace")) or {}).get("ref", "")
+    except Exception:
+        return 400, "bad json"
+    if ref and not ref.endswith("/" + d["branch"]):
+        return 202, "other branch ignored"
+    threading.Thread(target=_autodeploy_run, args=(dep_id,), daemon=True, name=f"AutoDeploy-{dep_id}").start()
+    return 202, "deploying"
+
+
+_autodeploy_busy = set()
+
+
+def _autodeploy_run(dep_id):
+    if dep_id in _autodeploy_busy:
+        return
+    _autodeploy_busy.add(dep_id)
+    d = _fp_dep(dep_id)
+    tmp = None
+    try:
+        if not d or not d["repo"] or "/" not in d["repo"]:
+            return
+        owner_id = d["owner"]
+        if get_ban_info(owner_id):
+            return
+        gh_owner, gh_repo = d["repo"].split("/", 1)
+        token = d["env"].get("GITHUB_DEPLOY_TOKEN")
+        tmp = Path(tempfile.mkdtemp(prefix="ad_", dir=str(BASE_DIR)))
+        if not download_github_repo(gh_owner, gh_repo, d["branch"], tmp, token, lambda m: None):
+            send_message(owner_id, f"⚠️ *Auto-deploy #{dep_id}* — couldn't download `{d['repo']}`. Nothing changed.")
+            return
+        if scan_repo_data_theft(tmp):
+            send_message(owner_id, f"🚫 *Auto-deploy #{dep_id} rejected* — the new commit tries to access other "
+                                   f"users' bots or data. Your running bot was left unchanged.")
+            audit(owner_id, "autodeploy_rejected", dep_id, d["repo"])
+            return
+        snapshot_create(dep_id, "before-auto-deploy")
+        shutil.copytree(tmp, d["folder"], dirs_exist_ok=True)
+        try:
+            install_from_repo_requirements(d["folder"], lambda m: None)
+        except Exception as e:
+            print(f"⚠️ autodeploy deps: {e}")
+        stop_deployment(dep_id)
+        res = _auto_relaunch_deployment(dep_id, reason="update", bypass_cap=True)
+        try:
+            files_repo_async_save(dep_id, "auto-deploy")
+        except Exception:
+            pass
+        ok = res == "restarted"
+        send_message(owner_id, (f"🚀 *Auto-deploy #{dep_id} done* — pushed code from `{d['repo']}` is live."
+                                if ok else f"⚠️ *Auto-deploy #{dep_id}*: code updated but the restart returned `{res}`. "
+                                           f"Open the deployment and press Restart."),
+                     _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+    except Exception as e:
+        print(f"❌ autodeploy {dep_id}: {e}")
+    finally:
+        _autodeploy_busy.discard(dep_id)
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- monitors
+def _fp_restart(dep_id, reason):
+    stop_deployment(dep_id)
+    return _auto_relaunch_deployment(dep_id, reason=reason, bypass_cap=True)
+
+
+def scheduled_restart_monitor():
+    sleep(90)
+    print("✅ Scheduled-restart monitor started")
+    while True:
+        try:
+            rows = db_execute("SELECT s.deployment_id, s.restart_hours, s.last_sched FROM dep_settings s "
+                              "JOIN deployments d ON d.deployment_id = s.deployment_id "
+                              "WHERE s.restart_hours > 0 AND d.status = 'active'", fetch='all') or []
+            now = datetime.now()
+            for dep_id, hours, last in rows:
+                try:
+                    due = (not last) or (now - datetime.fromisoformat(last)).total_seconds() >= hours * 3600
+                except Exception:
+                    due = True
+                if not last:               # first sight: start the clock instead of restarting immediately
+                    db_execute("UPDATE dep_settings SET last_sched = ? WHERE deployment_id = ?",
+                               (now.isoformat(), dep_id))
+                    continue
+                if due:
+                    db_execute("UPDATE dep_settings SET last_sched = ? WHERE deployment_id = ?",
+                               (now.isoformat(), dep_id))
+                    print(f"⏰ scheduled restart of #{dep_id}")
+                    _fp_restart(dep_id, "scheduled")
+        except Exception as e:
+            print(f"❌ schedule monitor: {e}")
+        sleep(300)
+
+
+_metric_prev = {}
+
+
+def metrics_sampler():
+    sleep(45)
+    print("✅ Usage sampler started (5 min)")
+    n = 0
+    while True:
+        try:
+            rows = db_execute("SELECT deployment_id, proc_pid FROM deployments WHERE status='active' "
+                              "AND proc_pid IS NOT NULL", fetch='all') or []
+            now = time.time()
+            for dep_id, pid in rows:
+                try:
+                    os.kill(int(pid), 0)
+                    cpu_s = _tree_cpu_seconds(pid)
+                    ram = get_process_tree_ram_mb(pid)
+                except Exception:
+                    continue
+                prev = _metric_prev.get(dep_id)
+                _metric_prev[dep_id] = (now, cpu_s)
+                pct = 0.0
+                if prev and now > prev[0] and cpu_s >= prev[1]:
+                    pct = (cpu_s - prev[1]) / (now - prev[0]) * 100
+                db_execute("INSERT INTO dep_metrics (deployment_id, ts, cpu, ram) VALUES (?, ?, ?, ?)",
+                           (dep_id, int(now), round(pct, 1), round(float(ram or 0), 1)))
+            n += 1
+            if n % 12 == 0:
+                db_execute("DELETE FROM dep_metrics WHERE ts < ?", (int(now) - 8 * 86400,))
+        except Exception as e:
+            print(f"❌ metrics sampler: {e}")
+        sleep(300)
+
+
+def _is_zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
+        return s[s.rindex(")") + 2] == "Z"
+    except Exception:
+        return False
+
+
+def _health_target(d, st):
+    """The URL to ping, or None. 'local' = this bot's own PORT on localhost."""
+    u = st["health_url"]
+    if not u:
+        return None
+    if u == "local":
+        port = d["env"].get("PORT") or d["env"].get("BOT_PORT")
+        return f"http://127.0.0.1:{int(port)}/" if str(port).isdigit() else None
+    return u
+
+
+def _url_is_public(url):
+    import socket, ipaddress
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        for info in socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80)):
+            if not ipaddress.ip_address(info[4][0]).is_global:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+_TG_TOKEN_RX = re.compile(r'^\d{6,12}:[A-Za-z0-9_-]{30,}$')
+_pending_hist = {}
+
+
+def _telegram_token(env):
+    for v in (env or {}).values():
+        if isinstance(v, str) and _TG_TOKEN_RX.match(v.strip()):
+            return v.strip()
+    return None
+
+
+def _tg_pending(token):
+    """(pending_update_count, uses_webhook) from Telegram for a bot token, or None. Read-only: never consumes updates."""
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10) as r:
+            res = (json.loads(r.read().decode()) or {}).get("result") or {}
+        return int(res.get("pending_update_count") or 0), bool(res.get("url"))
+    except Exception:
+        return None
+
+
+def hang_check_tick():
+    """Polling bots have no URL to ping, but a hung one stops reading updates: Telegram's queue for its token keeps
+    growing. Growing for 3 checks in a row → restart once; if it still doesn't drain, detection switches itself off."""
+    rows = db_execute("SELECT deployment_id FROM deployments WHERE status='active' AND proc_pid IS NOT NULL",
+                      fetch='all') or []
+    for (dep_id,) in rows:
+        st = _fp_settings(dep_id)
+        if st["hang_off"] or st["health_url"]:
+            continue
+        d = _fp_dep(dep_id)
+        tok = _telegram_token(d["env"]) if d else None
+        if not tok:
+            continue
+        res = _tg_pending(tok)
+        if not res or res[1]:
+            continue                      # no answer, or the bot uses a webhook instead of polling
+        hist = _pending_hist.setdefault(dep_id, [])
+        hist.append(res[0])
+        del hist[:-4]
+        if len(hist) < 4 or hist[-1] < 5 or not (hist[1] <= hist[2] <= hist[3] and hist[3] > hist[0]):
+            continue
+        _pending_hist[dep_id] = []
+        strikes = _pending_hist.get(("s", dep_id), 0) + 1
+        _pending_hist[("s", dep_id)] = strikes
+        if strikes >= 2:
+            db_execute("UPDATE dep_settings SET hang_off = 1 WHERE deployment_id = ?", (dep_id,))
+            send_message(d["owner"], f"ℹ️ *Bot #{dep_id}*: a restart didn't make it read its Telegram updates, so it may "
+                                     f"simply not use polling. I turned hang detection off for this bot.",
+                         _fp_kb([_fp_btn("🩺 Health check", f"fp_health_{dep_id}")]))
+            continue
+        tail = ""
+        try:
+            tail = _log_tail_text(d["folder"], 8)
+        except Exception:
+            pass
+        res2 = _fp_restart(dep_id, "hang")
+        audit(d["owner"], "hang_restart", dep_id, f"pending={hist and res[0]}")
+        send_message(d["owner"], f"🩺 *Bot #{dep_id} looks hung* — Telegram's queue for it kept growing (`{res[0]}` updates "
+                                 f"waiting) so I restarted it (`{res2}`)." +
+                     (f"\n\nLast log lines:\n```\n{tail}\n```" if tail else ""),
+                     _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+
+
+def health_check_monitor():
+    sleep(120)
+    print("✅ Health-ping monitor started (2 min)")
+    while True:
+        try:
+            try:
+                hang_check_tick()
+            except Exception as _e:
+                print(f"❌ hang check: {_e}")
+            rows = db_execute("SELECT s.deployment_id FROM dep_settings s JOIN deployments d "
+                              "ON d.deployment_id = s.deployment_id WHERE d.status='active' "
+                              "AND s.health_url IS NOT NULL", fetch='all') or []
+            for (dep_id,) in rows:
+                d, st = _fp_dep(dep_id), _fp_settings(dep_id)
+                url = _health_target(d, st) if d else None
+                if not url:
+                    continue
+                if url != f"http://127.0.0.1:{d['env'].get('PORT')}/" and not _url_is_public(url):
+                    continue
+                ok = False
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "BotHosting-HealthCheck/1.0"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        ok = r.status < 500
+                except urllib.error.HTTPError as e:
+                    ok = e.code < 500
+                except Exception:
+                    ok = False
+                if d["pid"] and _is_zombie(d["pid"]):
+                    ok = False
+                if ok:
+                    if st["fails"]:
+                        db_execute("UPDATE dep_settings SET health_fails = 0 WHERE deployment_id = ?", (dep_id,))
+                    continue
+                fails = st["fails"] + 1
+                if fails < 3:
+                    db_execute("UPDATE dep_settings SET health_fails = ? WHERE deployment_id = ?", (fails, dep_id))
+                    continue
+                db_execute("UPDATE dep_settings SET health_fails = 0 WHERE deployment_id = ?", (dep_id,))
+                tail = ""
+                try:
+                    tail = _log_tail_text(d["folder"], 8)
+                except Exception:
+                    pass
+                res = _fp_restart(dep_id, "health")
+                send_message(d["owner"], f"🩺 *Bot #{dep_id} stopped answering* its health check 3 times in a row, so I "
+                                         f"restarted it (`{res}`)." + (f"\n\nLast log lines:\n```\n{tail}\n```" if tail else ""),
+                             _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+        except Exception as e:
+            print(f"❌ health monitor: {e}")
+        sleep(120)
+
+
+# ---------------------------------------------------------------- usage graphs
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _spark(vals):
+    real = [v for v in vals if v is not None]
+    if not real:
+        return "—"
+    hi = max(real) or 1
+    return "".join("·" if v is None else _SPARK[min(7, int(v / hi * 7.999))] for v in vals)
+
+
+def usage_text(dep_id, hours=24):
+    now = int(time.time())
+    buckets = 24 if hours <= 24 else 28
+    span = hours * 3600 // buckets
+    rows = db_execute("SELECT ts, cpu, ram FROM dep_metrics WHERE deployment_id = ? AND ts > ? ORDER BY ts",
+                      (dep_id, now - hours * 3600), fetch='all') or []
+    if not rows:
+        return "📈 *USAGE*\n\nNo samples yet — usage is recorded every 5 minutes while the bot is running."
+    cpu, ram = [[] for _ in range(buckets)], [[] for _ in range(buckets)]
+    for ts, c, r in rows:
+        i = min(buckets - 1, (ts - (now - hours * 3600)) // span)
+        cpu[i].append(c)
+        ram[i].append(r)
+    avg = lambda xs: (sum(xs) / len(xs)) if xs else None
+    cs, rs = [avg(x) for x in cpu], [avg(x) for x in ram]
+    allc, allr = [r[1] for r in rows], [r[2] for r in rows]
+    label = "last 24 hours" if hours <= 24 else "last 7 days"
+    return (f"📈 *USAGE — {label}*\n\n"
+            f"⚙️ CPU (% of 1 core)\n`{_spark(cs)}`\navg `{sum(allc)/len(allc):.0f}%` · peak `{max(allc):.0f}%`\n\n"
+            f"🧠 RAM\n`{_spark(rs)}`\navg `{format_resource(sum(allr)/len(allr))}` · peak `{format_resource(max(allr))}`\n\n"
+            f"_Left = oldest, right = now · {len(rows)} samples_")
+
+
+# ---------------------------------------------------------------- log search
+_ERR_RE = re.compile(r'error|exception|traceback|critical|fatal|failed|refused|denied', re.I)
+_WARN_RE = re.compile(r'warn|error|exception|traceback|critical|fatal|failed', re.I)
+
+
+def _read_log_lines(folder):
+    p = Path(folder) / "output.log"
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 400_000))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return []
+
+
+def log_search_text(folder, pattern=None, mode="kw"):
+    lines = _read_log_lines(folder)
+    if not lines:
+        return "📄 No runtime log yet."
+    if mode == "err":
+        rx, title = _ERR_RE, "errors"
+    elif mode == "warn":
+        rx, title = _WARN_RE, "warnings & errors"
+    else:
+        try:
+            rx = re.compile(re.escape(pattern), re.I)
+        except Exception:
+            return "❌ Bad search text."
+        title = f"“{pattern[:30]}”"
+    hits = [l for l in lines if rx.search(l)]
+    if not hits:
+        return f"🔎 No matches for {title} in the last {len(lines)} log lines."
+    out, total = [], 0
+    for l in reversed(hits):
+        l = l.replace("`", "'")[:220]
+        if total + len(l) > 3200:
+            break
+        out.append(l)
+        total += len(l) + 1
+    out.reverse()
+    return (f"🔎 *{len(hits)} match(es) for {title}* (showing last {len(out)})\n```\n" + "\n".join(out) + "\n```")
+
+
+# ---------------------------------------------------------------- promo codes / receipts
+def redeem_promo(user_id, code):
+    code = (code or "").strip().upper()
+    r = db_execute("SELECT kind, value, max_uses, used, expires_at, active FROM promo_codes WHERE code = ?",
+                   (code,), fetch='one')
+    if not r or not r[5]:
+        return False, "❌ That promo code isn't valid."
+    kind, value, max_uses, used, exp, _a = r
+    if exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now():
+                return False, "⌛ That promo code has expired."
+        except Exception:
+            pass
+    if max_uses and used >= max_uses:
+        return False, "🔒 That promo code has been fully used."
+    if db_execute("SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ?", (code, user_id), fetch='one'):
+        return False, "ℹ️ You've already used that code."
+    if kind == "discount":
+        db_execute("INSERT INTO user_discounts (user_id, percent, code) VALUES (?, ?, ?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET percent = excluded.percent, code = excluded.code",
+                   (user_id, int(value), code))
+        msg = f"🏷️ *{int(value)}% discount* saved — it's applied automatically to your next coin payment."
+    else:
+        update_user_coins(user_id, int(value), "promo_code", code)
+        msg = f"🪙 *+{int(value)} coins* added to your balance!"
+    db_execute("INSERT INTO promo_redemptions (code, user_id, ts) VALUES (?, ?, ?)",
+               (code, user_id, datetime.now().isoformat(timespec='seconds')))
+    db_execute("UPDATE promo_codes SET used = used + 1 WHERE code = ?", (code,))
+    return True, f"✅ Code `{code}` accepted!\n\n{msg}"
+
+
+def apply_discount_cashback(user_id, cost_coins):
+    """After a successful coin payment: return the saved discount % of it as coins (one-time). -> coins refunded."""
+    try:
+        r = db_execute("SELECT percent, code FROM user_discounts WHERE user_id = ?", (user_id,), fetch='one')
+        if not r or not cost_coins or cost_coins <= 0:
+            return 0
+        back = int(cost_coins * min(90, int(r[0])) // 100)
+        db_execute("DELETE FROM user_discounts WHERE user_id = ?", (user_id,))
+        if back > 0:
+            update_user_coins(user_id, back, "promo_discount", r[1])
+            send_message(user_id, f"🏷️ Promo `{r[1]}`: *{r[0]}% off* applied — `{back}🪙` returned to your balance.")
+        return back
+    except Exception as e:
+        print(f"⚠️ cashback: {e}")
+        return 0
+
+
+def _tx_rows(user_id, limit=15):
+    rows = []
+    for tbl, cur in (("coin_transactions", "🪙"), ("star_transactions", "⭐")):
+        for tid, amt, typ, src, ts in (db_execute(
+                f"SELECT transaction_id, amount, transaction_type, source, timestamp FROM {tbl} WHERE user_id = ? "
+                f"ORDER BY transaction_id DESC LIMIT ?", (user_id, limit), fetch='all') or []):
+            rows.append((str(ts or ""), tid, amt, cur, typ, src, "C" if cur == "🪙" else "S"))
+    rows.sort(reverse=True)
+    return rows[:limit]
+
+
+def payment_history_text(user_id):
+    rows = _tx_rows(user_id)
+    if not rows:
+        return "🧾 *PAYMENT HISTORY*\n\nNo transactions yet."
+    out = ["🧾 *PAYMENT HISTORY* (latest)\n"]
+    for ts, tid, amt, cur, typ, src, k in rows:
+        sign = "+" if (amt or 0) > 0 else ""
+        out.append(f"`{ts[:16]}` {sign}{amt}{cur} · {typ}" + (f" ({src})" if src else "") + f" · RCP-{k}{tid}")
+    return "\n".join(out)[:3900]
+
+
+def send_receipts_file(chat_id, user_id):
+    rows = _tx_rows(user_id, 200)
+    if not rows:
+        send_message(chat_id, "🧾 Nothing to export yet.")
+        return
+    lines = [f"RECEIPTS — user {user_id}", f"Generated {datetime.now():%Y-%m-%d %H:%M}", "=" * 50]
+    for ts, tid, amt, cur, typ, src, k in rows:
+        lines.append(f"RCP-{k}{tid} | {ts[:19]} | {amt:+d} {'coins' if cur == '🪙' else 'stars'} | {typ} | {src or '-'}")
+    p = Path(tempfile.mkdtemp(prefix="rc_")) / "receipts.txt"
+    p.write_text("\n".join(lines) + "\n")
+    try:
+        send_document(chat_id, str(p), "🧾 Your receipts", "receipts.txt")
+    finally:
+        shutil.rmtree(p.parent, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- languages
+LANGS = {"en": "🇬🇧 English", "es": "🇪🇸 Español", "fr": "🇫🇷 Français", "pt": "🇧🇷 Português",
+         "ru": "🇷🇺 Русский", "ar": "🇸🇦 العربية"}
+_TR = {
+    "es": {"Deploy New Bot": "Desplegar nuevo bot", "Deploy from GitHub": "Desplegar desde GitHub",
+           "Free Deployment": "Despliegue gratis", "My Deployments": "Mis despliegues", "Back": "Atrás",
+           "Menu": "Menú", "Delete Deployment": "Eliminar despliegue", "Stop Bot": "Detener bot",
+           "Restart": "Reiniciar", "Download Backup (zip)": "Descargar copia (zip)",
+           "View Install Logs": "Ver logs de instalación", "View Runtime Logs": "Ver logs de ejecución",
+           "Refresh stats": "Actualizar estadísticas", "Cancel": "Cancelar", "Yes, Delete": "Sí, eliminar",
+           "DEPLOYMENT": "DESPLIEGUE", "Status:": "Estado:", "Expires:": "Expira:", "Remaining:": "Restante:",
+           "Started:": "Inicio:", "Plan:": "Plan:", "Cost:": "Costo:", "Framework:": "Framework:",
+           "Environment Variables:": "Variables de entorno:", "Requirements:": "Requisitos:",
+           "LIVE STATS": "ESTADÍSTICAS EN VIVO", "Uptime:": "Tiempo activo:", "ACTIVE": "ACTIVO",
+           "STOPPED": "DETENIDO", "PAUSED": "PAUSADO", "YOUR BALANCE": "TU SALDO", "Admin Panel": "Panel admin",
+           "Language": "Idioma", "Promo Code": "Código promo", "Payment History": "Historial de pagos",
+           "More": "Más", "Shared with me": "Compartidos conmigo", "Tools": "Herramientas",
+           "Session expired": "Sesión expirada", "Get Premium": "Obtener Premium"},
+    "fr": {"Deploy New Bot": "Déployer un bot", "Deploy from GitHub": "Déployer depuis GitHub",
+           "Free Deployment": "Déploiement gratuit", "My Deployments": "Mes déploiements", "Back": "Retour",
+           "Menu": "Menu", "Delete Deployment": "Supprimer le déploiement", "Stop Bot": "Arrêter le bot",
+           "Restart": "Redémarrer", "Download Backup (zip)": "Télécharger la sauvegarde (zip)",
+           "View Install Logs": "Logs d'installation", "View Runtime Logs": "Logs d'exécution",
+           "Refresh stats": "Actualiser", "Cancel": "Annuler", "Yes, Delete": "Oui, supprimer",
+           "DEPLOYMENT": "DÉPLOIEMENT", "Status:": "Statut :", "Expires:": "Expire :", "Remaining:": "Restant :",
+           "Started:": "Début :", "Plan:": "Offre :", "Cost:": "Coût :", "Framework:": "Framework :",
+           "Environment Variables:": "Variables d'environnement :", "Requirements:": "Dépendances :",
+           "LIVE STATS": "STATS EN DIRECT", "Uptime:": "Disponibilité :", "ACTIVE": "ACTIF",
+           "STOPPED": "ARRÊTÉ", "PAUSED": "EN PAUSE", "YOUR BALANCE": "VOTRE SOLDE", "Admin Panel": "Panneau admin",
+           "Language": "Langue", "Promo Code": "Code promo", "Payment History": "Historique des paiements",
+           "More": "Plus", "Shared with me": "Partagés avec moi", "Tools": "Outils",
+           "Session expired": "Session expirée", "Get Premium": "Passer Premium"},
+    "pt": {"Deploy New Bot": "Implantar novo bot", "Deploy from GitHub": "Implantar do GitHub",
+           "Free Deployment": "Implantação grátis", "My Deployments": "Minhas implantações", "Back": "Voltar",
+           "Menu": "Menu", "Delete Deployment": "Excluir implantação", "Stop Bot": "Parar bot",
+           "Restart": "Reiniciar", "Download Backup (zip)": "Baixar backup (zip)",
+           "View Install Logs": "Logs de instalação", "View Runtime Logs": "Logs de execução",
+           "Refresh stats": "Atualizar", "Cancel": "Cancelar", "Yes, Delete": "Sim, excluir",
+           "DEPLOYMENT": "IMPLANTAÇÃO", "Status:": "Status:", "Expires:": "Expira:", "Remaining:": "Restante:",
+           "Started:": "Início:", "Plan:": "Plano:", "Cost:": "Custo:", "Framework:": "Framework:",
+           "Environment Variables:": "Variáveis de ambiente:", "Requirements:": "Requisitos:",
+           "LIVE STATS": "ESTATÍSTICAS AO VIVO", "Uptime:": "Tempo ativo:", "ACTIVE": "ATIVO",
+           "STOPPED": "PARADO", "PAUSED": "PAUSADO", "YOUR BALANCE": "SEU SALDO", "Admin Panel": "Painel admin",
+           "Language": "Idioma", "Promo Code": "Código promo", "Payment History": "Histórico de pagamentos",
+           "More": "Mais", "Shared with me": "Compartilhados comigo", "Tools": "Ferramentas",
+           "Session expired": "Sessão expirada", "Get Premium": "Obter Premium"},
+    "ru": {"Deploy New Bot": "Развернуть бота", "Deploy from GitHub": "Развернуть из GitHub",
+           "Free Deployment": "Бесплатный деплой", "My Deployments": "Мои деплои", "Back": "Назад",
+           "Menu": "Меню", "Delete Deployment": "Удалить деплой", "Stop Bot": "Остановить бота",
+           "Restart": "Перезапуск", "Download Backup (zip)": "Скачать бэкап (zip)",
+           "View Install Logs": "Логи установки", "View Runtime Logs": "Логи работы",
+           "Refresh stats": "Обновить", "Cancel": "Отмена", "Yes, Delete": "Да, удалить",
+           "DEPLOYMENT": "ДЕПЛОЙ", "Status:": "Статус:", "Expires:": "Истекает:", "Remaining:": "Осталось:",
+           "Started:": "Запущен:", "Plan:": "План:", "Cost:": "Цена:", "Framework:": "Фреймворк:",
+           "Environment Variables:": "Переменные окружения:", "Requirements:": "Зависимости:",
+           "LIVE STATS": "СТАТИСТИКА", "Uptime:": "Аптайм:", "ACTIVE": "АКТИВЕН",
+           "STOPPED": "ОСТАНОВЛЕН", "PAUSED": "НА ПАУЗЕ", "YOUR BALANCE": "ВАШ БАЛАНС", "Admin Panel": "Админ-панель",
+           "Language": "Язык", "Promo Code": "Промокод", "Payment History": "История платежей",
+           "More": "Ещё", "Shared with me": "Доступные мне", "Tools": "Инструменты",
+           "Session expired": "Сессия истекла", "Get Premium": "Получить Premium"},
+    "ar": {"Deploy New Bot": "نشر بوت جديد", "Deploy from GitHub": "النشر من GitHub",
+           "Free Deployment": "نشر مجاني", "My Deployments": "عمليات النشر الخاصة بي", "Back": "رجوع",
+           "Menu": "القائمة", "Delete Deployment": "حذف النشر", "Stop Bot": "إيقاف البوت",
+           "Restart": "إعادة تشغيل", "Download Backup (zip)": "تنزيل نسخة احتياطية (zip)",
+           "View Install Logs": "سجلات التثبيت", "View Runtime Logs": "سجلات التشغيل",
+           "Refresh stats": "تحديث", "Cancel": "إلغاء", "Yes, Delete": "نعم، احذف",
+           "DEPLOYMENT": "النشر", "Status:": "الحالة:", "Expires:": "ينتهي:", "Remaining:": "المتبقي:",
+           "Started:": "بدأ:", "Plan:": "الخطة:", "Cost:": "التكلفة:", "Framework:": "الإطار:",
+           "Environment Variables:": "متغيرات البيئة:", "Requirements:": "المتطلبات:",
+           "LIVE STATS": "إحصائيات مباشرة", "Uptime:": "مدة التشغيل:", "ACTIVE": "نشط",
+           "STOPPED": "متوقف", "PAUSED": "متوقف مؤقتًا", "YOUR BALANCE": "رصيدك", "Admin Panel": "لوحة المشرف",
+           "Language": "اللغة", "Promo Code": "رمز ترويجي", "Payment History": "سجل المدفوعات",
+           "More": "المزيد", "Shared with me": "مشاركة معي", "Tools": "الأدوات",
+           "Session expired": "انتهت الجلسة", "Get Premium": "احصل على بريميوم"},
+}
+
+_TR_EXTRA = {
+ "es": {"Search logs": "Buscar en logs", "Usage": "Uso", "Schedule": "Programar", "Health check": "Chequeo de salud",
+        "Auto-deploy": "Auto-despliegue", "Share": "Compartir", "Versions / rollback": "Versiones / revertir",
+        "Restore zip": "Restaurar zip", "Maintenance": "Mantenimiento", "Promo Codes": "Códigos promo",
+        "Audit Log": "Registro de auditoría", "Are you sure?": "¿Seguro?", "Yes": "Sí", "Errors only": "Solo errores",
+        "Full log": "Log completo", "Roll back": "Revertir", "Continue": "Continuar", "Turn off": "Desactivar",
+        "Turn on": "Activar", "Add by user ID": "Añadir por ID", "Save one now": "Guardar uno ahora"},
+ "fr": {"Search logs": "Chercher dans les logs", "Usage": "Utilisation", "Schedule": "Planifier", "Health check": "Contrôle de santé",
+        "Auto-deploy": "Déploiement auto", "Share": "Partager", "Versions / rollback": "Versions / retour arrière",
+        "Restore zip": "Restaurer un zip", "Maintenance": "Maintenance", "Promo Codes": "Codes promo",
+        "Audit Log": "Journal d'audit", "Are you sure?": "Êtes-vous sûr ?", "Yes": "Oui", "Errors only": "Erreurs seulement",
+        "Full log": "Log complet", "Roll back": "Revenir", "Continue": "Continuer", "Turn off": "Désactiver",
+        "Turn on": "Activer", "Add by user ID": "Ajouter par ID", "Save one now": "En sauvegarder un"},
+ "pt": {"Search logs": "Buscar nos logs", "Usage": "Uso", "Schedule": "Agendar", "Health check": "Verificação de saúde",
+        "Auto-deploy": "Auto-implantação", "Share": "Compartilhar", "Versions / rollback": "Versões / reverter",
+        "Restore zip": "Restaurar zip", "Maintenance": "Manutenção", "Promo Codes": "Códigos promo",
+        "Audit Log": "Registro de auditoria", "Are you sure?": "Tem certeza?", "Yes": "Sim", "Errors only": "Só erros",
+        "Full log": "Log completo", "Roll back": "Reverter", "Continue": "Continuar", "Turn off": "Desativar",
+        "Turn on": "Ativar", "Add by user ID": "Adicionar por ID", "Save one now": "Salvar um agora"},
+ "ru": {"Search logs": "Поиск по логам", "Usage": "Нагрузка", "Schedule": "Расписание", "Health check": "Проверка здоровья",
+        "Auto-deploy": "Автодеплой", "Share": "Поделиться", "Versions / rollback": "Версии / откат",
+        "Restore zip": "Восстановить из zip", "Maintenance": "Техобслуживание", "Promo Codes": "Промокоды",
+        "Audit Log": "Журнал аудита", "Are you sure?": "Вы уверены?", "Yes": "Да", "Errors only": "Только ошибки",
+        "Full log": "Полный лог", "Roll back": "Откатить", "Continue": "Продолжить", "Turn off": "Выключить",
+        "Turn on": "Включить", "Add by user ID": "Добавить по ID", "Save one now": "Сохранить сейчас"},
+ "ar": {"Search logs": "بحث في السجلات", "Usage": "الاستخدام", "Schedule": "جدولة", "Health check": "فحص الصحة",
+        "Auto-deploy": "نشر تلقائي", "Share": "مشاركة", "Versions / rollback": "الإصدارات / تراجع",
+        "Restore zip": "استعادة zip", "Maintenance": "الصيانة", "Promo Codes": "رموز ترويجية",
+        "Audit Log": "سجل التدقيق", "Are you sure?": "هل أنت متأكد؟", "Yes": "نعم", "Errors only": "الأخطاء فقط",
+        "Full log": "السجل الكامل", "Roll back": "تراجع", "Continue": "متابعة", "Turn off": "إيقاف",
+        "Turn on": "تشغيل", "Add by user ID": "إضافة بالمعرّف", "Save one now": "احفظ الآن"},
+}
+for _l, _d in _TR_EXTRA.items():
+    _TR[_l].update(_d)
+
+_tr_rx = {}
+_lang_cache = {}
+
+
+def user_lang(chat_id):
+    try:
+        cid = int(chat_id)
+    except Exception:
+        return "en"
+    hit = _lang_cache.get(cid)
+    if hit and time.time() - hit[1] < 120:
+        return hit[0]
+    r = db_execute("SELECT lang FROM users WHERE user_id = ?", (cid,), fetch='one') if cid > 0 else None
+    lang = (r[0] if r and r[0] else "en")
+    _lang_cache[cid] = (lang, time.time())
+    return lang
+
+
+def set_user_lang(user_id, lang):
+    db_execute("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id))
+    _lang_cache[int(user_id)] = (lang, time.time())
+
+
+def _tr_text(lang, s):
+    tbl = _TR.get(lang)
+    if not tbl or not s:
+        return s
+    rx = _tr_rx.get(lang)
+    if rx is None:
+        keys = sorted(tbl, key=len, reverse=True)
+        rx = _tr_rx[lang] = re.compile(r'(?<![\w`])(' + '|'.join(re.escape(k) for k in keys) + r')(?![\w`])')
+    return rx.sub(lambda m: tbl[m.group(1)], s)
+
+
+def localize(chat_id, text, keyboard):
+    """Translate common UI phrases for users whose language isn't English."""
+    try:
+        lang = user_lang(chat_id)
+        if lang == "en" or lang not in _TR:
+            return text, keyboard
+        text = _tr_text(lang, text)
+        if keyboard and keyboard.get("inline_keyboard"):
+            keyboard = {"inline_keyboard": [[dict(b, text=_tr_text(lang, b.get("text", ""))) for b in row]
+                                            for row in keyboard["inline_keyboard"]]}
+    except Exception:
+        pass
+    return text, keyboard
+
+
+# ---------------------------------------------------------------- sharing / permissions
+_SHARE_ALLOWED = re.compile(r'^(view_deploy|restart_deploy|stop_deploy|view_runtime_logs|view_install_logs|'
+                            r'fp_logs|fp_lgm|fp_lgk|fp_usage)_(\d+)(?:_\d+)?$')
+
+
+def _fp_share_remap(callback):
+    """If a collaborator presses an allowed button for a bot shared with them, act as the owner for that call."""
+    try:
+        data = callback.get('data') or ''
+        m = _SHARE_ALLOWED.match(data)
+        if not m:
+            return callback
+        uid = callback['from']['id']
+        dep_id = int(m.group(2))
+        d = _fp_dep(dep_id)
+        if not d or d["owner"] == uid or get_ban_info(uid):
+            return callback
+        if not db_execute("SELECT 1 FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one'):
+            return callback
+        cb = dict(callback)
+        cb['from'] = dict(callback['from'], id=d["owner"])
+        _fp_ctx.shared = True
+        audit(uid, "shared_action", dep_id, data)
+        return cb
+    except Exception:
+        return callback
+
+
+def _fp_filter_shared_kb(keyboard, dep_id):
+    """For a collaborator: keep only the actions they're allowed to use."""
+    if not getattr(_fp_ctx, 'shared', False) or not keyboard:
+        return keyboard
+    keep = []
+    for row in keyboard["inline_keyboard"]:
+        row = [b for b in row if _SHARE_ALLOWED.match(b.get("callback_data", "")) and not b["callback_data"].startswith("edit_")]
+        if row:
+            keep.append(row)
+    keep.append([_fp_btn("🔎 Search logs", f"fp_logs_{dep_id}"), _fp_btn("📈 Usage", f"fp_usage_{dep_id}")])
+    keep.append([_fp_btn("🤝 Shared with me", "fp_shared")])
+    return {"inline_keyboard": keep}
+
+
+# ---------------------------------------------------------------- confirmation gate
+_CONFIRM = (
+    (re.compile(r'^stop_deploy_(\d+)$'), "🛑 *Stop this bot?*\n\nIt will go offline until you restart it.", "view_deploy_{0}"),
+    (re.compile(r'^edit_envdel_(\d+)_\w+$'), "🗑️ *Delete this environment variable?*", "edit_env_{0}"),
+)
+
+
+def _fp_confirm_gate(callback):
+    """-> True if a confirmation prompt was shown (caller stops). 'fpc:<data>' = confirmed → unwraps."""
+    data = callback.get('data') or ''
+    msg = callback.get('message') or {}
+    chat_id, mid = (msg.get('chat') or {}).get('id'), msg.get('message_id')
+    if data.startswith("fpc:"):
+        callback['data'] = data[4:]
+        return False
+    for rx, text, back in _CONFIRM:
+        m = rx.match(data)
+        if m and len(data) < 58:
+            answer_callback(callback['id'])
+            edit_message(chat_id, mid, text, _fp_kb([_fp_btn("✅ Yes", "fpc:" + data),
+                                                    _fp_btn("❌ Cancel", back.format(*m.groups()))]))
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- audit of admin callbacks
+_ADMIN_ACT = re.compile(r'(approve|reject|unban|ban|delete|revoke|grant|add_|create|restore|broadcast|confirm|'
+                        r'toggle|refund|reset|remove|send|kick|reply|resolve)', re.I)
+
+
+def _fp_audit_cb(uid, data):
+    if is_admin(uid) and data.startswith(("admin_", "sec_", "bug_")) and _ADMIN_ACT.search(data):
+        audit(uid, "admin_click", data[:40], "")
+
+
+# ---------------------------------------------------------------- UI screens
+def fp_more_menu(chat_id, message_id):
+    edit_message(chat_id, message_id, "*🧰 MORE*\n\nExtras for your account.", _fp_kb(
+        [_fp_btn("🎟️ Promo Code", "fp_promo"), _fp_btn("🧾 Payment History", "fp_history")],
+        [_fp_btn("🌐 Language", "fp_lang"), _fp_btn("🤝 Shared with me", "fp_shared")],
+        [_fp_btn("🔙 Menu", "main_menu")]))
+
+
+def fp_tools_menu(chat_id, message_id, uid, dep_id):
+    d = _fp_own(uid, dep_id)
+    if not d:
+        edit_message(chat_id, message_id, "❌ Not found", _fp_kb([_fp_btn("🔙 Back", "my_deployments")]))
+        return
+    st = _fp_settings(dep_id)
+    sched = f"every {st['restart_hours']}h" if st["restart_hours"] else "off"
+    edit_message(chat_id, message_id, f"*🛠 TOOLS — #{dep_id}*\n\n"
+                 f"⏰ Scheduled restart: `{sched}`\n🩺 Health check: `{'on' if st['health_url'] else 'off'}`\n"
+                 f"🔗 Auto-deploy: `{'on' if st['auto'] else 'off'}`\n"
+                 f"🕘 Rollback points: `{len(snapshot_list(dep_id))}`",
+                 _fp_kb([_fp_btn("🔎 Search logs", f"fp_logs_{dep_id}"), _fp_btn("📈 Usage", f"fp_usage_{dep_id}")],
+                        [_fp_btn("⏰ Schedule", f"fp_sched_{dep_id}"), _fp_btn("🩺 Health check", f"fp_health_{dep_id}")],
+                        [_fp_btn("🔗 Auto-deploy", f"fp_hook_{dep_id}"), _fp_btn("🤝 Share", f"fp_share_{dep_id}")],
+                        [_fp_btn("🕘 Versions / rollback", f"fp_ver_{dep_id}"), _fp_btn("♻️ Restore zip", f"fp_restore_{dep_id}")],
+                        [_fp_btn("🔙 Deployment", f"view_deploy_{dep_id}")]))
+
+
+def fp_sched_menu(chat_id, message_id, dep_id, note=""):
+    st = _fp_settings(dep_id)
+    cur = st["restart_hours"]
+    mk = lambda h, t: _fp_btn(("✅ " if cur == h else "") + t, f"fp_schedset_{dep_id}_{h}")
+    edit_message(chat_id, message_id, f"*⏰ SCHEDULED RESTART*\n\nRestart this bot automatically on a timer — handy "
+                 f"for bots that leak memory or need a fresh start.\n\nNow: `{'every ' + str(cur) + 'h' if cur else 'off'}`{note}",
+                 _fp_kb([mk(0, "Off"), mk(6, "6h"), mk(12, "12h")], [mk(24, "24h"), mk(72, "3 days"), mk(168, "7 days")],
+                        [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+
+
+def fp_health_menu(chat_id, message_id, dep_id):
+    d, st = _fp_dep(dep_id), _fp_settings(dep_id)
+    cur = st["health_url"]
+    shown = ("this bot's own PORT" if cur == "local" else cur) if cur else "off"
+    port = d["env"].get("PORT") or d["env"].get("BOT_PORT")
+    rows = [[_fp_btn("🌐 Set URL", f"fp_healthurl_{dep_id}")]]
+    if port:
+        rows.append([_fp_btn(f"🔌 Use my PORT ({port})", f"fp_healthlocal_{dep_id}")])
+    if cur:
+        rows.append([_fp_btn("🗑️ Turn off", f"fp_healthoff_{dep_id}")])
+    has_tok = bool(_telegram_token(d["env"]))
+    if has_tok:
+        rows.append([_fp_btn(("🟢 Hang detection: ON" if not st["hang_off"] else "⚪ Hang detection: OFF"), f"fp_hangtog_{dep_id}")])
+    rows.append([_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")])
+    edit_message(chat_id, message_id, f"*🩺 HEALTH CHECK*\n\nIf your bot serves a web page/endpoint, I'll ping it every "
+                 f"2 minutes. After 3 failures in a row I restart the bot and send you the last log lines. "
+                 f"A zombie (dead-but-listed) process also triggers a restart.\n\n"
+                 f"*Telegram polling bots* (no web page) are covered too: if I see your bot's update queue growing for "
+                 f"~6 minutes it isn't reading messages, so I restart it ({'auto-detected token ✅' if has_tok else 'no bot token found in env'}).\n\n"
+                 f"Now: `{shown}`\n\n"
+                 f"_Only public http(s) URLs are allowed._", _fp_kb(*rows))
+
+
+def fp_hook_menu(chat_id, message_id, dep_id):
+    d, st = _fp_dep(dep_id), _fp_settings(dep_id)
+    if d["source"] != "github" and not d["repo"]:
+        edit_message(chat_id, message_id, "*🔗 AUTO-DEPLOY*\n\nThis works for bots deployed *from GitHub*. "
+                     "Redeploy this bot from a repo to use it.", _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+        return
+    base = _public_base_url() or "https://YOUR-HOST.onrender.com"
+    info = ""
+    if st["auto"]:
+        info = (f"\n\n*Add this webhook in GitHub → Settings → Webhooks:*\n"
+                f"Payload URL:\n`{base}/gh/{dep_id}`\nContent type: `application/json`\n"
+                f"Secret:\n`{st['secret']}`\nEvents: *Just the push event*")
+    edit_message(chat_id, message_id, f"*🔗 AUTO-DEPLOY ON PUSH*\n\nRepo: `{d['repo']}` (branch `{d['branch']}`)\n"
+                 f"Status: `{'ON' if st['auto'] else 'OFF'}`\n\nEvery push redeploys the bot — checked by the security "
+                 f"scan first, with an automatic rollback point.{info}",
+                 _fp_kb([_fp_btn("🔴 Turn off" if st["auto"] else "🟢 Turn on", f"fp_hooktog_{dep_id}")],
+                        *([[_fp_btn("🔑 New secret", f"fp_hooknew_{dep_id}")]] if st["auto"] else []),
+                        [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+
+
+def fp_logs_menu(chat_id, message_id, dep_id):
+    edit_message(chat_id, message_id, f"*🔎 LOG SEARCH — #{dep_id}*\n\nSearch the runtime log or filter it.",
+                 _fp_kb([_fp_btn("🔤 Search keyword", f"fp_lgk_{dep_id}")],
+                        [_fp_btn("❗ Errors only", f"fp_lgm_{dep_id}_1"), _fp_btn("⚠️ Warnings+", f"fp_lgm_{dep_id}_2")],
+                        [_fp_btn("📥 Full log", f"view_runtime_logs_{dep_id}")],
+                        [_fp_btn("🔙 Back", f"view_deploy_{dep_id}")]))
+
+
+def fp_share_menu(chat_id, message_id, uid, dep_id):
+    d = _fp_own(uid, dep_id)
+    if not d:
+        return
+    rows = db_execute("SELECT s.user_id, COALESCE(u.username, u.first_name, '') FROM dep_shares s "
+                      "LEFT JOIN users u ON u.user_id = s.user_id WHERE s.deployment_id = ?", (dep_id,), fetch='all') or []
+    btns = [[_fp_btn(f"❌ {(n or '')[:14]} ({u})", f"fp_unshare_{dep_id}_{u}")] for u, n in rows]
+    edit_message(chat_id, message_id, f"*🤝 SHARE BOT #{dep_id}*\n\nCo-owners can view the bot, read its logs and usage, "
+                 f"and stop/restart it. They can't edit, delete or see your env vars.\n\nShared with: "
+                 f"`{len(rows)}`", _fp_kb(*btns, [_fp_btn("➕ Add by user ID", f"fp_shareadd_{dep_id}")],
+                                          [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+
+
+def fp_versions_menu(chat_id, message_id, dep_id):
+    snaps = snapshot_list(dep_id)
+    rows = [[_fp_btn(f"⏪ {_snap_label(p)}"[:40], f"fp_rb_{dep_id}_{i}")] for i, p in enumerate(snaps)]
+    edit_message(chat_id, message_id, f"*🕘 VERSIONS — #{dep_id}*\n\nRollback points are saved automatically before "
+                 f"edits, restores and auto-deploys (last {SNAP_KEEP}).\n\n" + ("" if snaps else "_None yet._"),
+                 _fp_kb(*rows, [_fp_btn("📸 Save one now", f"fp_snap_{dep_id}")], [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+
+
+def fp_shared_list(chat_id, message_id, uid):
+    rows = db_execute("SELECT s.deployment_id, d.file_name, d.status FROM dep_shares s JOIN deployments d "
+                      "ON d.deployment_id = s.deployment_id WHERE s.user_id = ?", (uid,), fetch='all') or []
+    btns = [[_fp_btn(f"{'🟢' if st == 'active' else '🔴'} #{i} · {display_filename(f)}"[:40], f"view_deploy_{i}")]
+            for i, f, st in rows]
+    edit_message(chat_id, message_id, "*🤝 SHARED WITH ME*\n\n" + ("" if rows else "Nobody has shared a bot with you yet."),
+                 _fp_kb(*btns, [_fp_btn("🔙 More", "fp_more")]))
+
+
+def fp_lang_menu(chat_id, message_id, uid):
+    cur = user_lang(uid)
+    rows = [[_fp_btn(("✅ " if c == cur else "") + n, f"fp_setlang_{c}")] for c, n in LANGS.items()]
+    edit_message(chat_id, message_id, "*🌐 LANGUAGE*\n\nMenus and common labels will be shown in your language "
+                 "(some messages stay in English).", _fp_kb(*rows, [_fp_btn("🔙 More", "fp_more")]))
+
+
+def fp_admin_promo_menu(chat_id, message_id):
+    rows = db_execute("SELECT code, kind, value, max_uses, used, active FROM promo_codes ORDER BY rowid DESC LIMIT 10",
+                      fetch='all') or []
+    lines = [f"{'✅' if a else '❌'} `{c}` · {k} {v}{'%' if k == 'discount' else '🪙'} · {u}/{m or '∞'}"
+             for c, k, v, m, u, a in rows]
+    btns = [[_fp_btn(f"{'⏸ Disable' if a else '▶️ Enable'} {c}", f"fp_pctog_{c}")] for c, k, v, m, u, a in rows[:6]]
+    edit_message(chat_id, message_id, "*🏷️ PROMO CODES*\n\n" + ("\n".join(lines) or "_None yet._"),
+                 _fp_kb([_fp_btn("➕ New code", "fp_pcnew")], *btns, [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+
+
+def fp_admin_audit(chat_id, message_id, page=0):
+    page = max(0, int(page))
+    rows = db_execute("SELECT ts, actor, action, target, detail FROM audit_log ORDER BY id DESC LIMIT 12 OFFSET ?",
+                      (page * 12,), fetch='all') or []
+    lines = [f"`{ts[5:16]}` `{a}` {act} {tg} {dt}".strip()[:110] for ts, a, act, tg, dt in rows]
+    nav = []
+    if page:
+        nav.append(_fp_btn("⬅️ Newer", f"fp_audit_{page - 1}"))
+    if len(rows) == 12:
+        nav.append(_fp_btn("Older ➡️", f"fp_audit_{page + 1}"))
+    edit_message(chat_id, message_id, "*🧾 AUDIT LOG*\n\n" + ("\n".join(lines) or "_Empty._"),
+                 _fp_kb(nav, [_fp_btn("🔙 Admin Panel", "admin_panel")]) if nav else
+                 _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")]))
+
+
+def _fp_admin_rows():
+    on = maintenance_on()
+    return [[_fp_btn(f"🛠 Maintenance: {'ON 🔴' if on else 'OFF 🟢'}", "fp_maint")],
+            [_fp_btn("🏷️ Promo Codes", "fp_apromo"), _fp_btn("🧾 Audit Log", "fp_audit_0")]]
+
+
+# ---------------------------------------------------------------- callback router
+def _fp_pre_callback(callback):
+    """Runs first for every callback. -> True if fully handled here."""
+    data = callback.get('data') or ''
+    uid = callback['from']['id']
+    if get_ban_info(uid):
+        return False
+    msg = callback.get('message') or {}
+    chat_id, mid = (msg.get('chat') or {}).get('id'), msg.get('message_id')
+
+    step = get_user_step(uid).get('step') or ''
+    if step.startswith('fp_'):
+        set_user_step(uid, None)              # leaving a prompt cancels it
+
+    if not is_admin(uid) and maintenance_on() and data.startswith(_MAINT_BLOCKED):
+        answer_callback(callback['id'])
+        edit_message(chat_id, mid, MAINT_TEXT, _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+        return True
+
+    _fp_audit_cb(uid, data)
+    if _fp_confirm_gate(callback):
+        return True
+    data = callback.get('data') or ''
+    if not data.startswith("fp_"):
+        return False
+
+    answer_callback(callback['id'])
+    try:
+        return _fp_route(callback, data, uid, chat_id, mid)
+    except Exception as e:
+        print(f"❌ fp route {data}: {e}")
+        traceback.print_exc()
+        send_message(chat_id, "⚠️ Something went wrong with that. Please try again.")
+        return True
+
+
+def _fp_route(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    cmd = p[1] if len(p) > 1 else ""
+    dep_id = int(p[2]) if len(p) > 2 and p[2].isdigit() else None
+
+    # ---- account-level
+    if data == "fp_more":
+        fp_more_menu(chat_id, mid); return True
+    if data == "fp_promo":
+        set_user_step(uid, 'fp_promo')
+        edit_message(chat_id, mid, "*🎟️ PROMO CODE*\n\nSend your promo code as a message.",
+                     _fp_kb([_fp_btn("❌ Cancel", "fp_more")])); return True
+    if data == "fp_history":
+        edit_message(chat_id, mid, payment_history_text(uid),
+                     _fp_kb([_fp_btn("📄 Download receipts", "fp_receipts")], [_fp_btn("🔙 More", "fp_more")])); return True
+    if data == "fp_receipts":
+        send_receipts_file(chat_id, uid); return True
+    if data == "fp_lang":
+        fp_lang_menu(chat_id, mid, uid); return True
+    if cmd == "setlang" and len(p) == 3 and p[2] in LANGS:
+        set_user_lang(uid, p[2]); fp_lang_menu(chat_id, mid, uid); return True
+    if data == "fp_shared":
+        fp_shared_list(chat_id, mid, uid); return True
+
+    # ---- admin-level
+    if data in ("fp_maint", "fp_apromo", "fp_pcnew") or cmd in ("audit", "pctog"):
+        if not is_admin(uid):
+            return True
+        if data == "fp_maint":
+            kv_set("maintenance", "0" if maintenance_on() else "1")
+            audit(uid, "maintenance", "on" if maintenance_on() else "off")
+            show_admin_panel(chat_id, mid)
+        elif data == "fp_apromo":
+            fp_admin_promo_menu(chat_id, mid)
+        elif data == "fp_pcnew":
+            set_user_step(uid, 'fp_pcnew')
+            edit_message(chat_id, mid, "*➕ NEW PROMO CODE*\n\nSend one line:\n`CODE KIND VALUE [MAX_USES] [DAYS]`\n\n"
+                         "KIND = `coins` (bonus coins) or `discount` (percent off the user's next coin payment)\n"
+                         "Examples:\n`WELCOME50 coins 50 100 30`\n`SAVE20 discount 20 50`",
+                         _fp_kb([_fp_btn("❌ Cancel", "fp_apromo")]))
+        elif cmd == "pctog":
+            code = "_".join(p[2:])
+            db_execute("UPDATE promo_codes SET active = 1 - active WHERE code = ?", (code,))
+            audit(uid, "promo_toggle", code)
+            fp_admin_promo_menu(chat_id, mid)
+        else:
+            fp_admin_audit(chat_id, mid, int(p[2]) if len(p) > 2 and p[2].isdigit() else 0)
+        return True
+
+    # ---- per-deployment (owner/admin)
+    if dep_id is None:
+        return True
+    if cmd in ("logs", "usage", "lgm", "lgk"):      # also reachable by collaborators (remapped to owner)
+        d = _fp_own(uid, dep_id)
+        if not d:
+            edit_message(chat_id, mid, "❌ Not found", _fp_kb([_fp_btn("🔙 Back", "my_deployments")])); return True
+        if cmd == "logs":
+            fp_logs_menu(chat_id, mid, dep_id)
+        elif cmd == "lgk":
+            set_user_step(uid, 'fp_lgk', edit_dep=dep_id)
+            edit_message(chat_id, mid, "🔤 Send the text to search for in the log.",
+                         _fp_kb([_fp_btn("❌ Cancel", f"fp_logs_{dep_id}")]))
+        elif cmd == "lgm":
+            mode = "err" if (len(p) > 3 and p[3] == "1") else "warn"
+            edit_message(chat_id, mid, log_search_text(d["folder"], mode=mode),
+                         _fp_kb([_fp_btn("🔙 Log search", f"fp_logs_{dep_id}")]))
+        else:
+            hrs = 168 if (len(p) > 3 and p[3] == "168") else 24
+            edit_message(chat_id, mid, usage_text(dep_id, hrs),
+                         _fp_kb([_fp_btn("24h", f"fp_usage_{dep_id}_24"), _fp_btn("7d", f"fp_usage_{dep_id}_168")],
+                                [_fp_btn("🔙 Back", f"view_deploy_{dep_id}")]))
+        return True
+
+    d = _fp_own(uid, dep_id)
+    if not d:
+        edit_message(chat_id, mid, "❌ Not found", _fp_kb([_fp_btn("🔙 Back", "my_deployments")])); return True
+
+    if cmd == "tools":
+        fp_tools_menu(chat_id, mid, uid, dep_id)
+    elif cmd == "sched":
+        fp_sched_menu(chat_id, mid, dep_id)
+    elif cmd == "schedset" and len(p) > 3:
+        hrs = int(p[3]) if p[3].isdigit() and int(p[3]) in (0, 6, 12, 24, 72, 168) else 0
+        db_execute("UPDATE dep_settings SET restart_hours = ?, last_sched = ? WHERE deployment_id = ?",
+                   (hrs, datetime.now().isoformat() if hrs else None, dep_id))
+        _fp_settings(dep_id)
+        fp_sched_menu(chat_id, mid, dep_id, "\n\n✅ Saved." if hrs else "\n\n✅ Turned off.")
+    elif cmd == "health":
+        fp_health_menu(chat_id, mid, dep_id)
+    elif cmd == "healthurl":
+        set_user_step(uid, 'fp_healthurl', edit_dep=dep_id)
+        edit_message(chat_id, mid, "🌐 Send the public URL to ping (e.g. `https://mybot.example.com/health`).",
+                     _fp_kb([_fp_btn("❌ Cancel", f"fp_health_{dep_id}")]))
+    elif cmd == "healthlocal":
+        db_execute("UPDATE dep_settings SET health_url = 'local', health_fails = 0 WHERE deployment_id = ?", (dep_id,))
+        fp_health_menu(chat_id, mid, dep_id)
+    elif cmd == "hangtog":
+        db_execute("UPDATE dep_settings SET hang_off = 1 - COALESCE(hang_off, 0) WHERE deployment_id = ?", (dep_id,))
+        _pending_hist.pop(("s", dep_id), None)
+        fp_health_menu(chat_id, mid, dep_id)
+    elif cmd == "healthoff":
+        db_execute("UPDATE dep_settings SET health_url = NULL, health_fails = 0 WHERE deployment_id = ?", (dep_id,))
+        fp_health_menu(chat_id, mid, dep_id)
+    elif cmd == "hook":
+        fp_hook_menu(chat_id, mid, dep_id)
+    elif cmd in ("hooktog", "hooknew"):
+        st = _fp_settings(dep_id)
+        if cmd == "hooknew" or not st["auto"]:
+            db_execute("UPDATE dep_settings SET hook_secret = ? WHERE deployment_id = ?",
+                       (secrets.token_urlsafe(18), dep_id))
+        if cmd == "hooktog":
+            db_execute("UPDATE dep_settings SET auto_deploy = ? WHERE deployment_id = ?", (0 if st["auto"] else 1, dep_id))
+        fp_hook_menu(chat_id, mid, dep_id)
+    elif cmd == "share":
+        fp_share_menu(chat_id, mid, uid, dep_id)
+    elif cmd == "shareadd":
+        set_user_step(uid, 'fp_shareadd', edit_dep=dep_id)
+        edit_message(chat_id, mid, "➕ Send the Telegram *user ID* of the person to share with (they must have used "
+                     "this bot).", _fp_kb([_fp_btn("❌ Cancel", f"fp_share_{dep_id}")]))
+    elif cmd == "unshare" and len(p) > 3 and p[3].lstrip('-').isdigit():
+        db_execute("DELETE FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, int(p[3])))
+        audit(uid, "unshare", dep_id, p[3])
+        fp_share_menu(chat_id, mid, uid, dep_id)
+    elif cmd == "ver":
+        fp_versions_menu(chat_id, mid, dep_id)
+    elif cmd == "snap":
+        ok = snapshot_create(dep_id, "manual")
+        send_message(chat_id, "📸 Rollback point saved." if ok else "ℹ️ Nothing to save yet.")
+        fp_versions_menu(chat_id, mid, dep_id)
+    elif cmd == "rb" and len(p) > 3:
+        snaps = snapshot_list(dep_id)
+        i = int(p[3])
+        if i < len(snaps):
+            edit_message(chat_id, mid, f"⏪ *Roll back to* `{_snap_label(snaps[i])}`?\n\nCurrent files are saved as a new "
+                         f"rollback point first.", _fp_kb([_fp_btn("✅ Roll back", f"fp_rbok_{dep_id}_{i}"),
+                                                          _fp_btn("❌ Cancel", f"fp_ver_{dep_id}")]))
+    elif cmd == "rbok" and len(p) > 3:
+        snaps = snapshot_list(dep_id)
+        i = int(p[3])
+        if i < len(snaps):
+            ok, m = apply_zip_to_deployment(d, snaps[i], "rollback")
+            if ok:
+                m += "\n" + _edit_push(dep_id, "rollback")
+            edit_message(chat_id, mid, m, _edit_after_kb(dep_id) if ok else _fp_kb([_fp_btn("🔙 Versions", f"fp_ver_{dep_id}")]))
+    elif cmd == "restore":
+        if len(p) > 3 and p[3] == "go":
+            set_user_step(uid, 'fp_restore', edit_dep=dep_id)
+            edit_message(chat_id, mid, "♻️ Send your backup `.zip` (from *Download Backup*).",
+                         _fp_kb([_fp_btn("❌ Cancel", f"fp_tools_{dep_id}")]))
+        else:
+            edit_message(chat_id, mid, "♻️ *Restore from a zip?*\n\nFiles in the zip overwrite the current ones (a rollback "
+                         "point is saved first). It's scanned like any upload.",
+                         _fp_kb([_fp_btn("✅ Continue", f"fp_restore_{dep_id}_go"), _fp_btn("❌ Cancel", f"fp_tools_{dep_id}")]))
+    return True
+
+
+# ---------------------------------------------------------------- text / document steps
+def _fp_text(message, user_step):
+    """Text input for fp_* prompts. -> True if handled."""
+    step = user_step.get('step') or ''
+    if not step.startswith('fp_'):
+        return False
+    chat_id, uid = message['chat']['id'], message['from']['id']
+    text = (message.get('text') or '').strip()
+    if text.startswith('/'):
+        return False
+    dep_id = int(user_step['edit_dep']) if str(user_step.get('edit_dep') or '').isdigit() else None
+    set_user_step(uid, None)
+
+    if step == 'fp_promo':
+        ok, m = redeem_promo(uid, text)
+        send_message(chat_id, m, _fp_kb([_fp_btn("🔙 More", "fp_more")]))
+    elif step == 'fp_pcnew' and is_admin(uid):
+        parts = text.split()
+        try:
+            code, kind, val = parts[0].upper(), parts[1].lower(), int(parts[2])
+            mx = int(parts[3]) if len(parts) > 3 else 0
+            days = int(parts[4]) if len(parts) > 4 else 0
+            assert kind in ("coins", "discount") and val > 0 and re.fullmatch(r'[A-Z0-9_-]{3,24}', code)
+            if kind == "discount":
+                val = min(val, 90)
+        except Exception:
+            send_message(chat_id, "❌ Format: `CODE coins|discount VALUE [MAX_USES] [DAYS]`",
+                         _fp_kb([_fp_btn("➕ Try again", "fp_pcnew")]))
+            return True
+        exp = (datetime.now() + timedelta(days=days)).isoformat() if days else None
+        db_execute("INSERT OR REPLACE INTO promo_codes (code, kind, value, max_uses, used, expires_at, active, created_by) "
+                   "VALUES (?, ?, ?, ?, COALESCE((SELECT used FROM promo_codes WHERE code = ?), 0), ?, 1, ?)",
+                   (code, kind, val, mx, code, exp, uid))
+        audit(uid, "promo_create", code, f"{kind} {val} max={mx} days={days}")
+        send_message(chat_id, f"✅ Promo `{code}` created.", _fp_kb([_fp_btn("🏷️ Promo codes", "fp_apromo")]))
+    elif step == 'fp_lgk' and dep_id:
+        d = _fp_own(uid, dep_id) or (_fp_dep(dep_id) if db_execute(
+            "SELECT 1 FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one') else None)
+        if d:
+            send_message(chat_id, log_search_text(d["folder"], text[:80]), _fp_kb([_fp_btn("🔙 Log search", f"fp_logs_{dep_id}")]))
+    elif step == 'fp_healthurl' and dep_id and _fp_own(uid, dep_id):
+        if _url_is_public(text):
+            db_execute("UPDATE dep_settings SET health_url = ?, health_fails = 0 WHERE deployment_id = ?", (text[:300], dep_id))
+            send_message(chat_id, "✅ Health check saved.", _fp_kb([_fp_btn("🩺 Health check", f"fp_health_{dep_id}")]))
+        else:
+            send_message(chat_id, "❌ That must be a *public* http(s) URL (private/internal addresses aren't allowed).",
+                         _fp_kb([_fp_btn("🔁 Try again", f"fp_healthurl_{dep_id}")]))
+    elif step == 'fp_shareadd' and dep_id and _fp_own(uid, dep_id):
+        d = _fp_dep(dep_id)
+        if text.lstrip('-').isdigit() and db_execute("SELECT 1 FROM users WHERE user_id = ?", (int(text),), fetch='one') \
+                and int(text) != d["owner"] and not get_ban_info(int(text)):
+            db_execute("INSERT OR IGNORE INTO dep_shares (deployment_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+                       (dep_id, int(text), uid, datetime.now().isoformat(timespec='seconds')))
+            audit(uid, "share", dep_id, text)
+            send_message(int(text), f"🤝 A bot (#{dep_id}) was shared with you. You can view it, read its logs/usage and "
+                                    f"restart it.", _fp_kb([_fp_btn("🤝 Shared with me", "fp_shared")]))
+            send_message(chat_id, "✅ Shared.", _fp_kb([_fp_btn("🤝 Sharing", f"fp_share_{dep_id}")]))
+        else:
+            send_message(chat_id, "❌ No such user (they must have started this bot).",
+                         _fp_kb([_fp_btn("🔁 Try again", f"fp_shareadd_{dep_id}")]))
+    return True
+
+
+def _fp_document(message, user_step, doc, file_name):
+    """Documents for fp_restore, and .env files for any env-entry step. -> True if handled."""
+    chat_id, uid = message['chat']['id'], message['from']['id']
+    step = user_step.get('step') or ''
+    lname = (file_name or '').lower()
+    if step == 'fp_restore' and user_step.get('edit_dep'):
+        dep_id = int(user_step['edit_dep'])
+        d = _fp_own(uid, dep_id)
+        if not d:
+            set_user_step(uid, None); send_message(chat_id, "❌ Deployment not found"); return True
+        if not lname.endswith('.zip'):
+            send_message(chat_id, "❌ Please send a `.zip` backup."); return True
+        raw = _download_telegram_file_bytes(doc.get("file_id"))
+        if raw is None:
+            send_message(chat_id, "❌ Could not download the file from Telegram."); return True
+        set_user_step(uid, None)
+        tmpz = Path(tempfile.mkdtemp(prefix="rz_")) / "r.zip"
+        try:
+            tmpz.write_bytes(raw)
+            ok, m = apply_zip_to_deployment(d, tmpz, "restore")
+        finally:
+            shutil.rmtree(tmpz.parent, ignore_errors=True)
+        if ok:
+            m += "\n" + _edit_push(dep_id, "restore")
+            audit(uid, "restore_zip", dep_id)
+        send_message(chat_id, m, _edit_after_kb(dep_id) if ok else _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+        return True
+    env_name = lname in ('.env', 'env', 'env.txt', 'dotenv') or lname.endswith('.env')
+    wants_env = step in ('edit_env', 'awaiting_env', 'awaiting_env_vars') or user_step.get('waiting_for_env') == 1
+    if env_name and wants_env:
+        raw = _download_telegram_file_bytes(doc.get("file_id"))
+        if raw is None:
+            send_message(chat_id, "❌ Could not download the file from Telegram."); return True
+        fake = {k: v for k, v in message.items() if k not in ('document', 'caption')}
+        fake['text'] = raw.decode('utf-8', 'replace')[:20000]
+        send_message(chat_id, "📄 Importing variables from your `.env` file…")
+        handle_message(fake)
+        return True
+    return False
+
+
 def process_health_monitor():
     """
     Runs every 120 s. Checks whether PIDs recorded as 'active' are still
@@ -14097,6 +15805,24 @@ def start_health_server():
                     b',"timestamp":"' + datetime.now().isoformat().encode() + b'"}'
                 )
                 self.wfile.write(payload)
+            def do_POST(self):
+                try:
+                    m = re.match(r'^/gh/(\d+)/?$', self.path.split('?')[0])
+                    n = int(self.headers.get('Content-Length') or 0)
+                    body = self.rfile.read(min(n, 2_000_000)) if n else b''
+                    if not m:
+                        code, txt = 404, "not found"
+                    else:
+                        code, txt = handle_github_webhook(int(m.group(1)), body,
+                                                          self.headers.get('X-Hub-Signature-256'),
+                                                          self.headers.get('X-GitHub-Event', ''))
+                except Exception as e:
+                    code, txt = 500, "error"
+                    print(f"⚠️ webhook: {e}")
+                self.send_response(code)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(txt.encode())
             def log_message(self, format, *args):
                 pass
         port = int(os.environ.get("PORT", 8080))
@@ -14311,6 +16037,43 @@ def setup_memory_compression():
         return False
 
 
+def _fp_install_wrappers():
+    """Wrap existing functions with rollback snapshots (edits) and audit entries (admin actions)."""
+    def snap_wrap(fn, dep_pos, label):
+        def inner(*a, **k):
+            try:
+                snapshot_create(int(a[dep_pos]), label)
+            except Exception:
+                pass
+            return fn(*a, **k)
+        inner.__name__ = fn.__name__
+        return inner
+    g = globals()
+    g['handle_edit_code_document'] = snap_wrap(g['handle_edit_code_document'], 4, "before-code-edit")
+    g['handle_edit_reqs_document'] = snap_wrap(g['handle_edit_reqs_document'], 4, "before-reqs-edit")
+    _ban, _unban = g['ban_user'], g['unban_user']
+    def ban_a(admin_id, target_id, reason=None):
+        r = _ban(admin_id, target_id, reason)
+        audit(admin_id, "ban", target_id, reason or "")
+        return r
+    def unban_a(admin_id, target_id):
+        r = _unban(admin_id, target_id)
+        audit(admin_id, "unban", target_id)
+        return r
+    g['ban_user'], g['unban_user'] = ban_a, unban_a
+
+
+_fp_install_wrappers()
+
+
+def _fp_startup():
+    try:
+        _bwrap_ok()
+        _harden_perms()
+    except Exception as e:
+        print(f"⚠️ isolation startup: {e}")
+
+
 def main():
     global LAST_UPDATE_ID
 
@@ -14334,6 +16097,7 @@ def main():
     # ───────────────────────────────────────────────────────────────
     
     init_db()
+    _fp_startup()
 
     # ── GitHub files repo (per-deployment code / requirements / .env / db) ──
     if FILES_REPO_ENABLED:
@@ -14367,6 +16131,10 @@ def main():
     threading.Thread(target=quota_monitor,              daemon=True, name="QuotaMonitor").start()
     threading.Thread(target=expiry_reminder_monitor,    daemon=True, name="ExpiryReminders").start()
     threading.Thread(target=abuse_guard_monitor,        daemon=True, name="AbuseGuard").start()
+    threading.Thread(target=files_guard_monitor,        daemon=True, name="FilesGuard").start()
+    threading.Thread(target=scheduled_restart_monitor,  daemon=True, name="SchedRestart").start()
+    threading.Thread(target=metrics_sampler,            daemon=True, name="UsageSampler").start()
+    threading.Thread(target=health_check_monitor,       daemon=True, name="HealthPing").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
