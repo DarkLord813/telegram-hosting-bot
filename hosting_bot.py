@@ -1546,7 +1546,7 @@ def github_restore_db():
         _db_restore_failed = True
         return False
 
-def github_backup_db(reason: str = "auto", force: bool = False):
+def github_backup_db(reason: str = "auto", force: bool = False, bypass_interval: bool = False):
     """
     Upload DATABASE_FILE to GitHub.  Thread-safe via push lock.
     Silently skips when:
@@ -1569,10 +1569,10 @@ def github_backup_db(reason: str = "auto", force: bool = False):
         return False
 
     now = datetime.now().timestamp()
-    if not force and now - _last_backup_time < _MIN_BACKUP_INTERVAL:
+    if not force and not bypass_interval and now - _last_backup_time < _MIN_BACKUP_INTERVAL:
         return False   # too soon — silent
 
-    if force:
+    if force or bypass_interval:
         acquired = _github_push_lock.acquire(blocking=True, timeout=15)
     else:
         acquired = _github_push_lock.acquire(blocking=False)
@@ -1628,13 +1628,40 @@ def github_backup_db(reason: str = "auto", force: bool = False):
     finally:
         _github_push_lock.release()
 
+_backup_state = {"scheduled": False, "dirty": False}
+_backup_state_lock = threading.Lock()
+
+
+def _coalesced_backup(reason):
+    """Every change gets backed up: requests that arrive inside the minimum interval are merged into ONE trailing
+    backup instead of being silently dropped (a dropped backup = a deployment lost on the next host redeploy)."""
+    with _backup_state_lock:
+        if _backup_state["scheduled"]:
+            _backup_state["dirty"] = True
+            return
+        _backup_state["scheduled"] = True
+    try:
+        while True:
+            wait = _MIN_BACKUP_INTERVAL - (datetime.now().timestamp() - _last_backup_time)
+            if wait > 0:
+                sleep(wait + 0.5)
+            with _backup_state_lock:
+                _backup_state["dirty"] = False
+            github_backup_db(reason, bypass_interval=True)
+            with _backup_state_lock:
+                if not _backup_state["dirty"]:
+                    _backup_state["scheduled"] = False
+                    return
+    except Exception as e:
+        print(f"⚠️  coalesced backup error: {e}")
+        with _backup_state_lock:
+            _backup_state["scheduled"] = False
+
+
 def async_backup(reason: str = "auto"):
-    """Fire-and-forget backup — never blocks the bot's response path."""
+    """Fire-and-forget backup — never blocks the bot's response path, never silently dropped."""
     if GITHUB_ENABLED:
-        threading.Thread(
-            target=github_backup_db, args=(reason,),
-            daemon=True, name="GitHubBackup"
-        ).start()
+        threading.Thread(target=_coalesced_backup, args=(reason,), daemon=True, name="GitHubBackup").start()
 
 def _periodic_backup_thread():
     """Safety-net: flush a backup every 30 minutes regardless of other triggers."""
@@ -2413,6 +2440,90 @@ def _files_restore_for_relaunch(owner_id, deployment_id, deploy_folder: Path, de
     return True, env
 
 
+def persist_new_deployment(dep_id, reason="deployed"):
+    """Make a brand-new deployment durable BEFORE telling the user it worked: files → GitHub files repo, database →
+    GitHub backup, both immediately (not queued, not debounced). Best effort; never raises."""
+    try:
+        if FILES_REPO_ENABLED:
+            files_repo_save_deployment(dep_id, reason)
+    except Exception as e:
+        print(f"⚠️ persist files #{dep_id}: {e}")
+    try:
+        if GITHUB_ENABLED:
+            github_backup_db(f"{reason}_{dep_id}", bypass_interval=True)
+    except Exception as e:
+        print(f"⚠️ persist db #{dep_id}: {e}")
+
+
+def adopt_lost_deployments():
+    """The database can roll back (host redeploy restores an older backup) while the GitHub files repo still holds
+    the deployment. Re-create any such deployment's row from its manifest and relaunch it.
+    -> {"adopted": [(uid, dep)], "error": str|None}"""
+    res = {"adopted": [], "error": None}
+    if not FILES_REPO_ENABLED:
+        return res
+    try:
+        if not _files_repo_ready():
+            res["error"] = "files repo not ready"
+            return res
+        with _files_lock:
+            found = _files_remote_deployment_dirs()
+        known = {r[0] for r in (db_execute("SELECT deployment_id FROM deployments", fetch='all') or [])}
+        for (uid, dep), paths in sorted(found.items()):
+            if dep in known:
+                continue
+            prefix = _files_prefix(uid, dep)
+            try:
+                with _files_lock:
+                    remote = _files_list_remote(prefix)
+                man_sha, env_sha = remote.get(f"{prefix}/manifest.json"), remote.get(f"{prefix}/.env")
+                if not man_sha:
+                    continue
+                man = json.loads((_files_fetch_blob(man_sha) or b"{}").decode("utf-8", "replace"))
+                env = _parse_env_text((_files_fetch_blob(env_sha) or b"").decode("utf-8", "replace")) if env_sha else {}
+            except Exception as e:
+                res["error"] = f"read #{dep}: {e}"
+                continue
+            fn = str(man.get("file_name") or "")
+            if (int(man.get("user_id") or -1) != uid or int(man.get("deployment_id") or -1) != dep
+                    or not fn or fn.startswith("/") or ".." in Path(fn).parts):
+                continue                                   # not trustworthy → leave for the admin
+            exp = man.get("expire_time")
+            if exp:
+                try:
+                    if datetime.fromisoformat(exp) <= datetime.now():
+                        continue                           # expired anyway → normal cleanup may remove it
+                except Exception:
+                    continue
+            db_execute("INSERT OR IGNORE INTO users (user_id, join_date, last_active) VALUES (?, ?, ?)",
+                       (uid, datetime.now().isoformat(), datetime.now().isoformat()))
+            db_execute('''INSERT INTO deployments
+                (deployment_id, user_id, file_name, file_size, requirements, env_vars, plan, payment_method,
+                 cost_coins, cost_stars, start_time, expire_time, status, proc_pid, deploy_log, is_free, is_paused,
+                 framework, dependencies_installed, folder_name, source_type, github_repo, github_branch)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (dep, uid, fn, 0, "", json.dumps(env), man.get("plan") or "monthly", "restored", 0, 0,
+                 man.get("start_time") or datetime.now().isoformat(), exp, "active", None,
+                 "Recovered from the GitHub files repo", 1 if man.get("is_free") else 0, 0,
+                 "unknown", json.dumps([]), str(man.get("folder_name") or dep),
+                 man.get("source_type") or "upload", man.get("github_repo"), man.get("github_branch") or "main"))
+            res["adopted"].append((uid, dep))
+            print(f"♻️  Recovered deployment #{dep} (user {uid}) from the files repo")
+            try:
+                enqueue_relaunch(dep, reason="adopt", bypass_cap=True)
+                send_message(uid, f"♻️ *Bot #{dep} recovered*\n\nThe host's database was rolled back, but your bot's "
+                                  f"files were safe on GitHub. I've restored it and it's starting now.",
+                             {"inline_keyboard": [[{"text": "📄 Deployment", "callback_data": f"view_deploy_{dep}"}]]})
+            except Exception as e:
+                print(f"⚠️ adopt notify #{dep}: {e}")
+        if res["adopted"]:
+            async_backup("adopted_deployments")
+    except Exception as e:
+        res["error"] = str(e)
+        print(f"⚠️ adopt_lost_deployments: {e}")
+    return res
+
+
 # ---- background worker so saves/deletes never block the bot ------------------
 _files_jobs         = queue.Queue()
 _files_jobs_pending = set()
@@ -2487,7 +2598,11 @@ def _files_sync_thread():
     while True:
         try:
             _files_retry_pending_deletes()
-            files_repo_purge_orphans_auto()
+            _adopt = adopt_lost_deployments()               # recover first, so cleanup never deletes a lost-but-live bot
+            if _adopt["error"]:
+                print(f"⚠️  Orphan cleanup skipped this cycle (recovery incomplete: {_adopt['error']})")
+            else:
+                files_repo_purge_orphans_auto()
             where = "" if first else "WHERE status IN ('active', 'paused')"
             ids = [r[0] for r in db_execute(f"SELECT deployment_id FROM deployments {where}", fetch='all') or []]
             first = False
@@ -7700,8 +7815,9 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
             conn.commit()
             conn.close()
 
-            # Save code + manifests + .env (+ any db the bot has created) to the GitHub files repo
-            files_repo_async_save(deployment_db_id, "deployed")
+            # Save code + manifests + .env (+ any db the bot has created) to GitHub — NOW, not queued
+            update_logs("💾 Saving to GitHub…")
+            persist_new_deployment(deployment_db_id, "deployed")
 
             set_user_step(user_id, None)
             with deployment_lock:
@@ -7725,7 +7841,6 @@ def deploy_from_github(chat_id, user_id, owner, repo, branch, token,
                     [{"text": "🏠 Menu",           "callback_data": "main_menu"}],
                 ]})
 
-            async_backup(f"github_deploy_{deployment_db_id}")
             return True
         else:
             err_tail = ""
@@ -7979,8 +8094,9 @@ def deploy_with_logs_enhanced(chat_id, user_id, temp_file, requirements_text, en
             conn.commit()
             conn.close()
 
-            # Save code + manifests + .env (+ any db the bot has created) to the GitHub files repo
-            files_repo_async_save(deployment_db_id, "deployed")
+            # Save code + manifests + .env (+ any db the bot has created) to GitHub — NOW, not queued
+            update_logs("💾 Saving to GitHub…")
+            persist_new_deployment(deployment_db_id, "deployed")
 
             Path(temp_file).unlink(missing_ok=True)
             set_user_step(user_id, None)
@@ -16540,6 +16656,7 @@ def main():
     # ── GitHub files repo (per-deployment code / requirements / .env / db) ──
     if FILES_REPO_ENABLED:
         _files_init_tables()
+        threading.Thread(target=lambda: (sleep(20), adopt_lost_deployments()), daemon=True, name="AdoptLost").start()
         if _files_repo_ready(force=True):
             print(f"✅ Files repo ready: {GITHUB_REPO_OWNER}/{GITHUB_FILES_REPO_NAME} "
                   f"[branch: {GITHUB_BACKUP_BRANCH}] (private)")
