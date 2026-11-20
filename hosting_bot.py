@@ -18,6 +18,7 @@ import signal
 import platform
 import traceback
 import hashlib
+import hmac
 import base64
 import tempfile
 import random
@@ -10698,7 +10699,7 @@ def admin_user_detail(chat_id, target_id):
     dep = db_execute("SELECT COUNT(*), SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) "
                      "FROM deployments WHERE user_id = ?", (target_id,), fetch='one') or (0, 0)
     text = (f"*👤 USER DETAILS*\n━━━━━━━━━━━━━━━━━━━━━━\n{_user_card(row)}\n"
-            f"📦 Deployments: `{dep[0] or 0}` (🟢 `{dep[1] or 0}` running)")
+            f"📦 Deployments: `{dep[0] or 0}` (🟢 `{dep[1] or 0}` running)" + _p2_user_extra(target_id))
     info = get_ban_info(target_id)
     if info:
         text += f"\n🚫 Ban reason: `{safe_md(info['reason'] or 'none given')}`"
@@ -10709,7 +10710,8 @@ def admin_user_detail(chat_id, target_id):
     else:
         ban_row = [{"text": "🚫 Ban user", "callback_data": f"admin_ban_{target_id}"}]
     send_message(chat_id, text,
-                 {"inline_keyboard": ([ban_row] if ban_row else []) + [[{"text": "🔄 Refresh", "callback_data": f"admin_user_view_{target_id}"}],
+                 {"inline_keyboard": ([ban_row] if ban_row else []) + [[{"text": "⚙️ Limits, note & PIN", "callback_data": f"p2_au_{target_id}"}],
+                                      [{"text": "🔄 Refresh", "callback_data": f"admin_user_view_{target_id}"}],
                                       [{"text": "🔍 Search again", "callback_data": "admin_search_user"}],
                                       [{"text": "👥 All Users", "callback_data": "admin_list_users"}]]})
 
@@ -15807,6 +15809,7 @@ def fp_more_menu(chat_id, message_id):
     edit_message(chat_id, message_id, "*🧰 MORE*\n\nExtras for your account.", _fp_kb(
         [_fp_btn("🎟️ Promo Code", "fp_promo"), _fp_btn("🧾 Payment History", "fp_history")],
         [_fp_btn("🌐 Language", "fp_lang"), _fp_btn("🤝 Shared with me", "fp_shared")],
+        *_P2_MORE_ROWS,
         [_fp_btn("🔙 Menu", "main_menu")]))
 
 
@@ -15826,6 +15829,10 @@ def fp_tools_menu(chat_id, message_id, uid, dep_id):
                         [_fp_btn("🔗 Auto-deploy", f"fp_hook_{dep_id}"), _fp_btn("🤝 Share", f"fp_share_{dep_id}")],
                         [_fp_btn("🕘 Versions / rollback", f"fp_ver_{dep_id}"), _fp_btn("♻️ Restore zip", f"fp_restore_{dep_id}")],
                         [_fp_btn(f"🗜 Ultra compress: {'ON' if st['compress'] else 'OFF'}", f"fp_comp_{dep_id}")],
+                        [_fp_btn("🔍 Scan for secrets", f"p2_scan_{dep_id}"),
+                         _fp_btn(f"🛡 Safe deploy: {'OFF' if _p2_safe_off(dep_id) else 'ON'}", f"p2_safe_{dep_id}")],
+                        [_fp_btn("🌍 Public URL", f"p2_pub_{dep_id}"),
+                         _fp_btn(f"🔁 Auto-renew: {'ON' if p2_autorenew_on(dep_id) else 'OFF'}", f"p2_ren_{dep_id}")],
                         [_fp_btn("🔙 Deployment", f"view_deploy_{dep_id}")]))
 
 
@@ -15958,7 +15965,7 @@ def _fp_admin_rows():
     on = maintenance_on()
     return [[_fp_btn(f"🛠 Maintenance: {'ON 🔴' if on else 'OFF 🟢'}", "fp_maint")],
             [_fp_btn("🏷️ Promo Codes", "fp_apromo"), _fp_btn("🧾 Audit Log", "fp_audit_0")],
-            [_fp_btn("🧪 Test translation", "fp_trtest")]]
+            [_fp_btn("🧪 Test translation", "fp_trtest")], *_P2_ADMIN_ROWS]
 
 
 # ---------------------------------------------------------------- callback router
@@ -15984,6 +15991,18 @@ def _fp_pre_callback(callback):
     if _fp_confirm_gate(callback):
         return True
     data = callback.get('data') or ''
+    if _p2_pin_gate(data, uid, chat_id, mid):
+        answer_callback(callback['id'])
+        return True
+    if data.startswith("p2_"):
+        answer_callback(callback['id'])
+        try:
+            return _p2_route(callback, data, uid, chat_id, mid)
+        except Exception as e:
+            print(f"❌ p2 route {data}: {e}")
+            traceback.print_exc()
+            send_message(chat_id, "⚠️ Something went wrong with that. Please try again.")
+            return True
     if not data.startswith("fp_"):
         return False
 
@@ -16193,6 +16212,8 @@ def _fp_text(message, user_step):
     step = user_step.get('step') or ''
     if not step.startswith('fp_'):
         return False
+    if step in _P2_TEXT:
+        return _p2_text(message, user_step)
     chat_id, uid = message['chat']['id'], message['from']['id']
     text = (message.get('text') or '').strip()
     if text.startswith('/'):
@@ -16291,6 +16312,1785 @@ def _fp_document(message, user_step, doc, file_name):
     return False
 
 
+# =====================================================================================================
+# FEATURE PACK 2 — PIN, secret warnings, safe deploys, public URLs, payments, auto-renew, commissions,
+# gifts, tickets, admin overrides/notes, scheduled broadcasts, data export / deletion, Mini App.
+# All UI uses `p2_` callbacks and `fp_p2*` text steps. Modules register themselves in the tables below.
+# =====================================================================================================
+_P2 = {"init": False}
+_P2_LOCK = threading.Lock()
+_P2_ROUTES = []            # (prefix, fn(callback, data, uid, chat_id, mid) -> bool)
+_P2_TEXT = {}              # step -> fn(message, user_step, uid, chat_id, text) -> bool
+_P2_MORE_ROWS = []         # rows appended to the "More" menu
+_P2_ADMIN_ROWS = []        # rows appended to the admin panel
+_P2_DDL = [
+    "CREATE TABLE IF NOT EXISTS user_pins (user_id INTEGER PRIMARY KEY, salt BLOB, pin_hash TEXT, set_at TEXT, "
+    "fails INTEGER DEFAULT 0, locked_until TEXT)",
+    "CREATE TABLE IF NOT EXISTS payment_orders (ref TEXT PRIMARY KEY, user_id INTEGER, provider TEXT, coins INTEGER, "
+    "amount_minor INTEGER, currency TEXT, status TEXT, created_at TEXT, paid_at TEXT, email TEXT, extra TEXT)",
+    "CREATE TABLE IF NOT EXISTS renew_log (deployment_id INTEGER, expire_from TEXT, renewed_at TEXT, "
+    "PRIMARY KEY (deployment_id, expire_from))",
+    "CREATE TABLE IF NOT EXISTS commission_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer INTEGER, "
+    "referred INTEGER, coins INTEGER, spend INTEGER, ts TEXT, reversed INTEGER DEFAULT 0, tx_ref TEXT)",
+    "CREATE TABLE IF NOT EXISTS gift_codes (code TEXT PRIMARY KEY, plan TEXT, buyer INTEGER, cost INTEGER, "
+    "created_at TEXT, redeemed_by INTEGER, redeemed_at TEXT, cancelled INTEGER DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, subject TEXT, "
+    "status TEXT DEFAULT 'open', created_at TEXT, updated_at TEXT, unread_admin INTEGER DEFAULT 1, "
+    "unread_user INTEGER DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS ticket_msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER, sender TEXT, "
+    "text TEXT, ts TEXT)",
+    "CREATE TABLE IF NOT EXISTS user_overrides (user_id INTEGER PRIMARY KEY, max_deps INTEGER, quota_mb INTEGER, "
+    "note TEXT, updated_at TEXT)",
+]
+
+
+def _p2_ensure():
+    if _P2["init"]:
+        return
+    with _P2_LOCK:
+        if _P2["init"]:
+            return
+        for ddl in _P2_DDL:
+            db_execute(ddl)
+        try:
+            db_execute("ALTER TABLE dep_settings ADD COLUMN safe_off INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db_execute("ALTER TABLE dep_settings ADD COLUMN autorenew INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db_execute("ALTER TABLE dep_settings ADD COLUMN public INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        _P2["init"] = True
+
+
+def _q(query, params=(), fetch='none'):
+    _p2_ensure()
+    return db_execute(query, params, fetch=fetch)
+
+
+def _now():
+    return datetime.now().isoformat(timespec='seconds')
+
+
+def _p2_del_msg(chat_id, message_id):
+    try:
+        if message_id:
+            http_get(f"{TELEGRAM_API}/deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- PIN
+_P2_PEND = {}              # uid -> {"data","chat","mid","ts"}   action waiting on a PIN
+_P2_TMP = {}               # uid -> (first_pin, ts)              PIN being confirmed
+_P2_OK = {}                # uid -> (callback data, expiry)      one-shot approval after a correct PIN
+PIN_MAX_FAILS = 5
+PIN_LOCK_MIN = 15
+_PIN_NEEDED_FOR_DEPLOY = ("deploy_new", "github_deploy", "free_deployment", "plan_monthly", "plan_yearly",
+                          "gh_plan_monthly", "gh_plan_yearly", "gh_plan_free")
+_PIN_SENSITIVE = re.compile(r'^(confirm_delete_\d+|p2_delacct_go|p2_exp_go|p2_pinchg_go)$')
+
+
+def _pin_hash(pin, salt):
+    return hashlib.scrypt(pin.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32).hex()
+
+
+def pin_is_set(uid):
+    r = _q("SELECT pin_hash FROM user_pins WHERE user_id = ?", (uid,), fetch='one')
+    return bool(r and r[0])
+
+
+def pin_valid_format(pin):
+    if not re.fullmatch(r'\d{4,6}', pin or ''):
+        return "PIN must be 4–6 digits."
+    if pin == "0000" or len(set(pin)) == 1:
+        return "That PIN is too easy (0000 / repeated digits). Pick another."
+    return None
+
+
+def pin_set(uid, pin):
+    salt = os.urandom(16)
+    _q("INSERT INTO user_pins (user_id, salt, pin_hash, set_at, fails, locked_until) VALUES (?, ?, ?, ?, 0, NULL) "
+       "ON CONFLICT(user_id) DO UPDATE SET salt=excluded.salt, pin_hash=excluded.pin_hash, set_at=excluded.set_at, "
+       "fails=0, locked_until=NULL", (uid, salt, _pin_hash(pin, salt), _now()))
+
+
+def pin_reset(uid):
+    _q("DELETE FROM user_pins WHERE user_id = ?", (uid,))
+
+
+def pin_lock_left(uid):
+    r = _q("SELECT locked_until FROM user_pins WHERE user_id = ?", (uid,), fetch='one')
+    if r and r[0]:
+        try:
+            left = (datetime.fromisoformat(r[0]) - datetime.now()).total_seconds()
+            return int(left) if left > 0 else 0
+        except Exception:
+            pass
+    return 0
+
+
+def pin_check(uid, pin):
+    """-> (ok, message). Unset PIN == default '0000'. 5 wrong tries lock for 15 minutes."""
+    left = pin_lock_left(uid)
+    if left:
+        return False, f"🔒 Too many wrong PINs. Try again in {left // 60 + 1} min."
+    r = _q("SELECT salt, pin_hash, fails FROM user_pins WHERE user_id = ?", (uid,), fetch='one')
+    if not r or not r[1]:
+        return (pin == "0000"), "❌ Wrong PIN."
+    ok = hmac.compare_digest(_pin_hash(pin, bytes(r[0])), r[1])
+    if ok:
+        _q("UPDATE user_pins SET fails = 0, locked_until = NULL WHERE user_id = ?", (uid,))
+        return True, ""
+    fails = (r[2] or 0) + 1
+    if fails >= PIN_MAX_FAILS:
+        _q("UPDATE user_pins SET fails = 0, locked_until = ? WHERE user_id = ?",
+           ((datetime.now() + timedelta(minutes=PIN_LOCK_MIN)).isoformat(timespec='seconds'), uid))
+        audit(uid, "pin_locked", uid)
+        return False, f"🔒 Too many wrong PINs. Locked for {PIN_LOCK_MIN} minutes."
+    _q("UPDATE user_pins SET fails = ? WHERE user_id = ?", (fails, uid))
+    return False, f"❌ Wrong PIN. {PIN_MAX_FAILS - fails} attempt(s) left."
+
+
+def _p2_pin_start_set(uid, chat_id, mid, pend=None, reason=""):
+    _P2_PEND[uid] = dict(pend or {}, chat=chat_id, mid=mid, ts=time.time())
+    _P2_TMP.pop(uid, None)
+    set_user_step(uid, 'fp_p2set1')
+    txt = (f"*🔐 SET YOUR PIN*\n\n{reason}Choose a 4–6 digit PIN. It protects sensitive actions (deleting bots, data export, "
+           f"account deletion) and you must set one before deploying.\n\nSend it as a message — it's deleted right "
+           f"after, and stored only as a salted hash.")
+    kb = _fp_kb([_fp_btn("❌ Cancel", "main_menu")])
+    if mid:
+        edit_message(chat_id, mid, txt, kb)
+    else:
+        send_message(chat_id, txt, kb)
+
+
+def _p2_pin_start_ask(uid, chat_id, mid, data):
+    _P2_PEND[uid] = {"data": data, "chat": chat_id, "mid": mid, "ts": time.time()}
+    set_user_step(uid, 'fp_p2ask')
+    edit_message(chat_id, mid, "*🔐 ENTER YOUR PIN*\n\nThis action needs your PIN. Send it as a message (it's deleted right after).",
+                 _fp_kb([_fp_btn("❌ Cancel", "main_menu")]))
+
+
+def _p2_redispatch(uid, pend):
+    data = pend.get("data")
+    if not data:
+        return False
+    cb = {"id": "0", "from": {"id": uid}, "data": data,
+          "message": {"chat": {"id": pend["chat"]}, "message_id": pend.get("mid")}}
+    try:
+        handle_callback(cb)
+    except Exception as e:
+        print(f"⚠️ p2 redispatch {data}: {e}")
+    return True
+
+
+def _p2_pin_gate(data, uid, chat_id, mid):
+    """-> True if the callback was intercepted (PIN prompt shown)."""
+    if data in _PIN_NEEDED_FOR_DEPLOY or data.startswith(("plan_", "gh_plan_")):
+        if not pin_is_set(uid):
+            _p2_pin_start_set(uid, chat_id, mid, {"data": data}, "You must set a PIN before deploying.\n\n")
+            return True
+        return False
+    if _PIN_SENSITIVE.match(data):
+        ok = _P2_OK.get(uid)
+        if ok and ok[0] == data and ok[1] > time.time():
+            _P2_OK.pop(uid, None)
+            return False
+        if not pin_is_set(uid):
+            _p2_pin_start_set(uid, chat_id, mid, {"data": data}, "You need a PIN for this action.\n\n")
+        else:
+            _p2_pin_start_ask(uid, chat_id, mid, data)
+        return True
+    return False
+
+
+def _p2_text_pin(message, user_step, uid, chat_id, text):
+    step = user_step.get('step')
+    _p2_del_msg(chat_id, message.get('message_id'))
+    pend = _P2_PEND.get(uid) or {}
+    if pend and time.time() - pend.get("ts", 0) > 900:
+        _P2_PEND.pop(uid, None); pend = {}
+    cancel = _fp_kb([_fp_btn("❌ Cancel", "main_menu")])
+    if step == 'fp_p2set1':
+        err = pin_valid_format(text)
+        if err:
+            set_user_step(uid, 'fp_p2set1')
+            send_message(chat_id, f"❌ {err}\n\nSend a new PIN:", cancel); return True
+        _P2_TMP[uid] = (text, time.time())
+        set_user_step(uid, 'fp_p2set2')
+        send_message(chat_id, "🔁 Send the same PIN again to confirm.", cancel); return True
+    if step == 'fp_p2set2':
+        first = _P2_TMP.get(uid)
+        if not first or first[0] != text:
+            _P2_TMP.pop(uid, None)
+            set_user_step(uid, 'fp_p2set1')
+            send_message(chat_id, "❌ The PINs didn't match. Send a new PIN to start again:", cancel); return True
+        _P2_TMP.pop(uid, None)
+        pin_set(uid, text)
+        audit(uid, "pin_set", uid)
+        _P2_PEND.pop(uid, None)
+        send_message(chat_id, "✅ *PIN saved.* Keep it safe — nobody can see it, only an admin can reset it.")
+        if pend.get("data"):
+            _p2_redispatch(uid, pend)
+        else:
+            send_message(chat_id, "🔐 Security", _fp_kb([_fp_btn("🔙 More", "fp_more")]))
+        return True
+    if step == 'fp_p2old':                     # change PIN: verify old one first
+        ok, m = pin_check(uid, text)
+        if not ok:
+            set_user_step(uid, 'fp_p2old') if "left" in m else None
+            send_message(chat_id, m, cancel); return True
+        _p2_pin_start_set(uid, chat_id, None, {}, "Old PIN accepted.\n\n"); return True
+    if step == 'fp_p2ask':
+        ok, m = pin_check(uid, text)
+        if not ok:
+            if "left" in m:
+                set_user_step(uid, 'fp_p2ask')
+            send_message(chat_id, m, cancel); return True
+        _P2_PEND.pop(uid, None)
+        _P2_OK[uid] = (pend.get("data"), time.time() + 120)
+        _p2_redispatch(uid, pend); return True
+    return False
+
+
+_P2_TEXT.update({k: _p2_text_pin for k in ('fp_p2set1', 'fp_p2set2', 'fp_p2old', 'fp_p2ask')})
+
+
+def p2_security_menu(chat_id, mid, uid):
+    s = pin_is_set(uid)
+    edit_message(chat_id, mid, f"*🔐 PIN & SECURITY*\n\nPIN: `{'set ✅' if s else 'not set (default 0000) ⚠️'}`\n\n"
+                 f"Your PIN is required before deploying and for deleting bots, exporting or deleting your data.",
+                 _fp_kb([_fp_btn("🔑 Change PIN" if s else "🔑 Set PIN", "p2_pinchg")],
+                        [_fp_btn("🔙 More", "fp_more")]))
+
+
+def _p2_r_pin(callback, data, uid, chat_id, mid):
+    if data == "p2_sec":
+        p2_security_menu(chat_id, mid, uid); return True
+    if data == "p2_pinchg":
+        if not pin_is_set(uid):
+            _p2_pin_start_set(uid, chat_id, mid, {}); return True
+        set_user_step(uid, 'fp_p2old')
+        edit_message(chat_id, mid, "*🔑 CHANGE PIN*\n\nSend your *current* PIN.", _fp_kb([_fp_btn("❌ Cancel", "p2_sec")])); return True
+    return False
+
+
+_P2_ROUTES.append(("p2_sec", _p2_r_pin))
+_P2_ROUTES.append(("p2_pinchg", _p2_r_pin))
+_P2_MORE_ROWS.append([_fp_btn("🔐 PIN & Security", "p2_sec")])
+
+
+
+# ---- admin: reset a user's PIN (button flow, no commands)
+def _p2_r_apin(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    set_user_step(uid, 'fp_p2apin')
+    edit_message(chat_id, mid, "*🔑 RESET USER PIN*\n\nSend the user's Telegram ID. Their PIN is cleared and they must set a new one before deploying.",
+                 _fp_kb([_fp_btn("❌ Cancel", "admin_panel")]))
+    return True
+
+
+def _p2_text_apin(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    if text.lstrip('-').isdigit() and _q("SELECT 1 FROM users WHERE user_id = ?", (int(text),), fetch='one'):
+        pin_reset(int(text))
+        audit(uid, "pin_reset", text)
+        send_message(chat_id, f"✅ PIN cleared for `{text}`. They must set a new one before deploying.",
+                     _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")]))
+        try:
+            send_message(int(text), "🔐 An admin reset your PIN. You'll be asked to set a new one next time you deploy.")
+        except Exception:
+            pass
+    else:
+        send_message(chat_id, "❌ No such user.", _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_apin", _p2_r_apin))
+_P2_TEXT['fp_p2apin'] = _p2_text_apin
+_P2_ADMIN_ROWS.append([_fp_btn("🔑 Reset user PIN", "p2_apin")])
+
+
+# ---------------------------------------------------------------- hardcoded-secret warning (read-only)
+_P2_SECRET_RX = [
+    ("Telegram bot token", re.compile(r'\b\d{8,10}:[A-Za-z0-9_-]{30,40}\b')),
+    ("GitHub token", re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b')),
+    ("OpenAI-style API key", re.compile(r'\bsk-[A-Za-z0-9_-]{20,}\b')),
+    ("AWS access key", re.compile(r'\bAKIA[0-9A-Z]{16}\b')),
+    ("Google API key", re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b')),
+    ("Slack token", re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b')),
+    ("Database URL with password", re.compile(r'\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/\'"]+:[^\s@/\'"]+@')),
+    ("Private key", re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----')),
+]
+_P2_SCAN_EXT = {'.py', '.js', '.mjs', '.cjs', '.ts', '.json', '.yml', '.yaml', '.toml', '.cfg', '.ini', '.txt', '.sh'}
+_P2_ENV_LINE = re.compile(r'os\.environ|getenv|process\.env|environ\.get|config\(', re.I)
+
+
+def _p2_mask(s):
+    s = s.strip()
+    return (s[:4] + "…" + s[-2:]) if len(s) > 10 else "…"
+
+
+def scan_secrets(folder, max_files=400, max_hits=40):
+    """READ-ONLY scan. -> [(relative path, line number, kind, masked match)]. Never modifies a file."""
+    hits = []
+    folder = Path(folder)
+    n = 0
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in _JUNK_DIRS and not d.startswith('.')]
+            for f in files:
+                if f.startswith('.env') or Path(f).suffix.lower() not in _P2_SCAN_EXT:
+                    continue
+                fp = Path(root) / f
+                try:
+                    if fp.is_symlink() or fp.stat().st_size > 300_000:
+                        continue
+                    n += 1
+                    if n > max_files:
+                        return hits
+                    for i, line in enumerate(fp.read_text('utf-8', 'ignore').splitlines(), 1):
+                        if len(line) > 2000 or _P2_ENV_LINE.search(line):
+                            continue
+                        for kind, rx in _P2_SECRET_RX:
+                            m = rx.search(line)
+                            if m:
+                                hits.append((str(fp.relative_to(folder)), i, kind, _p2_mask(m.group(0))))
+                                break
+                        if len(hits) >= max_hits:
+                            return hits
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"⚠️ secret scan: {e}")
+    return hits
+
+
+def secret_report(dep_id, hits):
+    lines = [f"⚠️ *Possible hardcoded secrets in #{dep_id}*", ""]
+    for path, ln, kind, mask in hits[:8]:
+        lines.append(f"• `{path}:{ln}` — {kind} `{mask}`")
+    if len(hits) > 8:
+        lines.append(f"…and {len(hits) - 8} more")
+    lines += ["", "Anyone who can read your code (or your GitHub repo) can use these. Move them to *Environment "
+              "Variables* and read them with `os.environ` / `process.env`, then rotate any key that was exposed.",
+              "_I never change your files — this is only a warning._"]
+    return "\n".join(lines)
+
+
+def p2_secret_check(dep_id, notify=True):
+    d = _fp_dep(dep_id)
+    if not d or not d["folder"].exists():
+        return None
+    hits = scan_secrets(d["folder"])
+    fp = hashlib.sha1(repr(hits).encode()).hexdigest()[:12]
+    if notify and hits and kv_get(f"secscan_{dep_id}") != fp:
+        send_message(d["owner"], secret_report(dep_id, hits),
+                     _fp_kb([_fp_btn("🔧 Open env editor", f"edit_env_{dep_id}")],
+                            [_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+    kv_set(f"secscan_{dep_id}", fp if hits else "")
+    return hits
+
+
+def _p2_r_scan(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    dep_id = int(p[2]) if len(p) > 2 and p[2].isdigit() else None
+    d = _fp_own(uid, dep_id) if dep_id else None
+    if not d:
+        return True
+    hits = scan_secrets(d["folder"])
+    txt = secret_report(dep_id, hits) if hits else f"✅ *No hardcoded secrets found in #{dep_id}.*"
+    edit_message(chat_id, mid, txt, _fp_kb([_fp_btn("🔧 Env editor", f"edit_env_{dep_id}")] if hits else [],
+                                         [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_scan_", _p2_r_scan))
+
+
+def _p2_after_persist(dep_id):
+    def run():
+        try:
+            sleep(3)
+            p2_secret_check(dep_id)
+        except Exception as e:
+            print(f"⚠️ secret check #{dep_id}: {e}")
+    threading.Thread(target=run, daemon=True, name="SecretScan").start()
+
+
+
+def _p2_install_scan_hooks():
+    g = globals()
+    _pnd, _push = g['persist_new_deployment'], g['_edit_push']
+
+    def pnd(dep_id, reason="deployed"):
+        r = _pnd(dep_id, reason)
+        _p2_after_persist(dep_id)
+        return r
+
+    def push(dep_id, what):
+        r = _push(dep_id, what)
+        if what in ("code", "restore", "rollback"):
+            _p2_after_persist(dep_id)
+        return r
+    g['persist_new_deployment'], g['_edit_push'] = pnd, push
+
+
+_p2_install_scan_hooks()
+
+
+# ---------------------------------------------------------------- safe deploys (verify + automatic rollback)
+_P2_WATCH = set()
+SAFE_VERIFY_SECS = int(os.environ.get("SAFE_VERIFY_SECS", "40"))
+SAFE_SNAP_MAX_AGE = 15 * 60
+
+
+def _p2_alive(dep_id):
+    r = db_execute("SELECT proc_pid, status FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    if not r or not r[0] or r[1] != 'active':
+        return False
+    try:
+        os.kill(int(r[0]), 0)
+    except Exception:
+        return False
+    try:
+        if _psutil and _psutil.Process(int(r[0])).status() == _psutil.STATUS_ZOMBIE:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _p2_recent_before_snapshot(dep_id):
+    """Newest recent snapshot taken right before a code change (edit / auto-deploy / restore).
+    None if the latest event was a rollback (nothing to fall back to) or nothing recent exists."""
+    now = time.time()
+    for s in snapshot_list(dep_id):                      # newest first
+        stamp, _, slug = s.stem.partition("__")
+        if not slug.startswith("before"):
+            continue
+        try:
+            t = datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()
+        except Exception:
+            continue
+        if now - t > SAFE_SNAP_MAX_AGE:
+            return None
+        if slug.startswith(("before-rollback", "before-auto-rollback")):
+            return None
+        return s
+    return None
+
+
+def _p2_safe_watch(dep_id, snap):
+    """After a deploy/restart that followed code changes: if the bot isn't alive and stable, roll back."""
+    if dep_id in _P2_WATCH:
+        return
+    _P2_WATCH.add(dep_id)
+    try:
+        def crashes():
+            r = db_execute("SELECT COALESCE(crash_restart_count,0) FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+            return r[0] if r else 0
+        c0 = crashes()
+        sleep(SAFE_VERIFY_SECS)
+        stable = _p2_alive(dep_id) and crashes() <= c0
+        if stable:
+            sleep(max(5, SAFE_VERIFY_SECS // 4))
+            if _p2_alive(dep_id) and crashes() <= c0:
+                return
+        d = _fp_dep(dep_id)
+        if not d or d["status"] not in ('active', 'crashed'):
+            return
+        ok, msg = apply_zip_to_deployment(d, snap, "auto-rollback")
+        if not ok:
+            send_message(d["owner"], f"⚠️ *Bot #{dep_id}* crashed after the update and the automatic rollback failed: {msg[:120]}")
+            return
+        res = _fp_restart(dep_id, "rollback")
+        audit(d["owner"], "auto_rollback", dep_id, snap.name)
+        sleep(SAFE_VERIFY_SECS // 2)
+        alive = _p2_alive(dep_id)
+        send_message(d["owner"], (f"↩️ *Safe deploy — automatic rollback (#{dep_id})*\n\nYour latest change made the bot crash, "
+                                  f"so I restored the previous working version (`{_snap_label(snap)}`) and restarted it. "
+                                  f"{'It is running again ✅' if alive else 'It is still not running — check the logs.'}\n\n"
+                                  f"Check Logs to see what went wrong before trying again."),
+                     _fp_kb([_fp_btn("📜 Logs", f"fp_logs_{dep_id}"), _fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+    except Exception as e:
+        print(f"⚠️ safe watch #{dep_id}: {e}")
+    finally:
+        _P2_WATCH.discard(dep_id)
+
+
+def _p2_safe_off(dep_id):
+    r = _q("SELECT COALESCE(safe_off, 0) FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    return bool(r and r[0])
+
+
+def _p2_maybe_watch(dep_id):
+    try:
+        st = _fp_settings(dep_id)
+        off = db_execute("SELECT safe_off FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+        if off and off[0]:
+            return
+        snap = _p2_recent_before_snapshot(dep_id)
+        if snap:
+            threading.Thread(target=_p2_safe_watch, args=(dep_id, snap), daemon=True, name=f"SafeWatch{dep_id}").start()
+    except Exception as e:
+        print(f"⚠️ maybe_watch: {e}")
+
+
+def _p2_r_safe(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    dep_id = int(p[2]) if len(p) > 2 and p[2].isdigit() else None
+    if not dep_id or not _fp_own(uid, dep_id):
+        return True
+    _fp_settings(dep_id)
+    _q("UPDATE dep_settings SET safe_off = 1 - COALESCE(safe_off, 0) WHERE deployment_id = ?", (dep_id,))
+    fp_tools_menu(chat_id, mid, uid, dep_id)
+    return True
+
+
+_P2_ROUTES.append(("p2_safe_", _p2_r_safe))
+
+def _p2_install_safe_hooks():
+    g = globals()
+    _rd, _ar = g['restart_deployment'], g['_auto_relaunch_deployment']
+
+    def rd(deployment_id, *a, **k):
+        r = _rd(deployment_id, *a, **k)
+        _p2_maybe_watch(deployment_id)
+        return r
+
+    def ar(deployment_id, reason="crash", bypass_cap=False):
+        r = _ar(deployment_id, reason=reason, bypass_cap=bypass_cap)
+        if reason == "update" and r == "restarted":
+            _p2_maybe_watch(deployment_id)
+        return r
+    g['restart_deployment'], g['_auto_relaunch_deployment'] = rd, ar
+
+
+_p2_install_safe_hooks()
+
+
+# ---------------------------------------------------------------- HTTP layer: public URLs, payment webhooks, Mini App
+import http.client as _hc
+_P2_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers',
+           'transfer-encoding', 'upgrade', 'host', 'content-length'}
+_P2_PROXY_SEM = {}
+_P2_PROXY_RATE = {}
+
+
+def _p2_send(h, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+    if isinstance(body, str):
+        body = body.encode()
+    try:
+        h.send_response(code)
+        h.send_header('Content-Type', ctype)
+        h.send_header('Content-Length', str(len(body)))
+        for k, v in (extra or {}).items():
+            h.send_header(k, v)
+        h.end_headers()
+        if getattr(h, 'command', '') != 'HEAD':
+            h.wfile.write(body)
+    except Exception:
+        pass
+
+
+def _p2_body(h, limit=5_000_000):
+    try:
+        n = int(h.headers.get('Content-Length') or 0)
+    except Exception:
+        n = 0
+    return h.rfile.read(min(n, limit)) if n > 0 else b''
+
+
+def public_url_for(dep_id):
+    base = _public_base_url()
+    return f"{base}/b/{dep_id}/" if base else None
+
+
+def p2_proxy(h, method, dep_id, rest):
+    r = _q("SELECT public FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    d = _fp_dep(dep_id)
+    if not r or not r[0] or not d or d["status"] != 'active' or get_ban_info(d["owner"]):
+        _p2_send(h, 404, "Not found"); return
+    port = d["env"].get("PORT") or d["env"].get("BOT_PORT")
+    if not str(port).isdigit():
+        _p2_send(h, 502, "This bot has no web port"); return
+    now = time.time()
+    hits = [t for t in _P2_PROXY_RATE.get(dep_id, []) if now - t < 10]
+    if len(hits) >= 200:
+        _p2_send(h, 429, "Too many requests"); return
+    hits.append(now)
+    _P2_PROXY_RATE[dep_id] = hits
+    sem = _P2_PROXY_SEM.setdefault(dep_id, threading.BoundedSemaphore(8))
+    if not sem.acquire(timeout=5):
+        _p2_send(h, 503, "Busy"); return
+    try:
+        body = _p2_body(h) if method in ("POST", "PUT", "PATCH", "DELETE") else None
+        hdrs = {k: v for k, v in h.headers.items() if k.lower() not in _P2_HOP}
+        hdrs["X-Forwarded-For"] = h.client_address[0]
+        hdrs["X-Forwarded-Prefix"] = f"/b/{dep_id}"
+        conn = _hc.HTTPConnection("127.0.0.1", int(port), timeout=25)
+        try:
+            conn.request(method, rest or "/", body=body, headers=hdrs)
+            resp = conn.getresponse()
+            data = resp.read(10_000_000)
+            h.send_response(resp.status)
+            for k, v in resp.getheaders():
+                kl = k.lower()
+                if kl in _P2_HOP:
+                    continue
+                if kl == "set-cookie":                       # keep every bot's cookies inside its own /b/<id>/ path
+                    v = re.sub(r';\s*Domain=[^;]*', '', v, flags=re.I)
+                    v = (re.sub(r'Path=[^;]*', f'Path=/b/{dep_id}/', v, flags=re.I) if re.search(r'Path=', v, re.I)
+                         else v + f'; Path=/b/{dep_id}/')
+                elif kl == "location" and v.startswith("/") and not v.startswith("//"):
+                    v = f"/b/{dep_id}" + v
+                h.send_header(k, v)
+            h.send_header('Content-Length', str(len(data)))
+            h.end_headers()
+            if method != "HEAD":
+                h.wfile.write(data)
+        finally:
+            conn.close()
+    except Exception:
+        _p2_send(h, 502, "The bot did not respond")
+    finally:
+        sem.release()
+
+
+_P2_HTTP = []              # extra handlers: fn(h, method, path) -> bool
+
+
+def p2_http(h, method):
+    """Entry for HealthHandler. -> True if the request was handled here."""
+    try:
+        path = h.path.split('?')[0]
+        m = re.match(r'^/b/(\d+)(/.*)?$', path)
+        if m:
+            q = h.path.split('?', 1)[1] if '?' in h.path else ''
+            p2_proxy(h, method, int(m.group(1)), (m.group(2) or "/") + (("?" + q) if q else ""))
+            return True
+        for fn in _P2_HTTP:
+            if fn(h, method, path):
+                return True
+    except Exception as e:
+        print(f"⚠️ p2_http: {e}")
+        _p2_send(h, 500, "error"); return True
+    return False
+
+
+def _p2_r_pub(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    dep_id = int(p[2]) if len(p) > 2 and p[2].isdigit() else None
+    d = _fp_own(uid, dep_id) if dep_id else None
+    if not d or (d["owner"] != uid and not is_admin(uid)):
+        return True
+    _fp_settings(dep_id)
+    if p[1] == "pubtog":
+        _q("UPDATE dep_settings SET public = 1 - COALESCE(public, 0) WHERE deployment_id = ?", (dep_id,))
+        audit(uid, "public_url_toggle", dep_id)
+    r = _q("SELECT public FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    on = bool(r and r[0])
+    url = public_url_for(dep_id)
+    port = d["env"].get("PORT") or d["env"].get("BOT_PORT")
+    txt = (f"*🌍 PUBLIC URL — #{dep_id}*\n\nStatus: `{'ON 🟢' if on else 'OFF ⚪'}`\n"
+           + (f"URL: `{url}`\n" if on and url else "")
+           + ("\nThis forwards web traffic to your bot's web server (port `%s`). Use it for webhooks, APIs and dashboards. "
+              "Anyone with the link can reach it, so keep secrets in your own auth.\n" % port if str(port).isdigit() else "")
+           + ("\n⚠️ No public base URL is configured on the host (set `PUBLIC_BASE_URL`)." if not url else ""))
+    edit_message(chat_id, mid, txt, _fp_kb([_fp_btn("🔴 Turn OFF" if on else "🟢 Turn ON", f"p2_pubtog_{dep_id}")],
+                                          [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_pub", _p2_r_pub))
+
+
+
+# ---------------------------------------------------------------- local payments (Paystack / Flutterwave / USDT)
+def _p2_packs(kind="local"):
+    raw = os.environ.get("COIN_PACKS_USD" if kind == "usd" else "COIN_PACKS", "")
+    out = []
+    for part in raw.split(","):
+        try:
+            c, pr = part.strip().split(":")
+            if int(c) > 0 and float(pr) > 0:
+                out.append((int(c), float(pr)))
+        except Exception:
+            continue
+    return out
+
+
+def _p2_providers():
+    cur = os.environ.get("PAY_CURRENCY", "NGN").upper()
+    out = []
+    if os.environ.get("PAYSTACK_SECRET_KEY") and _p2_packs():
+        out.append(("paystack", "💳 Paystack", cur))
+    if os.environ.get("FLW_SECRET_KEY") and os.environ.get("FLW_SECRET_HASH") and _p2_packs():
+        out.append(("flutterwave", "🦋 Flutterwave", cur))
+    if os.environ.get("NOWPAYMENTS_API_KEY") and os.environ.get("NOWPAYMENTS_IPN_SECRET") and _p2_packs("usd"):
+        out.append(("usdt", "🪙 USDT (crypto)", "USD"))
+    return out
+
+
+def _p2_api(method, url, headers=None, body=None, timeout=20):
+    """-> (status, parsed json or {})"""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=dict({"Content-Type": "application/json", "User-Agent": "BotHosting/2"}, **(headers or {})))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        print(f"⚠️ pay api {url[:40]}: {e}")
+        return 0, {}
+
+
+def p2_create_order(uid, provider, coins, price, email=None):
+    """-> (ok, url_or_error)"""
+    base = _public_base_url()
+    if not base:
+        return False, "Payments need a public URL on the host (PUBLIC_BASE_URL)."
+    ref = f"HB{uid}-{secrets.token_hex(5)}"
+    if provider == "paystack":
+        cur = os.environ.get("PAY_CURRENCY", "NGN").upper()
+        minor = int(round(price * 100))
+        st, j = _p2_api("POST", "https://api.paystack.co/transaction/initialize",
+                        {"Authorization": "Bearer " + os.environ["PAYSTACK_SECRET_KEY"]},
+                        {"email": email, "amount": minor, "currency": cur, "reference": ref,
+                         "callback_url": base + "/pay/done", "metadata": {"user_id": uid, "coins": coins}})
+        url = (j.get("data") or {}).get("authorization_url")
+    elif provider == "flutterwave":
+        cur = os.environ.get("PAY_CURRENCY", "NGN").upper()
+        minor = int(round(price * 100))
+        st, j = _p2_api("POST", "https://api.flutterwave.com/v3/payments",
+                        {"Authorization": "Bearer " + os.environ["FLW_SECRET_KEY"]},
+                        {"tx_ref": ref, "amount": price, "currency": cur, "redirect_url": base + "/pay/done",
+                         "customer": {"email": email}, "customizations": {"title": "Buy coins"}})
+        url = (j.get("data") or {}).get("link")
+    elif provider == "usdt":
+        cur, minor = "USD", int(round(price * 100))
+        st, j = _p2_api("POST", "https://api.nowpayments.io/v1/invoice",
+                        {"x-api-key": os.environ["NOWPAYMENTS_API_KEY"]},
+                        {"price_amount": price, "price_currency": "usd", "pay_currency": "usdttrc20", "order_id": ref,
+                         "ipn_callback_url": base + "/pay/usdt", "success_url": base + "/pay/done",
+                         "order_description": f"{coins} coins"})
+        url = j.get("invoice_url")
+    else:
+        return False, "Unknown provider."
+    if not url:
+        return False, "The payment provider didn't accept the request. Try again later."
+    _q("INSERT INTO payment_orders (ref, user_id, provider, coins, amount_minor, currency, status, created_at, email) "
+       "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)", (ref, uid, provider, coins, minor, cur, _now(), email))
+    return True, url
+
+
+def p2_credit_order(ref, provider, paid_minor, currency):
+    """Idempotent. Amount/currency must match what we asked for. -> True if credited now."""
+    o = _q("SELECT user_id, coins, amount_minor, currency, status, provider FROM payment_orders WHERE ref = ?", (ref,), fetch='one')
+    if not o or o[5] != provider or o[4] == 'paid':
+        return False
+    if currency and str(currency).upper() != o[3].upper():
+        print(f"⚠️ pay {ref}: currency mismatch {currency} != {o[3]}"); return False
+    if paid_minor is None or int(paid_minor) < int(o[2]):
+        print(f"⚠️ pay {ref}: underpaid {paid_minor} < {o[2]}"); return False
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE payment_orders SET status='paid', paid_at=? WHERE ref=? AND status != 'paid'", (_now(), ref))
+        conn.commit()
+        if cur.rowcount != 1:
+            return False
+    finally:
+        conn.close()
+    update_user_coins(o[0], int(o[1]), "local_payment", ref)
+    audit("system", "payment_paid", o[0], f"{provider} {ref} +{o[1]}")
+    try:
+        async_backup(f"payment_{ref}")
+    except Exception:
+        pass
+    send_message(o[0], f"✅ *Payment received!*\n\n+{o[1]} 🪙 added to your balance.", _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+    return True
+
+
+def p2_payment_webhook(provider, body, headers):
+    """-> (http code, text). Signature checked FIRST; money only moves after provider-side verification."""
+    try:
+        if provider == "done":
+            return 200, "Payment received. You can return to Telegram."
+        if provider == "paystack":
+            key = os.environ.get("PAYSTACK_SECRET_KEY", "")
+            sig = headers.get("x-paystack-signature", "")
+            if not key or not hmac.compare_digest(hmac.new(key.encode(), body, hashlib.sha512).hexdigest(), sig):
+                return 401, "bad signature"
+            ev = json.loads(body)
+            if ev.get("event") != "charge.success":
+                return 200, "ignored"
+            ref = (ev.get("data") or {}).get("reference")
+            st, j = _p2_api("GET", f"https://api.paystack.co/transaction/verify/{urllib.parse.quote(str(ref))}",
+                            {"Authorization": "Bearer " + key})
+            if st == 0:
+                return 503, "retry"
+            dd = j.get("data") or {}
+            if dd.get("status") == "success":
+                p2_credit_order(ref, "paystack", dd.get("amount"), dd.get("currency"))
+            return 200, "ok"
+        if provider == "flutterwave":
+            want = os.environ.get("FLW_SECRET_HASH", "")
+            if not want or not hmac.compare_digest(headers.get("verif-hash", ""), want):
+                return 401, "bad signature"
+            ev = json.loads(body)
+            ref = (ev.get("data") or {}).get("tx_ref") or ev.get("txRef")
+            if not ref:
+                return 200, "ignored"
+            st, j = _p2_api("GET", "https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref="
+                            + urllib.parse.quote(str(ref)), {"Authorization": "Bearer " + os.environ.get("FLW_SECRET_KEY", "")})
+            if st == 0:
+                return 503, "retry"
+            dd = j.get("data") or {}
+            if dd.get("status") == "successful":
+                p2_credit_order(ref, "flutterwave", int(round(float(dd.get("amount", 0)) * 100)), dd.get("currency"))
+            return 200, "ok"
+        if provider == "usdt":
+            key = os.environ.get("NOWPAYMENTS_IPN_SECRET", "")
+            ev = json.loads(body)
+            canon = json.dumps(ev, sort_keys=True, separators=(',', ':'))
+            sig = headers.get("x-nowpayments-sig", "")
+            if not key or not hmac.compare_digest(hmac.new(key.encode(), canon.encode(), hashlib.sha512).hexdigest(), sig):
+                return 401, "bad signature"
+            if ev.get("payment_status") == "finished" and str(ev.get("price_currency", "")).lower() == "usd":
+                p2_credit_order(ev.get("order_id"), "usdt", int(round(float(ev.get("price_amount", 0)) * 100)), "USD")
+            return 200, "ok"
+    except Exception as e:
+        print(f"⚠️ pay webhook {provider}: {e}")
+        return 500, "error"
+    return 404, "not found"
+
+
+def p2_buy_menu(chat_id, mid, uid):
+    provs = _p2_providers()
+    if not provs:
+        edit_message(chat_id, mid, "*💳 BUY COINS*\n\nLocal payments aren't set up on this host yet.",
+                     _fp_kb([_fp_btn("🔙 More", "fp_more")])); return
+    edit_message(chat_id, mid, "*💳 BUY COINS*\n\nPick a payment method:",
+                 _fp_kb(*[[_fp_btn(label, f"p2_bprov_{k}")] for k, label, _ in provs], [_fp_btn("🔙 More", "fp_more")]))
+
+
+def _p2_r_buy(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    if data == "p2_buy":
+        p2_buy_menu(chat_id, mid, uid); return True
+    provs = {k: (label, cur) for k, label, cur in _p2_providers()}
+    if p[1] == "bprov" and len(p) > 2 and p[2] in provs:
+        packs = _p2_packs("usd" if p[2] == "usdt" else "local")
+        cur = provs[p[2]][1]
+        edit_message(chat_id, mid, f"*{provs[p[2]][0]}*\n\nChoose a coin pack:",
+                     _fp_kb(*[[_fp_btn(f"{c} 🪙 — {pr:g} {cur}", f"p2_bpack_{p[2]}_{i}")] for i, (c, pr) in enumerate(packs)],
+                            [_fp_btn("🔙 Back", "p2_buy")])); return True
+    if p[1] == "bpack" and len(p) > 3 and p[2] in provs and p[3].isdigit():
+        packs = _p2_packs("usd" if p[2] == "usdt" else "local")
+        i = int(p[3])
+        if i >= len(packs):
+            return True
+        coins, price = packs[i]
+        if p[2] != "usdt":
+            em = kv_get(f"email_{uid}")
+            if not em:
+                set_user_step(uid, 'fp_p2email')
+                _P2_PEND[uid] = {"data": data, "chat": chat_id, "mid": mid, "ts": time.time()}
+                edit_message(chat_id, mid, "📧 Send the email address for your payment receipt.",
+                             _fp_kb([_fp_btn("❌ Cancel", "p2_buy")])); return True
+        else:
+            em = None
+        edit_message(chat_id, mid, "⏳ Creating your payment link…")
+        ok, res = p2_create_order(uid, p[2], coins, price, em)
+        if ok:
+            edit_message(chat_id, mid, f"*💳 PAY — {coins} 🪙*\n\nOpen the secure payment page below. Coins are added automatically "
+                         f"a moment after you pay.", _fp_kb([{"text": "💳 Pay now", "url": res}], [_fp_btn("🔙 Back", "p2_buy")]))
+        else:
+            edit_message(chat_id, mid, f"❌ {res}", _fp_kb([_fp_btn("🔙 Back", "p2_buy")]))
+        return True
+    return False
+
+
+def _p2_text_email(message, user_step, uid, chat_id, text):
+    if not re.fullmatch(r'[^@\s]{1,64}@[^@\s]{1,120}\.[A-Za-z]{2,}', text):
+        set_user_step(uid, 'fp_p2email')
+        send_message(chat_id, "❌ That doesn't look like an email. Try again:", _fp_kb([_fp_btn("❌ Cancel", "p2_buy")])); return True
+    kv_set(f"email_{uid}", text)
+    pend = _P2_PEND.pop(uid, None)
+    if pend:
+        _p2_redispatch(uid, pend)
+    return True
+
+
+_P2_TEXT['fp_p2email'] = _p2_text_email
+_P2_ROUTES.append(("p2_buy", _p2_r_buy))
+_P2_ROUTES.append(("p2_bprov_", _p2_r_buy))
+_P2_ROUTES.append(("p2_bpack_", _p2_r_buy))
+_P2_MORE_ROWS.append([_fp_btn("💳 Buy coins (local)", "p2_buy")])
+
+
+def _p2_http_pay(h, method, path):
+    if not path.startswith("/pay/"):
+        return False
+    if method == "POST":
+        code, txt = p2_payment_webhook(path[5:].strip('/'), _p2_body(h, 1_000_000), h.headers)
+        _p2_send(h, code, txt)
+    elif path.rstrip('/') == "/pay/done":
+        _p2_send(h, 200, "<html><body style='font-family:sans-serif;text-align:center;padding:3em'><h2>Thank you!</h2>"
+                         "<p>Your payment is being confirmed. Return to Telegram - your coins appear automatically.</p></body></html>",
+                 "text/html; charset=utf-8")
+    else:
+        _p2_send(h, 404, "not found")
+    return True
+
+
+_P2_HTTP.append(_p2_http_pay)
+
+
+def p2_admin_pay(chat_id, mid):
+    rows = _q("SELECT ref, user_id, provider, coins, status, created_at FROM payment_orders ORDER BY created_at DESC LIMIT 12",
+              fetch='all') or []
+    prov = ", ".join(k for k, _, _ in _p2_providers()) or "none configured"
+    paid = _q("SELECT COUNT(*), COALESCE(SUM(coins),0) FROM payment_orders WHERE status='paid'", fetch='one')
+    lines = [f"*💳 LOCAL PAYMENTS*", "", f"Providers: `{prov}`", f"Paid orders: `{paid[0]}` · coins sold: `{paid[1]}`", ""]
+    for ref, u, p, c, s, t in rows:
+        lines.append(f"{'✅' if s == 'paid' else '⏳'} `{u}` {p} +{c}🪙 {t[5:16]}")
+    if not rows:
+        lines.append("_No orders yet._")
+    edit_message(chat_id, mid, "\n".join(lines), _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")]))
+
+
+def _p2_r_apay(callback, data, uid, chat_id, mid):
+    if is_admin(uid):
+        p2_admin_pay(chat_id, mid)
+    return True
+
+
+_P2_ROUTES.append(("p2_apay", _p2_r_apay))
+_P2_ADMIN_ROWS.append([_fp_btn("💳 Local payments", "p2_apay")])
+
+
+# ---------------------------------------------------------------- auto-renew with coins
+_P2_RENEW_PLANS = {"monthly": (30, "PRICE_MONTHLY_COINS"), "yearly": (365, "PRICE_YEARLY_COINS")}
+
+
+def _p2_plan_price(plan):
+    days, name = _P2_RENEW_PLANS[plan]
+    return days, int(globals()[name])
+
+
+def p2_autorenew_on(dep_id):
+    r = _q("SELECT COALESCE(autorenew, 0) FROM dep_settings WHERE deployment_id = ?", (dep_id,), fetch='one')
+    return bool(r and r[0])
+
+
+def p2_autorenew_tick():
+    """Renew coin-paid plans 24h before they expire; remind 3 days before. Idempotent. -> (renewed, warned)"""
+    renewed = warned = 0
+    now = datetime.now()
+    rows = _q("SELECT d.deployment_id, d.user_id, d.plan, d.expire_time FROM deployments d "
+              "JOIN dep_settings s ON s.deployment_id = d.deployment_id "
+              "WHERE s.autorenew = 1 AND d.status = 'active' AND COALESCE(d.is_free, 0) = 0 "
+              "AND d.plan IN ('monthly', 'yearly') AND d.expire_time IS NOT NULL", fetch='all') or []
+    for dep_id, uid, plan, exp_s in rows:
+        try:
+            exp = datetime.fromisoformat(exp_s)
+            left = exp - now
+            if left.total_seconds() <= 0 or left > timedelta(days=3) or get_ban_info(uid):
+                continue
+            if _premium_covers_plan_core(uid, plan):
+                continue                                   # the premium subscription already extends this bot
+            days, price = _p2_plan_price(plan)
+            bal = get_user_balances(uid)['coins']
+            if left > timedelta(hours=24):                 # 3-day heads-up, once per expiry
+                key = f"renewrem_{dep_id}_{exp_s}"
+                if not kv_get(key):
+                    kv_set(key, "1")
+                    send_message(uid, f"🔁 *Auto-renew #{dep_id}* — in about {int(left.total_seconds() // 3600 // 24) + 1} day(s) "
+                                      f"I'll renew this {plan} bot for `{price}🪙`.\nYour balance: `{bal}🪙`"
+                                      + ("" if bal >= price else "\n⚠️ That's not enough — top up so it doesn't expire."),
+                                 _fp_kb([_fp_btn("🔁 Settings", f"p2_ren_{dep_id}")]))
+                    warned += 1
+                continue
+            if bal < price:
+                key = f"renewlow_{dep_id}_{exp_s}"
+                if not kv_get(key):
+                    kv_set(key, "1")
+                    send_message(uid, f"⚠️ *Auto-renew #{dep_id} failed* — it needs `{price}🪙` but you have `{bal}🪙`. "
+                                      f"Top up before it expires on `{exp_s[:16]}`.",
+                                 _fp_kb([_fp_btn("🔁 Settings", f"p2_ren_{dep_id}"), _fp_btn("🏠 Menu", "main_menu")]))
+                    warned += 1
+                continue
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            try:
+                cur = conn.execute("INSERT OR IGNORE INTO renew_log (deployment_id, expire_from, renewed_at) VALUES (?, ?, ?)",
+                                   (dep_id, exp_s, _now()))
+                conn.commit()
+                claimed = cur.rowcount == 1
+            finally:
+                conn.close()
+            if not claimed:                                  # this expiry was already renewed
+                continue
+            update_user_coins(uid, -price, "deployment", f"autorenew_{dep_id}")
+            if get_user_balances(uid)['coins'] < 0:         # lost a race with another spend → undo
+                update_user_coins(uid, price, "deployment_refund", f"autorenew_{dep_id}")
+                db_execute("DELETE FROM renew_log WHERE deployment_id = ? AND expire_from = ?", (dep_id, exp_s))
+                continue
+            new_exp = exp + timedelta(days=days)
+            db_execute("UPDATE deployments SET expire_time = ? WHERE deployment_id = ? AND expire_time = ?",
+                       (new_exp.isoformat(), dep_id, exp_s))
+            audit("system", "autorenew", dep_id, f"{plan} -{price} -> {new_exp.date()}")
+            try:
+                async_backup(f"autorenew_{dep_id}")
+            except Exception:
+                pass
+            send_message(uid, f"✅ *Auto-renewed #{dep_id}* — {plan} plan extended to `{new_exp.strftime('%Y-%m-%d')}` "
+                              f"for `{price}🪙`.\nBalance: `{get_user_balances(uid)['coins']}🪙`",
+                         _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
+            renewed += 1
+        except Exception as e:
+            print(f"⚠️ autorenew #{dep_id}: {e}")
+    return renewed, warned
+
+
+def p2_autorenew_monitor():
+    sleep(120)
+    print("✅ Auto-renew monitor started")
+    while True:
+        try:
+            p2_autorenew_tick()
+        except Exception as e:
+            print(f"⚠️ autorenew monitor: {e}")
+        sleep(1800)
+
+
+def _p2_r_renew(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    dep_id = int(p[2]) if len(p) > 2 and p[2].isdigit() else None
+    d = _fp_own(uid, dep_id) if dep_id else None
+    if not d:
+        return True
+    row = _q("SELECT plan, COALESCE(is_free, 0) FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    plan, is_free = row[0], row[1]
+    eligible = (plan in _P2_RENEW_PLANS) and not is_free
+    _fp_settings(dep_id)
+    if p[1] == "rentog" and eligible:
+        _q("UPDATE dep_settings SET autorenew = 1 - COALESCE(autorenew, 0) WHERE deployment_id = ?", (dep_id,))
+        audit(uid, "autorenew_toggle", dep_id)
+    on = p2_autorenew_on(dep_id)
+    if eligible:
+        days, price = _p2_plan_price(plan)
+        txt = (f"*🔁 AUTO-RENEW — #{dep_id}*\n\nStatus: `{'ON 🟢' if on else 'OFF ⚪'}`\nPlan: `{plan}` · renews for `{price}🪙` "
+               f"(+{days} days)\n\nWhen ON: you get a reminder 3 days before expiry, and the plan is renewed from your coin "
+               f"balance 24h before it ends. If your balance is too low you're warned instead — nothing is charged.\n"
+               f"Balance: `{get_user_balances(d['owner'])['coins']}🪙`")
+        kb = _fp_kb([_fp_btn("🔴 Turn OFF" if on else "🟢 Turn ON", f"p2_rentog_{dep_id}")], [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")])
+    else:
+        txt = (f"*🔁 AUTO-RENEW — #{dep_id}*\n\nOnly paid *monthly* and *yearly* bots can auto-renew. "
+               f"This bot's plan is `{'free' if is_free else plan}`.")
+        kb = _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")])
+    edit_message(chat_id, mid, txt, kb)
+    return True
+
+
+_P2_ROUTES.append(("p2_ren", _p2_r_renew))
+
+
+# ---------------------------------------------------------------- referral commission
+_COM_SPEND_TYPES = ("deployment", "premium_subscription", "resource_tier")
+
+
+def com_settings():
+    try:
+        pct = max(0, min(50, int(kv_get("commission_pct", "10"))))
+    except Exception:
+        pct = 10
+    try:
+        months = max(1, min(24, int(kv_get("commission_months", "3"))))
+    except Exception:
+        months = 3
+    return pct, months
+
+
+def p2_commission_on_spend(uid, spent, source=""):
+    pct, months = com_settings()
+    if pct <= 0 or spent <= 0:
+        return 0
+    r = _q("SELECT referrer_id, created_at FROM referrals WHERE referred_id = ? AND reward_given = 1", (uid,), fetch='one')
+    if not r or int(r[0]) == uid or get_ban_info(int(r[0])):
+        return 0
+    try:
+        if datetime.now() - datetime.fromisoformat(r[1]) > timedelta(days=30 * months):
+            return 0
+    except Exception:
+        return 0
+    coins = int(spent * pct / 100)
+    if coins < 1:
+        return 0
+    referrer = int(r[0])
+    _p2_coins_orig(referrer, coins, "referral_commission", f"from_{uid}")
+    _q("INSERT INTO commission_ledger (referrer, referred, coins, spend, ts, reversed, tx_ref) VALUES (?, ?, ?, ?, ?, 0, ?)",
+       (referrer, uid, coins, int(spent), _now(), source))
+    try:
+        send_message(referrer, f"💸 *Referral commission* +{coins}🪙 — a friend you invited just spent {int(spent)}🪙.",
+                     _fp_kb([_fp_btn("💸 My commissions", "p2_com")]))
+    except Exception:
+        pass
+    return coins
+
+
+def p2_commission_reverse(uid, refunded):
+    """A purchase by `uid` was refunded → take the matching commission back."""
+    row = _q("SELECT id, referrer, coins FROM commission_ledger WHERE referred = ? AND reversed = 0 AND spend = ? "
+             "ORDER BY id DESC LIMIT 1", (uid, int(refunded)), fetch='one')
+    if not row:
+        return 0
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE commission_ledger SET reversed = 1 WHERE id = ? AND reversed = 0", (row[0],))
+        conn.commit()
+        if cur.rowcount != 1:
+            return 0
+    finally:
+        conn.close()
+    _p2_coins_orig(int(row[1]), -int(row[2]), "referral_commission_reversal", f"from_{uid}")
+    return int(row[2])
+
+
+def _p2_install_commission():
+    g = globals()
+    orig = g['update_user_coins']
+
+    def uuc(user_id, delta, transaction_type="balance_update", source="system"):
+        r = orig(user_id, delta, transaction_type, source)
+        try:
+            if delta < 0 and transaction_type in _COM_SPEND_TYPES:
+                p2_commission_on_spend(user_id, -delta, source)
+            elif delta > 0 and transaction_type == "deployment_refund":
+                p2_commission_reverse(user_id, delta)
+        except Exception as e:
+            print(f"⚠️ commission: {e}")
+        return r
+    g['_p2_coins_orig'] = orig
+    g['update_user_coins'] = uuc
+
+
+_p2_install_commission()
+
+
+def p2_commission_screen(chat_id, mid, uid):
+    pct, months = com_settings()
+    tot = _q("SELECT COALESCE(SUM(coins), 0), COUNT(*) FROM commission_ledger WHERE referrer = ? AND reversed = 0", (uid,), fetch='one')
+    nref = _q("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND reward_given = 1", (uid,), fetch='one')[0]
+    rows = _q("SELECT coins, ts, reversed FROM commission_ledger WHERE referrer = ? ORDER BY id DESC LIMIT 8", (uid,), fetch='all') or []
+    lines = ["*💸 REFERRAL COMMISSIONS*", ""]
+    if pct <= 0:
+        lines.append("Commissions are currently switched off.")
+    else:
+        lines.append(f"Earn *{pct}%* of every coin spent by people you invited, for *{months} month(s)* after they join.")
+    lines += ["", f"Verified referrals: `{nref}`", f"Earned so far: `{tot[0]}🪙` from `{tot[1]}` purchase(s)", ""]
+    for c, ts, rev in rows:
+        lines.append(f"{'↩️' if rev else '✅'} {'+' if not rev else '−'}{c}🪙 · {ts[5:16]}")
+    edit_message(chat_id, mid, "\n".join(lines), _fp_kb([_fp_btn("👥 My referrals", "my_referral")], [_fp_btn("🔙 More", "fp_more")]))
+
+
+def p2_admin_commission(chat_id, mid):
+    pct, months = com_settings()
+    tot = _q("SELECT COALESCE(SUM(coins), 0), COUNT(*) FROM commission_ledger WHERE reversed = 0", fetch='one')
+    mk = lambda v, cur, key: _fp_btn(("✅ " if v == cur else "") + (f"{v}%" if key == "pct" else f"{v} mo"), f"p2_acom_{key}_{v}")
+    edit_message(chat_id, mid, f"*💸 REFERRAL COMMISSION*\n\nRate: `{pct}%` of coins spent by referred users (0 = off)\n"
+                 f"Window: `{months}` month(s) from the day they joined\n\nPaid so far: `{tot[0]}🪙` ({tot[1]} payouts)",
+                 _fp_kb([mk(v, pct, "pct") for v in (0, 5, 10, 15, 20)],
+                        [mk(v, months, "mo") for v in (1, 3, 6, 12)],
+                        [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+
+
+def _p2_r_com(callback, data, uid, chat_id, mid):
+    if data == "p2_com":
+        p2_commission_screen(chat_id, mid, uid); return True
+    if data.startswith("p2_acom"):
+        if not is_admin(uid):
+            return True
+        p = data.split("_")
+        if len(p) == 4 and p[3].isdigit():
+            if p[2] == "pct" and int(p[3]) in (0, 5, 10, 15, 20):
+                kv_set("commission_pct", p[3]); audit(uid, "commission_pct", p[3])
+            elif p[2] == "mo" and int(p[3]) in (1, 3, 6, 12):
+                kv_set("commission_months", p[3]); audit(uid, "commission_months", p[3])
+        p2_admin_commission(chat_id, mid); return True
+    return False
+
+
+_P2_ROUTES.append(("p2_com", _p2_r_com))
+_P2_ROUTES.append(("p2_acom", _p2_r_com))
+_P2_MORE_ROWS.append([_fp_btn("💸 Referral commissions", "p2_com")])
+_P2_ADMIN_ROWS.append([_fp_btn("💸 Commission settings", "p2_acom")])
+
+
+# ---------------------------------------------------------------- gift a deployment
+GIFT_VALID_DAYS = 90
+_GIFT_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_GIFT_FAILS = {}
+
+
+def _gift_price(plan):
+    return {"monthly": (30, PRICE_MONTHLY_COINS), "yearly": (365, PRICE_YEARLY_COINS)}[plan]
+
+
+def _gift_new_code():
+    r = "".join(secrets.choice(_GIFT_ALPHA) for _ in range(8))
+    return f"GIFT-{r[:4]}-{r[4:]}"
+
+
+def _gift_norm(text):
+    t = re.sub(r'[^A-Z0-9]', '', (text or '').upper())
+    if t.startswith("GIFT"):
+        t = t[4:]
+    return f"GIFT-{t[:4]}-{t[4:]}" if len(t) == 8 else None
+
+
+def gift_buy(uid, plan):
+    """Charge coins and create a code. -> (ok, code_or_error)"""
+    if plan not in ("monthly", "yearly"):
+        return False, "Unknown plan."
+    days, cost = _gift_price(plan)
+    if get_user_balances(uid)['coins'] < cost:
+        return False, f"You need {cost}🪙 (balance {get_user_balances(uid)['coins']}🪙)."
+    code = _gift_new_code()
+    update_user_coins(uid, -cost, "gift_purchase", code)
+    if get_user_balances(uid)['coins'] < 0:                      # raced with another spend
+        update_user_coins(uid, cost, "gift_refund", code)
+        return False, "Your balance changed — try again."
+    _q("INSERT INTO gift_codes (code, plan, buyer, cost, created_at) VALUES (?, ?, ?, ?, ?)", (code, plan, uid, cost, _now()))
+    audit(uid, "gift_buy", code, f"{plan} {cost}")
+    return True, code
+
+
+def gift_redeem(uid, text):
+    """-> (ok, message)"""
+    now = time.time()
+    fails = [t for t in _GIFT_FAILS.get(uid, []) if now - t < 3600]
+    if len(fails) >= 5:
+        return False, "⛔ Too many wrong codes. Try again in an hour."
+    code = _gift_norm(text)
+    row = _q("SELECT plan, buyer, created_at, redeemed_by, cancelled FROM gift_codes WHERE code = ?", (code,), fetch='one') if code else None
+    bad = None
+    if not row or row[3] or row[4]:
+        bad = "❌ That gift code isn't valid (it may have been used or cancelled)."
+    else:
+        try:
+            if datetime.now() - datetime.fromisoformat(row[2]) > timedelta(days=GIFT_VALID_DAYS):
+                bad = "❌ That gift code has expired."
+        except Exception:
+            pass
+    if bad:
+        fails.append(now); _GIFT_FAILS[uid] = fails
+        return False, bad
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE gift_codes SET redeemed_by = ?, redeemed_at = ? WHERE code = ? AND redeemed_by IS NULL "
+                           "AND cancelled = 0", (uid, _now(), code))
+        conn.commit()
+        claimed = cur.rowcount == 1
+    finally:
+        conn.close()
+    if not claimed:
+        return False, "❌ That gift code was just used."
+    days, _ = _gift_price(row[0])
+    _q("INSERT INTO deploy_credits (user_id, plan, seconds_left, source_deployment, created_at, used) VALUES (?, ?, ?, 0, ?, 0)",
+       (uid, row[0], days * 86400, _now()))
+    audit(uid, "gift_redeem", code, row[0])
+    try:
+        send_message(row[1], f"🎁 Your gift `{code}` was redeemed — a {row[0]} deployment is now waiting for them.")
+    except Exception:
+        pass
+    try:
+        async_backup(f"gift_{code}")
+    except Exception:
+        pass
+    return True, (f"🎁 *Gift redeemed!* You now have a free *{row[0]}* deployment ({days} days). "
+                  f"Tap *Deploy* and pick the {row[0]} plan — it won't cost you anything.")
+
+
+def gift_cancel(uid, code):
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        r = conn.execute("SELECT cost FROM gift_codes WHERE code = ? AND buyer = ? AND redeemed_by IS NULL AND cancelled = 0",
+                         (code, uid)).fetchone()
+        if not r:
+            return False
+        cur = conn.execute("UPDATE gift_codes SET cancelled = 1 WHERE code = ? AND redeemed_by IS NULL AND cancelled = 0", (code,))
+        conn.commit()
+        if cur.rowcount != 1:
+            return False
+    finally:
+        conn.close()
+    update_user_coins(uid, int(r[0]), "gift_refund", code)
+    audit(uid, "gift_cancel", code)
+    return True
+
+
+def _g8(code):
+    return code.replace("GIFT-", "").replace("-", "")
+
+
+def _p2_gift_menu(chat_id, mid, uid):
+    edit_message(chat_id, mid, "*🎁 GIFTS*\n\nBuy a deployment for a friend with your coins. You get a code to send them; "
+                 "they redeem it here and deploy for free.",
+                 _fp_kb([_fp_btn(f"📅 Gift Monthly ({PRICE_MONTHLY_COINS}🪙)", "p2_gbuy_monthly")],
+                        [_fp_btn(f"🌟 Gift Yearly ({PRICE_YEARLY_COINS}🪙)", "p2_gbuy_yearly")],
+                        [_fp_btn("🎟 Redeem a gift code", "p2_gredeem"), _fp_btn("📋 My gifts", "p2_gmine")],
+                        [_fp_btn("🔙 More", "fp_more")]))
+
+
+def _p2_r_gift(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    if data == "p2_gift":
+        _p2_gift_menu(chat_id, mid, uid); return True
+    if data == "p2_gredeem":
+        set_user_step(uid, 'fp_p2gift')
+        edit_message(chat_id, mid, "*🎟 REDEEM GIFT*\n\nSend the gift code (looks like `GIFT-ABCD-2345`).",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_gift")])); return True
+    if p[1] == "gbuy" and len(p) == 3 and p[2] in ("monthly", "yearly"):
+        days, cost = _gift_price(p[2])
+        edit_message(chat_id, mid, f"*🎁 GIFT A {p[2].upper()} DEPLOYMENT*\n\nPrice: `{cost}🪙` ({days} days)\n"
+                     f"Your balance: `{get_user_balances(uid)['coins']}🪙`\n\nCodes are valid for {GIFT_VALID_DAYS} days. "
+                     f"You can cancel an unused gift for a full refund.",
+                     _fp_kb([_fp_btn("✅ Buy gift", f"p2_gbuyok_{p[2]}")], [_fp_btn("❌ Cancel", "p2_gift")])); return True
+    if p[1] == "gbuyok" and len(p) == 3:
+        ok_, res = gift_buy(uid, p[2])
+        if ok_:
+            edit_message(chat_id, mid, f"*🎁 GIFT READY*\n\nCode: `{res}`\n\nSend this code to your friend. They open the bot → "
+                         f"More → 🎁 Gifts → Redeem.", _fp_kb([_fp_btn("📋 My gifts", "p2_gmine")], [_fp_btn("🔙 Gifts", "p2_gift")]))
+        else:
+            edit_message(chat_id, mid, f"❌ {res}", _fp_kb([_fp_btn("🔙 Gifts", "p2_gift")]))
+        return True
+    if data == "p2_gmine":
+        rows = _q("SELECT code, plan, created_at, redeemed_by, cancelled FROM gift_codes WHERE buyer = ? ORDER BY created_at DESC LIMIT 10",
+                  (uid,), fetch='all') or []
+        lines = ["*📋 MY GIFTS*", ""] + [
+            f"`{c}` · {pl} · {'✅ redeemed' if rb else ('🚫 cancelled' if cx else '🟢 unused')}" for c, pl, ca, rb, cx in rows]
+        if not rows:
+            lines.append("_You haven't bought any gifts yet._")
+        kb = [[_fp_btn(f"🚫 Cancel {c[-4:]}", f"p2_gcxq_{_g8(c)}")] for c, pl, ca, rb, cx in rows if not rb and not cx]
+        edit_message(chat_id, mid, "\n".join(lines), _fp_kb(*kb, [_fp_btn("🔙 Gifts", "p2_gift")])); return True
+    if p[1] == "gcxq" and len(p) == 3 and len(p[2]) == 8:
+        edit_message(chat_id, mid, f"🚫 *Cancel gift* `GIFT-{p[2][:4]}-{p[2][4:]}`?\n\nYou get the coins back and the code stops working.",
+                     _fp_kb([_fp_btn("✅ Yes, cancel", f"p2_gcx_{p[2]}"), _fp_btn("❌ No", "p2_gmine")])); return True
+    if p[1] == "gcx" and len(p) == 3 and len(p[2]) == 8:
+        code = f"GIFT-{p[2][:4]}-{p[2][4:]}"
+        ok_ = gift_cancel(uid, code)
+        edit_message(chat_id, mid, "✅ Gift cancelled and coins refunded." if ok_ else "❌ That gift can't be cancelled (already used or cancelled).",
+                     _fp_kb([_fp_btn("📋 My gifts", "p2_gmine")])); return True
+    return False
+
+
+def _p2_text_gift(message, user_step, uid, chat_id, text):
+    ok_, msg = gift_redeem(uid, text)
+    send_message(chat_id, msg, _fp_kb([_fp_btn("🚀 Deploy", "deploy_new")] if ok_ else [_fp_btn("🔁 Try again", "p2_gredeem")],
+                                     [_fp_btn("🔙 Gifts", "p2_gift")]))
+    return True
+
+
+_P2_TEXT['fp_p2gift'] = _p2_text_gift
+_P2_ROUTES.append(("p2_g", _p2_r_gift))
+_P2_MORE_ROWS.append([_fp_btn("🎁 Gifts", "p2_gift")])
+
+
+# ---------------------------------------------------------------- support tickets
+TK_MAX_OPEN = 3
+TK_NEW_COOLDOWN = 600          # seconds between new tickets
+TK_REPLY_COOLDOWN = 20         # seconds between a user's messages
+TK_MAX_USER_MSGS = 20          # per ticket
+TK_MAX_LEN = 1500
+_TK_CTX = {}                   # uid -> ticket id being answered
+_TK_LAST = {}                  # (uid, kind) -> time
+
+
+def _tk_esc(s):
+    return re.sub(r'([_*`\[])', r'\\\1', s or '')
+
+
+def tk_create(uid, text):
+    """-> (ok, ticket id or error)"""
+    text = (text or '').strip()[:TK_MAX_LEN]
+    if not text:
+        return False, "Please send some text (photos and files aren't supported)."
+    n_open = _q("SELECT COUNT(*) FROM tickets WHERE user_id = ? AND status = 'open'", (uid,), fetch='one')[0]
+    if n_open >= TK_MAX_OPEN:
+        return False, f"You already have {TK_MAX_OPEN} open tickets. Close one first."
+    last = _TK_LAST.get((uid, 'new'), 0)
+    if time.time() - last < TK_NEW_COOLDOWN:
+        return False, f"Please wait {int(TK_NEW_COOLDOWN - (time.time() - last)) // 60 + 1} min before opening another ticket."
+    subject = text.split("\n")[0][:60]
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("INSERT INTO tickets (user_id, subject, status, created_at, updated_at, unread_admin, unread_user) "
+                           "VALUES (?, ?, 'open', ?, ?, 1, 0)", (uid, subject, _now(), _now()))
+        tid = cur.lastrowid
+        conn.execute("INSERT INTO ticket_msgs (ticket_id, sender, text, ts) VALUES (?, 'user', ?, ?)", (tid, text, _now()))
+        conn.commit()
+    finally:
+        conn.close()
+    _TK_LAST[(uid, 'new')] = time.time()
+    _tk_notify_admins(tid, uid, text, new=True)
+    return True, tid
+
+
+def tk_add(tid, sender, uid, text):
+    """sender 'user'|'admin'. -> (ok, error)"""
+    text = (text or '').strip()[:TK_MAX_LEN]
+    if not text:
+        return False, "Please send some text."
+    t = _q("SELECT user_id, status FROM tickets WHERE id = ?", (tid,), fetch='one')
+    if not t or (sender == 'user' and t[0] != uid):
+        return False, "Ticket not found."
+    if t[1] != 'open':
+        return False, "This ticket is closed."
+    if sender == 'user':
+        if time.time() - _TK_LAST.get((uid, 'rep'), 0) < TK_REPLY_COOLDOWN:
+            return False, "You're sending messages too fast. Wait a few seconds."
+        if _q("SELECT COUNT(*) FROM ticket_msgs WHERE ticket_id = ? AND sender = 'user'", (tid,), fetch='one')[0] >= TK_MAX_USER_MSGS:
+            return False, "This ticket reached its message limit. Close it and open a new one."
+        _TK_LAST[(uid, 'rep')] = time.time()
+    _q("INSERT INTO ticket_msgs (ticket_id, sender, text, ts) VALUES (?, ?, ?, ?)", (tid, sender, text, _now()))
+    _q("UPDATE tickets SET updated_at = ?, unread_admin = ?, unread_user = ? WHERE id = ?",
+       (_now(), 1 if sender == 'user' else 0, 1 if sender == 'admin' else 0, tid))
+    if sender == 'user':
+        _tk_notify_admins(tid, t[0], text)
+    else:
+        try:
+            send_message(t[0], f"🎫 *Support replied — ticket #{tid}*\n\n{_tk_esc(text)}",
+                         _fp_kb([_fp_btn("💬 Open ticket", f"p2_tkv_{tid}")]))
+        except Exception:
+            pass
+    return True, ""
+
+
+def _tk_notify_admins(tid, uid, text, new=False):
+    for a in list(ADMIN_IDS):
+        try:
+            send_message(a, f"🎫 *{'New ticket' if new else 'Reply on ticket'} #{tid}* from `{uid}`\n\n{_tk_esc(text[:600])}",
+                         _fp_kb([_fp_btn("💬 Open", f"p2_atkv_{tid}")]))
+        except Exception:
+            pass
+
+
+def tk_close(tid, by_admin, uid):
+    t = _q("SELECT user_id, status FROM tickets WHERE id = ?", (tid,), fetch='one')
+    if not t or t[1] != 'open' or (not by_admin and t[0] != uid):
+        return False
+    _q("UPDATE tickets SET status = 'closed', updated_at = ?, unread_admin = 0 WHERE id = ?", (_now(), tid))
+    if by_admin:
+        try:
+            send_message(t[0], f"🎫 Ticket #{tid} was closed by support. Open a new ticket if you still need help.")
+        except Exception:
+            pass
+    return True
+
+
+def _tk_thread(tid, limit=8):
+    rows = _q("SELECT sender, text, ts FROM ticket_msgs WHERE ticket_id = ? ORDER BY id DESC LIMIT ?", (tid, limit), fetch='all') or []
+    return "\n\n".join(f"{'🧑 You' if s == 'user' else '🛟 Support'} · {ts[5:16]}\n{_tk_esc(tx)}" for s, tx, ts in reversed(rows))
+
+
+def _p2_tk_menu(chat_id, mid, uid):
+    rows = _q("SELECT id, subject, status, unread_user FROM tickets WHERE user_id = ? ORDER BY updated_at DESC LIMIT 8", (uid,), fetch='all') or []
+    kb = [[_fp_btn(f"{'🔴' if u else ('🟢' if s == 'open' else '⚪')} #{i} {_tk_esc(sub)[:28]}", f"p2_tkv_{i}")] for i, sub, s, u in rows]
+    edit_message(chat_id, mid, "*🎫 SUPPORT*\n\nNeed help? Open a ticket and our team will reply here in the bot."
+                 + ("" if rows else "\n\n_You have no tickets yet._"),
+                 _fp_kb([_fp_btn("➕ New ticket", "p2_tknew")], *kb, [_fp_btn("🔙 More", "fp_more")]))
+
+
+def _p2_r_tk(callback, data, uid, chat_id, mid):
+    p = data.split("_")
+    if data == "p2_tk":
+        _p2_tk_menu(chat_id, mid, uid); return True
+    if data == "p2_tknew":
+        set_user_step(uid, 'fp_p2tknew')
+        edit_message(chat_id, mid, "*➕ NEW TICKET*\n\nDescribe your problem in one message (text only, up to "
+                     f"{TK_MAX_LEN} characters). Include your deployment number if it's about a bot.",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_tk")])); return True
+    if len(p) == 3 and p[2].isdigit():
+        tid = int(p[2])
+        t = _q("SELECT user_id, subject, status FROM tickets WHERE id = ?", (tid,), fetch='one')
+        if not t or t[0] != uid:
+            return True
+        if p[1] == "tkv":
+            _q("UPDATE tickets SET unread_user = 0 WHERE id = ?", (tid,))
+            kb = ([[_fp_btn("✍️ Reply", f"p2_tkr_{tid}"), _fp_btn("✅ Close", f"p2_tkc_{tid}")]] if t[2] == 'open' else [])
+            edit_message(chat_id, mid, f"*🎫 Ticket #{tid}* — {'open 🟢' if t[2] == 'open' else 'closed ⚪'}\n\n{_tk_thread(tid)}",
+                         _fp_kb(*kb, [_fp_btn("🔙 Support", "p2_tk")])); return True
+        if p[1] == "tkr" and t[2] == 'open':
+            _TK_CTX[uid] = tid
+            set_user_step(uid, 'fp_p2tkrep')
+            edit_message(chat_id, mid, f"✍️ Send your reply for ticket #{tid} (text only).",
+                         _fp_kb([_fp_btn("❌ Cancel", f"p2_tkv_{tid}")])); return True
+        if p[1] == "tkc":
+            tk_close(tid, False, uid)
+            edit_message(chat_id, mid, f"✅ Ticket #{tid} closed.", _fp_kb([_fp_btn("🔙 Support", "p2_tk")])); return True
+    return False
+
+
+def _p2_text_tk(message, user_step, uid, chat_id, text):
+    step = user_step.get('step')
+    if step == 'fp_p2tknew':
+        ok_, res = tk_create(uid, text)
+        send_message(chat_id, (f"✅ *Ticket #{res} sent.* We'll reply here as soon as we can." if ok_ else f"❌ {res}"),
+                     _fp_kb([_fp_btn("🎫 My tickets", "p2_tk")]))
+    elif step == 'fp_p2tkrep':
+        tid = _TK_CTX.get(uid)
+        ok_, res = tk_add(tid, 'user', uid, text) if tid else (False, "Ticket not found.")
+        send_message(chat_id, "✅ Sent." if ok_ else f"❌ {res}", _fp_kb([_fp_btn("💬 Ticket", f"p2_tkv_{tid}")] if tid else [_fp_btn("🎫 Support", "p2_tk")]))
+    elif step == 'fp_p2atkrep' and is_admin(uid):
+        tid = _TK_CTX.get(uid)
+        ok_, res = tk_add(tid, 'admin', uid, text) if tid else (False, "Ticket not found.")
+        if ok_:
+            audit(uid, "ticket_reply", tid)
+        send_message(chat_id, "✅ Reply sent." if ok_ else f"❌ {res}", _fp_kb([_fp_btn("💬 Ticket", f"p2_atkv_{tid}")] if tid else [_fp_btn("🎫 Queue", "p2_atk")]))
+    return True
+
+
+def _p2_r_atk(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    p = data.split("_")
+    if data == "p2_atk":
+        rows = _q("SELECT id, user_id, subject, unread_admin FROM tickets WHERE status = 'open' ORDER BY unread_admin DESC, updated_at DESC LIMIT 12",
+                  fetch='all') or []
+        total = _q("SELECT COUNT(*) FROM tickets WHERE status = 'open'", fetch='one')[0]
+        kb = [[_fp_btn(f"{'🔴' if u else '🟢'} #{i} {_tk_esc(sub)[:24]}", f"p2_atkv_{i}")] for i, uu, sub, u in rows]
+        edit_message(chat_id, mid, f"*🎫 SUPPORT QUEUE*\n\nOpen tickets: `{total}` (🔴 = needs reply)" + ("" if rows else "\n\n_Nothing open. 🎉_"),
+                     _fp_kb(*kb, [_fp_btn("🔙 Admin Panel", "admin_panel")])); return True
+    if len(p) == 3 and p[2].isdigit():
+        tid = int(p[2])
+        t = _q("SELECT user_id, subject, status FROM tickets WHERE id = ?", (tid,), fetch='one')
+        if not t:
+            return True
+        if p[1] == "atkv":
+            _q("UPDATE tickets SET unread_admin = 0 WHERE id = ?", (tid,))
+            kb = ([[_fp_btn("✍️ Reply", f"p2_atkr_{tid}"), _fp_btn("✅ Close", f"p2_atkc_{tid}")]] if t[2] == 'open'
+                  else [[_fp_btn("🔓 Reopen", f"p2_atko_{tid}")]])
+            edit_message(chat_id, mid, f"*🎫 #{tid}* · user `{t[0]}` · {'open 🟢' if t[2] == 'open' else 'closed ⚪'}\n\n{_tk_thread(tid, 10)}",
+                         _fp_kb(*kb, [_fp_btn("⚙️ User controls", f"p2_au_{t[0]}")], [_fp_btn("🔙 Queue", "p2_atk")])); return True
+        if p[1] == "atkr" and t[2] == 'open':
+            _TK_CTX[uid] = tid
+            set_user_step(uid, 'fp_p2atkrep')
+            edit_message(chat_id, mid, f"✍️ Send your reply to ticket #{tid}. The user is notified instantly.",
+                         _fp_kb([_fp_btn("❌ Cancel", f"p2_atkv_{tid}")])); return True
+        if p[1] == "atkc":
+            tk_close(tid, True, uid); audit(uid, "ticket_close", tid)
+            edit_message(chat_id, mid, f"✅ Ticket #{tid} closed.", _fp_kb([_fp_btn("🔙 Queue", "p2_atk")])); return True
+        if p[1] == "atko":
+            _q("UPDATE tickets SET status = 'open', updated_at = ? WHERE id = ?", (_now(), tid))
+            edit_message(chat_id, mid, f"🔓 Ticket #{tid} reopened.", _fp_kb([_fp_btn("💬 Open", f"p2_atkv_{tid}")])); return True
+    return False
+
+
+_P2_TEXT.update({'fp_p2tknew': _p2_text_tk, 'fp_p2tkrep': _p2_text_tk, 'fp_p2atkrep': _p2_text_tk})
+_P2_ROUTES.append(("p2_atk", _p2_r_atk))
+_P2_ROUTES.append(("p2_tk", _p2_r_tk))
+_P2_MORE_ROWS.append([_fp_btn("🎫 Support", "p2_tk")])
+_P2_ADMIN_ROWS.append([_fp_btn("🎫 Support tickets", "p2_atk")])
+
+
+# ---------------------------------------------------------------- per-user overrides + private admin notes
+_OV_FREE_PRESETS = (0, 1, 2, 3, 5, 10, 20)
+_OV_QUOTA_PRESETS = (128, 256, 512, 1024, 2048, 4096)
+_AOV_CTX = {}
+
+
+def ov_get(uid):
+    """-> dict(max_deps, quota_mb, note) — None where there is no override."""
+    r = _q("SELECT max_deps, quota_mb, note FROM user_overrides WHERE user_id = ?", (int(uid),), fetch='one')
+    return {"max_deps": r[0], "quota_mb": r[1], "note": r[2]} if r else {"max_deps": None, "quota_mb": None, "note": None}
+
+
+def ov_set(uid, field, value):
+    assert field in ("max_deps", "quota_mb", "note")
+    _q("INSERT OR IGNORE INTO user_overrides (user_id, updated_at) VALUES (?, ?)", (int(uid), _now()))
+    _q(f"UPDATE user_overrides SET {field} = ?, updated_at = ? WHERE user_id = ?", (value, _now(), int(uid)))
+
+
+def _p2_install_overrides():
+    g = globals()
+    _can, _quota = g['can_use_free_deployment'], g['get_user_quota_mb']
+
+    def can(user_id):
+        if not is_admin(user_id):
+            try:
+                lim = ov_get(user_id)["max_deps"]
+            except Exception:
+                lim = None
+            if lim is not None:
+                used = get_free_deployment_used_count(user_id)
+                if used < lim:
+                    return True, f"Admin limit - {lim - used} remaining (used {used}/{lim})"
+                return False, f"Free tier limit reached ({used}/{lim})"
+        return _can(user_id)
+
+    def quota(user_id):
+        if not is_admin(user_id):
+            try:
+                q = ov_get(user_id)["quota_mb"]
+            except Exception:
+                q = None
+            if q is not None:
+                return float(q)
+        return _quota(user_id)
+    g['can_use_free_deployment'], g['get_user_quota_mb'] = can, quota
+
+
+_p2_install_overrides()
+
+
+def _p2_user_extra(uid):
+    o = ov_get(uid)
+    s = ""
+    if o["max_deps"] is not None:
+        s += f"\n🤖 Free-bot limit override: `{o['max_deps']}`"
+    if o["quota_mb"] is not None:
+        s += f"\n💾 Quota override: `{o['quota_mb']} MB`"
+    if o["note"]:
+        s += f"\n📝 Note: _{_tk_esc(o['note'][:200])}_"
+    return s
+
+
+def p2_user_controls(chat_id, mid, target):
+    o = ov_get(target)
+    row = _q("SELECT first_name, username FROM users WHERE user_id = ?", (target,), fetch='one')
+    name = safe_md(f"{row[0] or ''} @{row[1]}" if row and row[1] else (row[0] if row else str(target)))
+    txt = (f"*⚙️ USER CONTROLS* — `{target}`\n{name}\n\n"
+           f"🤖 Free-bot limit: `{'default' if o['max_deps'] is None else o['max_deps']}` (default {FREE_USER_MAX_DEPLOYMENTS})\n"
+           f"💾 Memory quota: `{'default' if o['quota_mb'] is None else str(o['quota_mb']) + ' MB'}`\n"
+           f"🔐 PIN: `{'set' if pin_is_set(target) else 'not set'}`\n"
+           f"📝 Note (admins only): {('_' + _tk_esc(o['note']) + '_') if o['note'] else '`none`'}")
+    edit_message(chat_id, mid, txt, _fp_kb(
+        [_fp_btn("🤖 Free-bot limit", f"p2_auf_{target}"), _fp_btn("💾 Quota", f"p2_auq_{target}")],
+        [_fp_btn("📝 Edit note", f"p2_aun_{target}"), _fp_btn("🔑 Reset PIN", f"p2_aupin_{target}")],
+        [_fp_btn("👤 User page", f"admin_user_view_{target}")]))
+
+
+def _p2_ov_picker(chat_id, mid, target, kind):
+    presets, cur = ((_OV_FREE_PRESETS, "max_deps") if kind == "f" else (_OV_QUOTA_PRESETS, "quota_mb"))
+    now = ov_get(target)[cur]
+    unit = "" if kind == "f" else " MB"
+    btns = [_fp_btn(("✅ " if now == v else "") + f"{v}{unit}", f"p2_au{kind}s_{target}_{v}") for v in presets]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    title = "FREE-BOT LIMIT" if kind == "f" else "MEMORY QUOTA"
+    edit_message(chat_id, mid, f"*{'🤖' if kind == 'f' else '💾'} {title}* — `{target}`\n\nPick a value, or reset to the default.",
+                 _fp_kb(*rows, [_fp_btn(("✅ " if now is None else "") + "Default", f"p2_au{kind}s_{target}_d"),
+                                _fp_btn("✏️ Custom", f"p2_au{kind}c_{target}")], [_fp_btn("🔙 Back", f"p2_au_{target}")]))
+
+
+def _p2_r_au(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    p = data.split("_")
+    if len(p) < 3 or not p[2].lstrip("-").isdigit():
+        return True
+    target, k = int(p[2]), p[1]
+    if not _q("SELECT 1 FROM users WHERE user_id = ?", (target,), fetch='one'):
+        edit_message(chat_id, mid, "❌ No such user.", _fp_kb([_fp_btn("🔙 Admin Panel", "admin_panel")])); return True
+    if k == "au":
+        p2_user_controls(chat_id, mid, target); return True
+    if k in ("auf", "auq"):
+        _p2_ov_picker(chat_id, mid, target, k[-1]); return True
+    if k in ("aufs", "auqs") and len(p) == 4:
+        field = "max_deps" if k == "aufs" else "quota_mb"
+        val = None if p[3] == "d" else (int(p[3]) if p[3].isdigit() else "bad")
+        if val != "bad":
+            ov_set(target, field, val)
+            audit(uid, f"override_{field}", target, str(val))
+        p2_user_controls(chat_id, mid, target); return True
+    if k in ("aufc", "auqc"):
+        _AOV_CTX[uid] = (target, "f" if k == "aufc" else "q")
+        set_user_step(uid, 'fp_p2aov')
+        edit_message(chat_id, mid, "✏️ Send the number" + (" (0–100 free bots)." if k == "aufc" else " in MB (16–100000)."),
+                     _fp_kb([_fp_btn("❌ Cancel", f"p2_au_{target}")])); return True
+    if k == "aun":
+        _AOV_CTX[uid] = (target, "n")
+        set_user_step(uid, 'fp_p2aov')
+        edit_message(chat_id, mid, "📝 Send the note for this user (max 500 chars). Only admins can see it. Send `-` to clear it.",
+                     _fp_kb([_fp_btn("❌ Cancel", f"p2_au_{target}")])); return True
+    if k == "aupin":
+        edit_message(chat_id, mid, f"🔑 Reset the PIN of `{target}`? They must set a new one before deploying.",
+                     _fp_kb([_fp_btn("✅ Reset", f"p2_aupinok_{target}"), _fp_btn("❌ No", f"p2_au_{target}")])); return True
+    if k == "aupinok":
+        pin_reset(target); audit(uid, "pin_reset", target)
+        try:
+            send_message(target, "🔐 An admin reset your PIN. You'll be asked to set a new one next time you deploy.")
+        except Exception:
+            pass
+        p2_user_controls(chat_id, mid, target); return True
+    return False
+
+
+def _p2_text_aov(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    ctx = _AOV_CTX.pop(uid, None)
+    if not ctx:
+        return True
+    target, kind = ctx
+    back = _fp_kb([_fp_btn("⚙️ User controls", f"p2_au_{target}")])
+    if kind == "n":
+        note = None if text == "-" else text[:500]
+        ov_set(target, "note", note)
+        audit(uid, "user_note", target, "cleared" if note is None else "set")
+        send_message(chat_id, "✅ Note cleared." if note is None else "✅ Note saved.", back); return True
+    if not text.isdigit():
+        send_message(chat_id, "❌ Send a whole number.", back); return True
+    n = int(text)
+    lo, hi = (0, 100) if kind == "f" else (16, 100000)
+    if not lo <= n <= hi:
+        send_message(chat_id, f"❌ Must be between {lo} and {hi}.", back); return True
+    field = "max_deps" if kind == "f" else "quota_mb"
+    ov_set(target, field, n)
+    audit(uid, f"override_{field}", target, str(n))
+    send_message(chat_id, f"✅ Saved: `{n}`", back)
+    return True
+
+
+_P2_TEXT['fp_p2aov'] = _p2_text_aov
+_P2_ROUTES.append(("p2_au", _p2_r_au))
+
+
+def _p2_route(callback, data, uid, chat_id, mid):
+    for prefix, fn in _P2_ROUTES:
+        if data.startswith(prefix):
+            if fn(callback, data, uid, chat_id, mid):
+                return True
+    return False
+
+
+def _p2_text(message, user_step):
+    step = user_step.get('step') or ''
+    fn = _P2_TEXT.get(step)
+    if not fn:
+        return False
+    chat_id, uid = message['chat']['id'], message['from']['id']
+    text = (message.get('text') or '').strip()
+    if text.startswith('/'):
+        return False
+    set_user_step(uid, None)
+    return fn(message, user_step, uid, chat_id, text)
+
+
 def process_health_monitor():
     """
     Runs every 120 s. Checks whether PIDs recorded as 'active' are still
@@ -16339,9 +18139,16 @@ def process_health_monitor():
 # ==================== HEALTH CHECK SERVER ====================
 def start_health_server():
     try:
-        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
         class HealthHandler(BaseHTTPRequestHandler):
+            def _proxy_other(self):
+                if not p2_http(self, self.command):
+                    _p2_send(self, 404, "not found")
+            do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _proxy_other
+
             def do_GET(self):
+                if p2_http(self, 'GET'):
+                    return
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
@@ -16360,6 +18167,8 @@ def start_health_server():
                 )
                 self.wfile.write(payload)
             def do_POST(self):
+                if p2_http(self, 'POST'):
+                    return
                 try:
                     m = re.match(r'^/gh/(\d+)/?$', self.path.split('?')[0])
                     n = int(self.headers.get('Content-Length') or 0)
@@ -16380,7 +18189,8 @@ def start_health_server():
             def log_message(self, format, *args):
                 pass
         port = int(os.environ.get("PORT", 8080))
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        ThreadingHTTPServer.daemon_threads = True
+        server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
         threading.Thread(target=server.serve_forever, daemon=True,
                          name="HealthServer").start()
         print(f"✅ Health check server on port {port}")
@@ -16622,6 +18432,7 @@ _fp_install_wrappers()
 
 def _fp_startup():
     try:
+        _p2_ensure()
         _bwrap_ok()
         _harden_perms()
     except Exception as e:
@@ -16674,7 +18485,7 @@ def main():
     # ───────────────────────────────────────────────────────────────
     
     # Start health check server for cloud platforms
-    if IS_RENDER or IS_HEROKU or IS_CHOREO:
+    if IS_RENDER or IS_HEROKU or IS_CHOREO or os.environ.get("PUBLIC_BASE_URL"):
         start_health_server()
     
     # Start background monitors
@@ -16690,6 +18501,7 @@ def main():
     threading.Thread(target=scheduled_restart_monitor,  daemon=True, name="SchedRestart").start()
     threading.Thread(target=metrics_sampler,            daemon=True, name="UsageSampler").start()
     threading.Thread(target=health_check_monitor,       daemon=True, name="HealthPing").start()
+    threading.Thread(target=p2_autorenew_monitor,       daemon=True, name="AutoRenew").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
