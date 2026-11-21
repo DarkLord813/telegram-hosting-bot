@@ -18,6 +18,7 @@ import signal
 import platform
 import traceback
 import hashlib
+import zipfile
 import hmac
 import base64
 import tempfile
@@ -4811,7 +4812,7 @@ def reply_to_bug_report(report_id, admin_id, reply_text):
         f"An admin has replied to your report:\n\n"
         f"_{reply_text}_\n\n"
         f"Thank you for helping us improve the service! 🙏",
-        {"inline_keyboard": [[{"text": "🐛 Submit Another Report", "callback_data": "report_bug"}],
+        {"inline_keyboard": [[{"text": "🎫 Open a support ticket", "callback_data": "p2_tk"}],
                               [{"text": "🏠 Main Menu",            "callback_data": "main_menu"}]]})
     return True, target_user_id
 
@@ -9971,9 +9972,12 @@ def get_main_menu(user_id):
              {"text": "👥 Referral",                             "callback_data": "my_referral"}],
             [{"text": "⭐ Premium Subscription",                "callback_data": "subscribe_premium"},
              {"text": "📈 Resource Plans",                      "callback_data": "resource_tiers"}],
-            [{"text": "🐛 Report Bug",                          "callback_data": "report_bug"}],
+            [{"text": "🎫 Support",                            "callback_data": "p2_tk"}],
         ]
     }
+    _dash = _p2_dash_button()
+    if _dash:
+        keyboard["inline_keyboard"].insert(len(keyboard["inline_keyboard"]) - 1, [_dash])
 
     if is_admin(user_id):
         badge = f" ({open_reports} open)" if open_reports else ""
@@ -15809,7 +15813,7 @@ def fp_more_menu(chat_id, message_id):
     edit_message(chat_id, message_id, "*🧰 MORE*\n\nExtras for your account.", _fp_kb(
         [_fp_btn("🎟️ Promo Code", "fp_promo"), _fp_btn("🧾 Payment History", "fp_history")],
         [_fp_btn("🌐 Language", "fp_lang"), _fp_btn("🤝 Shared with me", "fp_shared")],
-        *_P2_MORE_ROWS,
+        *_p2_more_rows(),
         [_fp_btn("🔙 Menu", "main_menu")]))
 
 
@@ -16341,6 +16345,10 @@ _P2_DDL = [
     "text TEXT, ts TEXT)",
     "CREATE TABLE IF NOT EXISTS user_overrides (user_id INTEGER PRIMARY KEY, max_deps INTEGER, quota_mb INTEGER, "
     "note TEXT, updated_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS sched_broadcasts (id INTEGER PRIMARY KEY AUTOINCREMENT, audience TEXT, text TEXT, "
+    "run_at TEXT, status TEXT DEFAULT 'pending', created_by INTEGER, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, "
+    "finished_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS export_log (user_id INTEGER PRIMARY KEY, last_at TEXT)",
 ]
 
 
@@ -16567,6 +16575,7 @@ def p2_security_menu(chat_id, mid, uid):
     edit_message(chat_id, mid, f"*🔐 PIN & SECURITY*\n\nPIN: `{'set ✅' if s else 'not set (default 0000) ⚠️'}`\n\n"
                  f"Your PIN is required before deploying and for deleting bots, exporting or deleting your data.",
                  _fp_kb([_fp_btn("🔑 Change PIN" if s else "🔑 Set PIN", "p2_pinchg")],
+                        [_fp_btn("📦 My data & account", "p2_data")],
                         [_fp_btn("🔙 More", "fp_more")]))
 
 
@@ -17541,14 +17550,33 @@ _P2_MORE_ROWS.append([_fp_btn("💸 Referral commissions", "p2_com")])
 _P2_ADMIN_ROWS.append([_fp_btn("💸 Commission settings", "p2_acom")])
 
 
-# ---------------------------------------------------------------- gift a deployment
+# ---------------------------------------------------------------- gift a resource plan
 GIFT_VALID_DAYS = 90
 _GIFT_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _GIFT_FAILS = {}
 
 
+def _gift_split(plan):
+    """'1gb_m' -> ('1gb', 'm'); legacy 'monthly' / 'yearly' (deploy credit gifts) -> (None, plan)."""
+    if plan in ("monthly", "yearly"):
+        return None, plan
+    key, _, per = (plan or "").partition("_")
+    return (key, per) if key in RESOURCE_TIERS and per in TIER_PERIODS else (None, None)
+
+
 def _gift_price(plan):
+    """-> (days, coins)"""
+    key, per = _gift_split(plan)
+    if key:
+        return TIER_PERIODS[per][1], tier_price_coins(key, per)
     return {"monthly": (30, PRICE_MONTHLY_COINS), "yearly": (365, PRICE_YEARLY_COINS)}[plan]
+
+
+def _gift_label(plan):
+    key, per = _gift_split(plan)
+    if key:
+        return f"{RESOURCE_TIERS[key][1]} {TIER_PERIODS[per][0]} resource plan"
+    return f"{plan} deployment"
 
 
 def _gift_new_code():
@@ -17564,8 +17592,9 @@ def _gift_norm(text):
 
 
 def gift_buy(uid, plan):
-    """Charge coins and create a code. -> (ok, code_or_error)"""
-    if plan not in ("monthly", "yearly"):
+    """Charge coins and create a code for a resource plan like '1gb_m'. -> (ok, code_or_error)"""
+    key, per = _gift_split(plan)
+    if not key:
         return False, "Unknown plan."
     days, cost = _gift_price(plan)
     if get_user_balances(uid)['coins'] < cost:
@@ -17578,6 +17607,21 @@ def gift_buy(uid, plan):
     _q("INSERT INTO gift_codes (code, plan, buyer, cost, created_at) VALUES (?, ?, ?, ?, ?)", (code, plan, uid, cost, _now()))
     audit(uid, "gift_buy", code, f"{plan} {cost}")
     return True, code
+
+
+def _gift_block_reason(uid, plan):
+    """Why this user can't receive this gift right now (the code is NOT consumed in that case)."""
+    key, per = _gift_split(plan)
+    if not key:
+        return None
+    why = _tier_blocked_reason(uid, key)
+    if why:
+        return why
+    cur = get_user_tier(uid)
+    if cur and cur[1] > RESOURCE_TIERS[key][0]:
+        return (f"You already have a bigger plan ({format_resource(cur[1])}) active until {cur[2].strftime('%Y-%m-%d')}. "
+                f"Redeem this gift after it ends — the code stays valid for {GIFT_VALID_DAYS} days from purchase.")
+    return None
 
 
 def gift_redeem(uid, text):
@@ -17600,6 +17644,10 @@ def gift_redeem(uid, text):
     if bad:
         fails.append(now); _GIFT_FAILS[uid] = fails
         return False, bad
+    plan = row[0]
+    why = _gift_block_reason(uid, plan)
+    if why:
+        return False, f"❌ {why}"
     conn = sqlite3.connect(DATABASE_FILE, timeout=10)
     try:
         cur = conn.execute("UPDATE gift_codes SET redeemed_by = ?, redeemed_at = ? WHERE code = ? AND redeemed_by IS NULL "
@@ -17610,20 +17658,34 @@ def gift_redeem(uid, text):
         conn.close()
     if not claimed:
         return False, "❌ That gift code was just used."
-    days, _ = _gift_price(row[0])
-    _q("INSERT INTO deploy_credits (user_id, plan, seconds_left, source_deployment, created_at, used) VALUES (?, ?, ?, 0, ?, 0)",
-       (uid, row[0], days * 86400, _now()))
-    audit(uid, "gift_redeem", code, row[0])
+    key, per = _gift_split(plan)
+    days, _ = _gift_price(plan)
+    if key:
+        try:
+            end = activate_resource_tier(uid, key, per, 0, 0)
+        except Exception as e:                                   # never lose a gift to an error
+            print(f"⚠️ gift activate: {e}")
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            conn.execute("UPDATE gift_codes SET redeemed_by = NULL, redeemed_at = NULL WHERE code = ?", (code,))
+            conn.commit(); conn.close()
+            return False, "❌ Couldn't activate the gift right now. Your code is still valid — try again in a moment."
+        msg = (f"🎁 *Gift redeemed!* Your *{_gift_label(plan)}* is active until `{end.strftime('%Y-%m-%d')}` "
+               f"(guaranteed {RESOURCE_TIERS[key][1]} RAM + Premium).")
+    else:
+        _q("INSERT INTO deploy_credits (user_id, plan, seconds_left, source_deployment, created_at, used) VALUES (?, ?, ?, 0, ?, 0)",
+           (uid, plan, days * 86400, _now()))
+        msg = (f"🎁 *Gift redeemed!* You now have a free *{plan}* deployment ({days} days). "
+               f"Tap *Deploy* and pick the {plan} plan — it won't cost you anything.")
+    audit(uid, "gift_redeem", code, plan)
     try:
-        send_message(row[1], f"🎁 Your gift `{code}` was redeemed — a {row[0]} deployment is now waiting for them.")
+        send_message(row[1], f"🎁 Your gift `{code}` ({_gift_label(plan)}) was redeemed!")
     except Exception:
         pass
     try:
         async_backup(f"gift_{code}")
     except Exception:
         pass
-    return True, (f"🎁 *Gift redeemed!* You now have a free *{row[0]}* deployment ({days} days). "
-                  f"Tap *Deploy* and pick the {row[0]} plan — it won't cost you anything.")
+    return True, msg
 
 
 def gift_cancel(uid, code):
@@ -17649,10 +17711,9 @@ def _g8(code):
 
 
 def _p2_gift_menu(chat_id, mid, uid):
-    edit_message(chat_id, mid, "*🎁 GIFTS*\n\nBuy a deployment for a friend with your coins. You get a code to send them; "
-                 "they redeem it here and deploy for free.",
-                 _fp_kb([_fp_btn(f"📅 Gift Monthly ({PRICE_MONTHLY_COINS}🪙)", "p2_gbuy_monthly")],
-                        [_fp_btn(f"🌟 Gift Yearly ({PRICE_YEARLY_COINS}🪙)", "p2_gbuy_yearly")],
+    edit_message(chat_id, mid, "*🎁 GIFT A RESOURCE PLAN*\n\nBuy a guaranteed-RAM plan (with Premium) for a friend using your coins. "
+                 "You get a code to send them; they redeem it here and it activates instantly.\n\nPick a size:",
+                 _fp_kb(*[[_fp_btn(f"💾 {label} — from {tier_price_coins(k, 'm')}🪙", f"p2_gsz_{k}")] for k, (mb, label, _) in RESOURCE_TIERS.items()],
                         [_fp_btn("🎟 Redeem a gift code", "p2_gredeem"), _fp_btn("📋 My gifts", "p2_gmine")],
                         [_fp_btn("🔙 More", "fp_more")]))
 
@@ -17665,14 +17726,20 @@ def _p2_r_gift(callback, data, uid, chat_id, mid):
         set_user_step(uid, 'fp_p2gift')
         edit_message(chat_id, mid, "*🎟 REDEEM GIFT*\n\nSend the gift code (looks like `GIFT-ABCD-2345`).",
                      _fp_kb([_fp_btn("❌ Cancel", "p2_gift")])); return True
-    if p[1] == "gbuy" and len(p) == 3 and p[2] in ("monthly", "yearly"):
-        days, cost = _gift_price(p[2])
-        edit_message(chat_id, mid, f"*🎁 GIFT A {p[2].upper()} DEPLOYMENT*\n\nPrice: `{cost}🪙` ({days} days)\n"
+    if p[1] == "gsz" and len(p) == 3 and p[2] in RESOURCE_TIERS:
+        k = p[2]
+        edit_message(chat_id, mid, f"*🎁 {RESOURCE_TIERS[k][1]} PLAN*\n\nChoose how long the gift lasts:",
+                     _fp_kb(*[[_fp_btn(f"{TIER_PERIODS[per][0]} ({TIER_PERIODS[per][1]} days) — {tier_price_coins(k, per)}🪙", f"p2_gbuy_{k}_{per}")]
+                              for per in TIER_PERIODS], [_fp_btn("🔙 Back", "p2_gift")])); return True
+    if p[1] == "gbuy" and len(p) == 4 and _gift_split(f"{p[2]}_{p[3]}")[0]:
+        plan = f"{p[2]}_{p[3]}"
+        days, cost = _gift_price(plan)
+        edit_message(chat_id, mid, f"*🎁 GIFT — {_gift_label(plan).upper()}*\n\nPrice: `{cost}🪙` ({days} days)\n"
                      f"Your balance: `{get_user_balances(uid)['coins']}🪙`\n\nCodes are valid for {GIFT_VALID_DAYS} days. "
                      f"You can cancel an unused gift for a full refund.",
-                     _fp_kb([_fp_btn("✅ Buy gift", f"p2_gbuyok_{p[2]}")], [_fp_btn("❌ Cancel", "p2_gift")])); return True
-    if p[1] == "gbuyok" and len(p) == 3:
-        ok_, res = gift_buy(uid, p[2])
+                     _fp_kb([_fp_btn("✅ Buy gift", f"p2_gbuyok_{p[2]}_{p[3]}")], [_fp_btn("❌ Cancel", "p2_gift")])); return True
+    if p[1] == "gbuyok" and len(p) == 4:
+        ok_, res = gift_buy(uid, f"{p[2]}_{p[3]}")
         if ok_:
             edit_message(chat_id, mid, f"*🎁 GIFT READY*\n\nCode: `{res}`\n\nSend this code to your friend. They open the bot → "
                          f"More → 🎁 Gifts → Redeem.", _fp_kb([_fp_btn("📋 My gifts", "p2_gmine")], [_fp_btn("🔙 Gifts", "p2_gift")]))
@@ -17683,7 +17750,7 @@ def _p2_r_gift(callback, data, uid, chat_id, mid):
         rows = _q("SELECT code, plan, created_at, redeemed_by, cancelled FROM gift_codes WHERE buyer = ? ORDER BY created_at DESC LIMIT 10",
                   (uid,), fetch='all') or []
         lines = ["*📋 MY GIFTS*", ""] + [
-            f"`{c}` · {pl} · {'✅ redeemed' if rb else ('🚫 cancelled' if cx else '🟢 unused')}" for c, pl, ca, rb, cx in rows]
+            f"`{c}` · {_gift_label(pl)} · {'✅ redeemed' if rb else ('🚫 cancelled' if cx else '🟢 unused')}" for c, pl, ca, rb, cx in rows]
         if not rows:
             lines.append("_You haven't bought any gifts yet._")
         kb = [[_fp_btn(f"🚫 Cancel {c[-4:]}", f"p2_gcxq_{_g8(c)}")] for c, pl, ca, rb, cx in rows if not rb and not cx]
@@ -17813,7 +17880,7 @@ def _p2_tk_menu(chat_id, mid, uid):
     kb = [[_fp_btn(f"{'🔴' if u else ('🟢' if s == 'open' else '⚪')} #{i} {_tk_esc(sub)[:28]}", f"p2_tkv_{i}")] for i, sub, s, u in rows]
     edit_message(chat_id, mid, "*🎫 SUPPORT*\n\nNeed help? Open a ticket and our team will reply here in the bot."
                  + ("" if rows else "\n\n_You have no tickets yet._"),
-                 _fp_kb([_fp_btn("➕ New ticket", "p2_tknew")], *kb, [_fp_btn("🔙 More", "fp_more")]))
+                 _fp_kb([_fp_btn("➕ New ticket", "p2_tknew")], *kb, [_fp_btn("🔙 Menu", "main_menu")]))
 
 
 def _p2_r_tk(callback, data, uid, chat_id, mid):
@@ -17904,7 +17971,6 @@ def _p2_r_atk(callback, data, uid, chat_id, mid):
 _P2_TEXT.update({'fp_p2tknew': _p2_text_tk, 'fp_p2tkrep': _p2_text_tk, 'fp_p2atkrep': _p2_text_tk})
 _P2_ROUTES.append(("p2_atk", _p2_r_atk))
 _P2_ROUTES.append(("p2_tk", _p2_r_tk))
-_P2_MORE_ROWS.append([_fp_btn("🎫 Support", "p2_tk")])
 _P2_ADMIN_ROWS.append([_fp_btn("🎫 Support tickets", "p2_atk")])
 
 
@@ -18068,6 +18134,890 @@ def _p2_text_aov(message, user_step, uid, chat_id, text):
 
 _P2_TEXT['fp_p2aov'] = _p2_text_aov
 _P2_ROUTES.append(("p2_au", _p2_r_au))
+
+
+# ---------------------------------------------------------------- scheduled broadcasts
+SB_MAX_PENDING = 20
+SB_LATE_GRACE = timedelta(hours=6)
+_SB_DRAFT = {}
+
+
+def _sb_tz():
+    try:
+        return float(os.environ.get("ADMIN_TZ_OFFSET", "0"))
+    except Exception:
+        return 0.0
+
+
+def _sb_clock_skew():
+    d = datetime.now() - datetime.utcnow()               # server local clock vs UTC (a whole number of minutes)
+    return timedelta(minutes=round(d.total_seconds() / 60))
+
+
+def sb_admin_to_server(dt):
+    """A wall-clock time typed by the admin (ADMIN_TZ_OFFSET hours from UTC) → the server's datetime.now() clock."""
+    return dt - timedelta(hours=_sb_tz()) + _sb_clock_skew()
+
+
+def sb_server_to_admin(dt):
+    return dt - _sb_clock_skew() + timedelta(hours=_sb_tz())
+
+
+def sb_fmt(run_at_iso):
+    return sb_server_to_admin(datetime.fromisoformat(run_at_iso)).strftime("%Y-%m-%d %H:%M")
+
+
+def sb_parse_time(text):
+    """Admin text → server datetime, or None. Accepts 'YYYY-MM-DD HH:MM' or 'HH:MM' (next occurrence)."""
+    text = (text or '').strip()
+    now_admin = sb_server_to_admin(datetime.now())
+    try:
+        if re.fullmatch(r'\d{1,2}:\d{2}', text):
+            h, m = map(int, text.split(":"))
+            dt = now_admin.replace(hour=h, minute=m, second=0, microsecond=0)
+            if dt <= now_admin:
+                dt += timedelta(days=1)
+        else:
+            dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+    return sb_admin_to_server(dt)
+
+
+def sb_schedule(admin_id, audience, run_at, text):
+    """-> (ok, id or error)"""
+    if audience not in BROADCAST_AUDIENCES:
+        return False, "Unknown audience."
+    text = (text or '').strip()
+    if not text or len(text) > 3500:
+        return False, "The message must be 1–3500 characters."
+    now = datetime.now()
+    if run_at < now + timedelta(seconds=45):
+        return False, "That time is in the past — pick a later time."
+    if run_at > now + timedelta(days=60):
+        return False, "Schedule at most 60 days ahead."
+    if _q("SELECT COUNT(*) FROM sched_broadcasts WHERE status = 'pending'", fetch='one')[0] >= SB_MAX_PENDING:
+        return False, f"There are already {SB_MAX_PENDING} scheduled broadcasts. Cancel one first."
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("INSERT INTO sched_broadcasts (audience, text, run_at, status, created_by) VALUES (?, ?, ?, 'pending', ?)",
+                           (audience, text, run_at.isoformat(timespec='seconds'), admin_id))
+        conn.commit()
+        sid = cur.lastrowid
+    finally:
+        conn.close()
+    audit(admin_id, "broadcast_schedule", sid, f"{audience} @ {run_at.isoformat(timespec='minutes')}")
+    return True, sid
+
+
+def sb_run_due():
+    """Claim and send every due broadcast. -> number executed"""
+    n = 0
+    now = datetime.now()
+    rows = _q("SELECT id, audience, text, run_at, created_by FROM sched_broadcasts WHERE status = 'pending' AND run_at <= ? ORDER BY run_at",
+              (now.isoformat(timespec='seconds'),), fetch='all') or []
+    for sid, aud, text, run_at, by in rows:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        try:
+            cur = conn.execute("UPDATE sched_broadcasts SET status = 'running' WHERE id = ? AND status = 'pending'", (sid,))
+            conn.commit()
+            claimed = cur.rowcount == 1
+        finally:
+            conn.close()
+        if not claimed:
+            continue
+        if now - datetime.fromisoformat(run_at) > SB_LATE_GRACE:
+            _q("UPDATE sched_broadcasts SET status = 'missed', finished_at = ? WHERE id = ?", (_now(), sid))
+            try:
+                send_message(by, f"⚠️ Scheduled broadcast #{sid} was *not sent*: the bot was offline at {sb_fmt(run_at)} "
+                                 f"and it's now too late. Schedule it again if you still want it.")
+            except Exception:
+                pass
+            continue
+        try:
+            ok_n, fail_n, skip_n = do_broadcast(by, 'text', None, text, None, aud)
+        except Exception as e:
+            print(f"❌ scheduled broadcast #{sid}: {e}")
+            ok_n = fail_n = skip_n = 0
+        _q("UPDATE sched_broadcasts SET status = 'done', sent = ?, failed = ?, finished_at = ? WHERE id = ?",
+           (ok_n, fail_n, _now(), sid))
+        audit("system", "broadcast_sent", sid, f"{ok_n} ok / {fail_n} failed")
+        try:
+            send_message(by, f"📢 *Scheduled broadcast #{sid} sent*\n\n✅ Delivered: `{ok_n}`\n❌ Failed: `{fail_n}`\n⏭ Skipped (blocked): `{skip_n}`")
+        except Exception:
+            pass
+        n += 1
+    return n
+
+
+def sb_recover_interrupted():
+    """A broadcast that was 'running' when the process died may be half-sent — never resend it."""
+    rows = _q("SELECT id, created_by FROM sched_broadcasts WHERE status = 'running'", fetch='all') or []
+    for sid, by in rows:
+        _q("UPDATE sched_broadcasts SET status = 'interrupted', finished_at = ? WHERE id = ?", (_now(), sid))
+        try:
+            send_message(by, f"⚠️ Scheduled broadcast #{sid} was interrupted by a restart; some users may have received it. "
+                             f"It will not be re-sent automatically.")
+        except Exception:
+            pass
+    return len(rows)
+
+
+def p2_sched_broadcast_monitor():
+    sleep(20)
+    try:
+        sb_recover_interrupted()
+    except Exception as e:
+        print(f"⚠️ sb recover: {e}")
+    print("✅ Scheduled-broadcast worker started")
+    while True:
+        try:
+            sb_run_due()
+        except Exception as e:
+            print(f"⚠️ scheduled broadcasts: {e}")
+        sleep(30)
+
+
+def _p2_sb_list(chat_id, mid):
+    pend = _q("SELECT id, audience, run_at, text FROM sched_broadcasts WHERE status = 'pending' ORDER BY run_at LIMIT 10", fetch='all') or []
+    done = _q("SELECT id, status, sent, failed FROM sched_broadcasts WHERE status != 'pending' ORDER BY id DESC LIMIT 4", fetch='all') or []
+    lines = [f"*🗓 SCHEDULED BROADCASTS*", f"_Times shown in your timezone (UTC{_sb_tz():+g})._", ""]
+    for sid, aud, run_at, text in pend:
+        lines.append(f"⏳ #{sid} · {sb_fmt(run_at)} · {BROADCAST_AUDIENCES.get(aud, aud)}\n   _{_tk_esc(text[:50])}_")
+    if not pend:
+        lines.append("_Nothing scheduled._")
+    if done:
+        lines.append("")
+        lines += [f"{'✅' if s == 'done' else '⚠️'} #{i} {s}" + (f" · {a} sent, {b} failed" if s == 'done' else "") for i, s, a, b in done]
+    kb = [[_fp_btn(f"🗑 Cancel #{sid}", f"p2_sbc_{sid}")] for sid, *_ in pend]
+    edit_message(chat_id, mid, "\n".join(lines), _fp_kb([_fp_btn("➕ Schedule new", "p2_sbn")], *kb, [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+
+
+def _p2_sb_preview(chat_id, mid_or_none, admin):
+    d = _SB_DRAFT.get(admin)
+    if not d or not all(k in d for k in ("aud", "run_at", "text")):
+        return
+    n = len(broadcast_audience_ids(d["aud"]))
+    txt = (f"*🗓 CONFIRM SCHEDULE*\n\n👥 {BROADCAST_AUDIENCES[d['aud']]} — `{n}` users\n⏰ {sb_fmt(d['run_at'].isoformat())} (UTC{_sb_tz():+g})\n\n"
+           f"━━━━━━━━━━\n{d['text'][:1200]}")
+    kb = _fp_kb([_fp_btn("📨 Send test to me", "p2_sbtest")], [_fp_btn("✅ Schedule", "p2_sbgo"), _fp_btn("❌ Cancel", "p2_sb")])
+    if mid_or_none:
+        edit_message(chat_id, mid_or_none, txt, kb)
+    else:
+        send_message(chat_id, txt, kb)
+
+
+def _p2_r_sb(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    p = data.split("_")
+    if data == "p2_sb":
+        _SB_DRAFT.pop(uid, None); set_user_step(uid, None)
+        _p2_sb_list(chat_id, mid); return True
+    if data == "p2_sbn":
+        _SB_DRAFT[uid] = {}
+        rows = [[_fp_btn(f"{label} ({len(broadcast_audience_ids(k))})", f"p2_sba_{k}")] for k, label in BROADCAST_AUDIENCES.items()]
+        edit_message(chat_id, mid, "*🗓 SCHEDULE — 1/3*\n\nWho should receive it?", _fp_kb(*rows, [_fp_btn("🔙 Back", "p2_sb")])); return True
+    if p[1] == "sba" and len(p) == 3 and p[2] in BROADCAST_AUDIENCES:
+        _SB_DRAFT.setdefault(uid, {})["aud"] = p[2]
+        now_a = sb_server_to_admin(datetime.now())
+        edit_message(chat_id, mid, f"*🗓 SCHEDULE — 2/3*\n\nWhen? (your time: UTC{_sb_tz():+g}, now `{now_a.strftime('%H:%M')}`)",
+                     _fp_kb([_fp_btn("In 1 hour", "p2_sbt_1h"), _fp_btn("In 3 hours", "p2_sbt_3h")],
+                            [_fp_btn("In 12 hours", "p2_sbt_12h"), _fp_btn("Tomorrow 09:00", "p2_sbt_tom")],
+                            [_fp_btn("✏️ Custom time", "p2_sbt_cus")], [_fp_btn("🔙 Back", "p2_sbn")])); return True
+    if p[1] == "sbt" and len(p) == 3 and uid in _SB_DRAFT:
+        if p[2] == "cus":
+            set_user_step(uid, 'fp_p2sbtime')
+            edit_message(chat_id, mid, "✏️ Send the time as `YYYY-MM-DD HH:MM` (e.g. `2026-12-01 18:30`) or just `HH:MM` for the next "
+                         "occurrence.", _fp_kb([_fp_btn("❌ Cancel", "p2_sb")])); return True
+        now = datetime.now()
+        if p[2] in ("1h", "3h", "12h"):
+            run = now + timedelta(hours=int(p[2][:-1]))
+        else:
+            tom = sb_server_to_admin(now).replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            run = sb_admin_to_server(tom)
+        _SB_DRAFT[uid]["run_at"] = run.replace(microsecond=0)
+        set_user_step(uid, 'fp_p2sbtext')
+        edit_message(chat_id, mid, "*🗓 SCHEDULE — 3/3*\n\nSend the message text (Markdown allowed, up to 3500 characters).",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_sb")])); return True
+    if data == "p2_sbtest":
+        d = _SB_DRAFT.get(uid)
+        if d and d.get("text"):
+            send_message(uid, d["text"])
+        return True
+    if data == "p2_sbgo":
+        d = _SB_DRAFT.get(uid)
+        if not d or not all(k in d for k in ("aud", "run_at", "text")):
+            return True
+        ok_, res = sb_schedule(uid, d["aud"], d["run_at"], d["text"])
+        _SB_DRAFT.pop(uid, None)
+        edit_message(chat_id, mid, (f"✅ *Broadcast #{res} scheduled* for {sb_fmt(d['run_at'].isoformat())}." if ok_ else f"❌ {res}"),
+                     _fp_kb([_fp_btn("🗓 Scheduled", "p2_sb")])); return True
+    if p[1] == "sbc" and len(p) == 3 and p[2].isdigit():
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        try:
+            cur = conn.execute("UPDATE sched_broadcasts SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'pending'",
+                               (_now(), int(p[2])))
+            conn.commit()
+            done = cur.rowcount == 1
+        finally:
+            conn.close()
+        if done:
+            audit(uid, "broadcast_cancel", p[2])
+        _p2_sb_list(chat_id, mid); return True
+    return False
+
+
+def _p2_text_sb(message, user_step, uid, chat_id, text):
+    if not is_admin(uid) or uid not in _SB_DRAFT:
+        return True
+    step = user_step.get('step')
+    if step == 'fp_p2sbtime':
+        run = sb_parse_time(text)
+        if not run or run < datetime.now() + timedelta(seconds=45):
+            set_user_step(uid, 'fp_p2sbtime')
+            send_message(chat_id, "❌ Couldn't read that, or it's in the past. Send `YYYY-MM-DD HH:MM` or `HH:MM`.",
+                         _fp_kb([_fp_btn("❌ Cancel", "p2_sb")])); return True
+        _SB_DRAFT[uid]["run_at"] = run.replace(microsecond=0)
+        set_user_step(uid, 'fp_p2sbtext')
+        send_message(chat_id, "*🗓 SCHEDULE — 3/3*\n\nSend the message text (Markdown allowed, up to 3500 characters).",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_sb")])); return True
+    if step == 'fp_p2sbtext':
+        if not text or len(text) > 3500:
+            set_user_step(uid, 'fp_p2sbtext')
+            send_message(chat_id, "❌ The message must be 1–3500 characters of text. Send it again:", _fp_kb([_fp_btn("❌ Cancel", "p2_sb")])); return True
+        _SB_DRAFT[uid]["text"] = text
+        _p2_sb_preview(chat_id, None, uid)
+    return True
+
+
+_P2_TEXT.update({'fp_p2sbtime': _p2_text_sb, 'fp_p2sbtext': _p2_text_sb})
+_P2_ROUTES.append(("p2_sb", _p2_r_sb))
+_P2_ADMIN_ROWS.append([_fp_btn("🗓 Scheduled broadcasts", "p2_sb")])
+
+
+# ---------------------------------------------------------------- data export + account deletion
+EXPORT_COOLDOWN_S = 3600
+EXPORT_MAX_FILE = 5 << 20
+EXPORT_MAX_TOTAL = 40 << 20
+_ACCOUNT_COLS = ("user_id, username, first_name, join_date, last_active, coins_balance, stars_balance, total_coins_earned, "
+                 "total_coins_spent, total_stars_earned, total_stars_spent, is_premium, premium_expires, premium_plan, "
+                 "referral_code, referred_by, total_referrals, lang")
+
+
+def _rows_dicts(query, params=()):
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute(query, params)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def build_user_export(uid):
+    """-> path of a zip with everything we hold about this user (env VALUES are never included)."""
+    out_dir = BASE_DIR / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"export_{uid}_{int(time.time())}.zip"
+    acct = (_rows_dicts(f"SELECT {_ACCOUNT_COLS} FROM users WHERE user_id = ?", (uid,)) or [{}])[0]
+    acct["pin_set"] = pin_is_set(uid)
+    deps = _rows_dicts("SELECT deployment_id, file_name, plan, payment_method, status, is_free, start_time, expire_time, "
+                       "source_type, github_repo, github_branch, env_vars FROM deployments WHERE user_id = ?", (uid,))
+    for d in deps:
+        try:
+            d["env_variable_names"] = sorted((json.loads(d.pop("env_vars") or "{}") or {}).keys())
+        except Exception:
+            d["env_variable_names"] = []
+    tickets = _rows_dicts("SELECT id, subject, status, created_at FROM tickets WHERE user_id = ?", (uid,))
+    for t in tickets:
+        t["messages"] = _rows_dicts("SELECT sender, text, ts FROM ticket_msgs WHERE ticket_id = ? ORDER BY id", (t["id"],))
+    parts = {
+        "account.json": acct,
+        "deployments.json": deps,
+        "coin_transactions.json": _rows_dicts("SELECT amount, transaction_type, source, timestamp, status FROM coin_transactions "
+                                              "WHERE user_id = ? ORDER BY transaction_id DESC LIMIT 1000", (uid,)),
+        "payments.json": _rows_dicts("SELECT ref, provider, coins, amount_minor, currency, status, created_at, paid_at, email "
+                                     "FROM payment_orders WHERE user_id = ?", (uid,)),
+        "tickets.json": tickets,
+        "gifts.json": {"bought": _rows_dicts("SELECT code, plan, cost, created_at, redeemed_at, cancelled FROM gift_codes WHERE buyer = ?", (uid,)),
+                       "redeemed": _rows_dicts("SELECT code, plan, redeemed_at FROM gift_codes WHERE redeemed_by = ?", (uid,))},
+        "referrals.json": {"invited": _rows_dicts("SELECT referred_id, created_at, reward_given FROM referrals WHERE referrer_id = ?", (uid,)),
+                           "commissions": _rows_dicts("SELECT coins, ts, reversed FROM commission_ledger WHERE referrer = ?", (uid,))},
+    }
+    total = 0
+    skipped = []
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, obj in parts.items():
+            z.writestr(name, json.dumps(obj, indent=2, default=str, ensure_ascii=False))
+        for d in deps:
+            folder = get_deploy_folder(uid, d["deployment_id"])
+            if not folder.exists():
+                continue
+            for root, dirs, files in os.walk(folder):
+                dirs[:] = [x for x in dirs if x not in _JUNK_DIRS and not x.startswith(".git")]
+                for f in files:
+                    fp = Path(root) / f
+                    try:
+                        if fp.is_symlink():
+                            continue
+                        sz = fp.stat().st_size
+                        rel = f"files/{d['deployment_id']}/{fp.relative_to(folder)}"
+                        if sz > EXPORT_MAX_FILE or total + sz > EXPORT_MAX_TOTAL:
+                            skipped.append(f"{rel} ({sz // 1024} KB)")
+                            continue
+                        z.write(fp, rel)
+                        total += sz
+                    except Exception:
+                        continue
+        z.writestr("README.txt",
+                   "Your data export.\n\n- Environment variable VALUES are not included for safety (only their names). "
+                   "View them in the env editor.\n- Files larger than 5 MB, or beyond the 40 MB total, are listed below "
+                   "and were left out.\n\n" + ("\n".join(skipped) if skipped else "(nothing was left out)") + "\n")
+    return path
+
+
+def _p2_data_menu(chat_id, mid, uid):
+    edit_message(chat_id, mid, "*📦 MY DATA & ACCOUNT*\n\n• *Export*: a zip with your account details, deployments, "
+                 "coin and payment history, tickets and your bot files. (Env variable values are left out for safety.)\n"
+                 "• *Delete account*: permanently removes your bots and files and anonymises your account.\n\nBoth need your PIN.",
+                 _fp_kb([_fp_btn("📤 Export my data", "p2_exp")], [_fp_btn("🗑 Delete my account", "p2_delacct")],
+                        [_fp_btn("🔙 Security", "p2_sec")]))
+
+
+def _p2_r_data(callback, data, uid, chat_id, mid):
+    if data == "p2_data":
+        _p2_data_menu(chat_id, mid, uid); return True
+    if data == "p2_exp":
+        edit_message(chat_id, mid, "*📤 EXPORT MY DATA*\n\nI'll build a zip and send it here. You can export once per hour.",
+                     _fp_kb([_fp_btn("✅ Export now", "p2_exp_go")], [_fp_btn("🔙 Back", "p2_data")])); return True
+    if data == "p2_exp_go":
+        r = _q("SELECT last_at FROM export_log WHERE user_id = ?", (uid,), fetch='one')
+        if r and r[0]:
+            wait = EXPORT_COOLDOWN_S - (datetime.now() - datetime.fromisoformat(r[0])).total_seconds()
+            if wait > 0:
+                edit_message(chat_id, mid, f"⏳ You can export again in {int(wait // 60) + 1} min.", _fp_kb([_fp_btn("🔙 Back", "p2_data")])); return True
+        _q("INSERT OR REPLACE INTO export_log (user_id, last_at) VALUES (?, ?)", (uid, _now()))
+        edit_message(chat_id, mid, "⏳ Building your export…")
+
+        def run():
+            path = None
+            try:
+                path = build_user_export(uid)
+                if path.stat().st_size > 48 << 20:
+                    send_message(chat_id, "❌ The export is too large to send through Telegram. Delete old files and try again.")
+                else:
+                    send_document(chat_id, path, "📦 Your data export", f"my_data_{uid}.zip")
+                audit(uid, "data_export", uid)
+            except Exception as e:
+                print(f"⚠️ export {uid}: {e}")
+                send_message(chat_id, "❌ The export failed. Please try again later.")
+            finally:
+                try:
+                    if path:
+                        path.unlink()
+                except Exception:
+                    pass
+        threading.Thread(target=run, daemon=True, name="DataExport").start()
+        return True
+    if data == "p2_delacct":
+        n = _q("SELECT COUNT(*) FROM deployments WHERE user_id = ?", (uid,), fetch='one')[0]
+        paid = _q("SELECT COUNT(*) FROM deployments WHERE user_id = ? AND COALESCE(is_free,0)=0", (uid,), fetch='one')[0]
+        if is_admin(uid):
+            edit_message(chat_id, mid, "⛔ Admin accounts can't be deleted from here.", _fp_kb([_fp_btn("🔙 Back", "p2_data")])); return True
+        edit_message(chat_id, mid, f"*🗑 DELETE MY ACCOUNT*\n\nThis is *permanent*:\n• `{n}` deployment(s) are stopped and deleted "
+                     f"with all files and rollback points{f' (including {paid} paid — no refunds)' if paid else ''}\n"
+                     f"• Your coin balance (`{get_user_balances(uid)['coins']}🪙`) is forfeited\n• Your tickets and personal details are erased\n"
+                     "• Payment and coin records are kept without your name, for accounting\n\nTip: export your data first.",
+                     _fp_kb([_fp_btn("📤 Export first", "p2_exp")], [_fp_btn("🗑 Continue", "p2_delacct_go")], [_fp_btn("❌ Cancel", "p2_data")])); return True
+    if data == "p2_delacct_go":
+        if is_admin(uid):
+            return True
+        set_user_step(uid, 'fp_p2delconf')
+        edit_message(chat_id, mid, "⚠️ *Last step.* Type `DELETE` (capitals) to permanently delete your account.",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_data")])); return True
+    return False
+
+
+def _p2_purge_snapshots(dep_id):
+    try:
+        shutil.rmtree(BASE_DIR / "snapshots" / str(dep_id), ignore_errors=True)
+    except Exception:
+        pass
+
+    def remote():
+        try:
+            if _files_repo_ready():
+                pre = _snap_remote_prefix(dep_id)
+                with _files_lock:
+                    names = [k for k in _files_list_remote(pre)]
+                    if names:
+                        _files_commit({k: None for k in names}, f"remove rollback points #{dep_id}")
+        except Exception as e:
+            print(f"⚠️ snapshot purge #{dep_id}: {e}")
+    threading.Thread(target=remote, daemon=True, name="SnapPurge").start()
+
+
+def delete_account(uid):
+    """Stop + delete all bots and files, erase personal data, keep the (anonymised) ledger and any ban."""
+    uid = int(uid)
+    for dep_id, pid in (_q("SELECT deployment_id, proc_pid FROM deployments WHERE user_id = ?", (uid,), fetch='all') or []):
+        try:
+            if pid:
+                kill_deployment_process(pid)
+        except Exception:
+            pass
+        shutil.rmtree(get_deploy_folder(uid, dep_id), ignore_errors=True)
+        try:
+            files_repo_async_delete(uid, dep_id)
+        except Exception:
+            pass
+        _p2_purge_snapshots(dep_id)
+        for tbl in ("dep_settings", "dep_metrics", "dep_shares"):
+            _q(f"DELETE FROM {tbl} WHERE deployment_id = ?", (dep_id,))
+        _q("DELETE FROM deployments WHERE deployment_id = ?", (dep_id,))
+    _q("DELETE FROM dep_shares WHERE user_id = ?", (uid,))
+    try:
+        shutil.rmtree(DEPLOYMENTS_DIR / str(uid), ignore_errors=True)
+    except Exception:
+        pass
+    for t in (_q("SELECT id FROM tickets WHERE user_id = ?", (uid,), fetch='all') or []):
+        _q("DELETE FROM ticket_msgs WHERE ticket_id = ?", (t[0],))
+    for sql in ("DELETE FROM tickets WHERE user_id = ?", "DELETE FROM user_pins WHERE user_id = ?",
+                "DELETE FROM user_overrides WHERE user_id = ?", "DELETE FROM deploy_credits WHERE user_id = ?",
+                "DELETE FROM user_discounts WHERE user_id = ?", "DELETE FROM export_log WHERE user_id = ?",
+                "UPDATE payment_orders SET email = NULL WHERE user_id = ?"):
+        _q(sql, (uid,))
+    try:
+        _q("DELETE FROM kv WHERE key = ?", (f"email_{uid}",))
+    except Exception:
+        pass
+    _q("UPDATE users SET username = NULL, first_name = 'Deleted user', coins_balance = 0, stars_balance = 0, is_premium = 0, "
+       "premium_expires = NULL, premium_plan = NULL, step = NULL, temp_file = NULL, requirements = NULL, env_vars = NULL, "
+       "plan = NULL, payment_method = NULL, temp_target_user = NULL, pending_payment_payload = NULL, referral_code = NULL, "
+       "referred_by = NULL, resource_tier_mb = 0, resource_tier_key = NULL, resource_tier_expires = NULL, channels_verified = NULL, pending_json = '{}', last_active = ? WHERE user_id = ?", (_now(), uid))
+    audit("system", "account_deleted", uid)
+    try:
+        async_backup(f"account_deleted_{uid}")
+    except Exception:
+        pass
+
+
+def _p2_text_delconf(message, user_step, uid, chat_id, text):
+    if is_admin(uid):
+        return True
+    if text != "DELETE":
+        send_message(chat_id, "Cancelled — nothing was deleted. (You must type DELETE exactly.)",
+                     _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+        return True
+    delete_account(uid)
+    send_message(chat_id, "✅ *Your account has been deleted.* Your bots, files and personal details are gone. "
+                          "You're welcome back any time with /start.")
+    return True
+
+
+_P2_TEXT['fp_p2delconf'] = _p2_text_delconf
+_P2_ROUTES.append(("p2_data", _p2_r_data))
+_P2_ROUTES.append(("p2_exp", _p2_r_data))
+_P2_ROUTES.append(("p2_delacct", _p2_r_data))
+
+
+def _p2_install_delete_hook():
+    g = globals()
+    _dd = g['delete_deployment']
+
+    def dd(deployment_id, user_id, chat_id):
+        r = _dd(deployment_id, user_id, chat_id)
+        if r:
+            _p2_purge_snapshots(deployment_id)
+        return r
+    g['delete_deployment'] = dd
+
+
+_p2_install_delete_hook()
+
+
+# ---------------------------------------------------------------- Telegram Mini App dashboard
+from urllib.parse import parse_qsl as _parse_qsl
+MA_AUTH_MAX_AGE = 86400
+MA_TAIL_CHARS = 6000
+_MA_RATE = {}
+
+
+def ma_verify_init_data(init_data, token=None, max_age=MA_AUTH_MAX_AGE, now=None):
+    """Validate Telegram WebApp initData (HMAC, see core.telegram.org/bots/webapps). -> user dict or None."""
+    token = token if token is not None else (BOT_TOKEN or "")
+    try:
+        if not init_data or not token or len(init_data) > 4096:
+            return None
+        pairs = dict(_parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        want = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(want, got):
+            return None
+        auth = int(pairs.get("auth_date", "0"))
+        if (now or time.time()) - auth > max_age or auth - (now or time.time()) > 300:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        return user if isinstance(user, dict) and user.get("id") else None
+    except Exception:
+        return None
+
+
+def ma_access(uid, dep_id):
+    """The deployment if `uid` owns it or it is shared with them (admins get no special access here)."""
+    d = _fp_dep(dep_id)
+    if not d:
+        return None
+    if d["owner"] == uid:
+        return d
+    if _q("SELECT 1 FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one'):
+        return d
+    return None
+
+
+def _ma_rate_ok(uid, kind, limit, window=60):
+    now = time.time()
+    k = (uid, kind)
+    hits = [t for t in _MA_RATE.get(k, []) if now - t < window]
+    if len(hits) >= limit:
+        _MA_RATE[k] = hits
+        return False
+    hits.append(now)
+    _MA_RATE[k] = hits
+    return True
+
+
+def _ma_series(dep_id, hours=24, points=48):
+    since = int(time.time()) - hours * 3600
+    rows = _q("SELECT ts, cpu, ram FROM dep_metrics WHERE deployment_id = ? AND ts >= ? ORDER BY ts", (dep_id, since), fetch='all') or []
+    if not rows:
+        return {"cpu": [], "ram": []}
+    step = hours * 3600 / points
+    buckets = {}
+    for ts, cpu, ram in rows:
+        b = int((ts - since) // step)
+        buckets.setdefault(b, []).append((cpu or 0, ram or 0))
+    cpu, ram = [], []
+    for b in range(points):
+        v = buckets.get(b)
+        cpu.append(round(sum(x[0] for x in v) / len(v), 1) if v else None)
+        ram.append(round(sum(x[1] for x in v) / len(v), 1) if v else None)
+    return {"cpu": cpu, "ram": ram}
+
+
+def _ma_dep_summary(d, uid):
+    return {"id": d["id"], "name": display_filename(d["file"]), "status": d["status"], "expire": d["expire"],
+            "shared": d["owner"] != uid}
+
+
+def ma_handle_api(uid, method, path):
+    """-> (status, json-able). Pure function of (user, request): no env values ever leave here."""
+    if get_ban_info(uid):
+        return 403, {"error": "banned"}
+    if not _ma_rate_ok(uid, "api", 90):
+        return 429, {"error": "slow down"}
+    if path == "/api/me" and method == "GET":
+        bal = get_user_balances(uid)
+        tier = get_user_tier(uid)
+        n = _q("SELECT COUNT(*) FROM deployments WHERE user_id = ?", (uid,), fetch='one')[0]
+        return 200, {"id": uid, "coins": bal['coins'], "stars": bal['stars'], "deployments": n,
+                     "tier": (RESOURCE_TIERS.get(tier[0], (0, format_resource(tier[1]), 0))[1] if tier else None),
+                     "tier_until": tier[2].strftime("%Y-%m-%d") if tier else None,
+                     "premium": bool(is_user_premium(uid))}
+    if path == "/api/deployments" and method == "GET":
+        rows = _q("SELECT deployment_id FROM deployments WHERE user_id = ? UNION SELECT deployment_id FROM dep_shares WHERE user_id = ?",
+                  (uid, uid), fetch='all') or []
+        out = [_ma_dep_summary(d, uid) for d in (ma_access(uid, r[0]) for r in rows) if d]
+        return 200, {"deployments": sorted(out, key=lambda x: -x["id"])}
+    m = re.match(r'^/api/deployment/(\d+)(?:/(restart|stop))?$', path)
+    if m:
+        dep_id, action = int(m.group(1)), m.group(2)
+        d = ma_access(uid, dep_id)
+        if not d:
+            return 404, {"error": "not found"}
+        if action is None and method == "GET":
+            tail = ""
+            try:
+                lf = d["folder"] / "output.log"
+                if lf.exists():
+                    with open(lf, "rb") as f:
+                        f.seek(0, 2); f.seek(max(0, f.tell() - MA_TAIL_CHARS))
+                        tail = f.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            r = _ma_dep_summary(d, uid)
+            r.update({"usage": _ma_series(dep_id), "logs": tail[-MA_TAIL_CHARS:], "can_control": d["status"] in ("active", "stopped", "crashed", "failed", "error")})
+            return 200, r
+        if action and method == "POST":
+            if not _ma_rate_ok(uid, "act", 6):
+                return 429, {"error": "too many actions"}
+            if d["status"] == "expired":
+                return 409, {"error": "expired"}
+
+            def run():
+                try:
+                    if action == "restart":
+                        _fp_restart(dep_id, "miniapp")
+                    else:
+                        stop_deployment(dep_id)
+                    audit(uid, f"miniapp_{action}", dep_id)
+                except Exception as e:
+                    print(f"⚠️ miniapp {action} #{dep_id}: {e}")
+            threading.Thread(target=run, daemon=True, name=f"MiniApp{action}").start()
+            return 202, {"ok": True}
+    return 404, {"error": "not found"}
+
+
+_MA_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Dashboard</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--fg:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#777);--card:var(--tg-theme-secondary-bg-color,#f3f3f5);--btn:var(--tg-theme-button-color,#2481cc);--btnfg:var(--tg-theme-button-text-color,#fff);--ok:#2e9e5b;--bad:#d6453d}
+*{box-sizing:border-box}body{margin:0;padding:14px 16px 40px;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,sans-serif}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:18px 0 8px;color:var(--hint);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.sub{color:var(--hint);font-size:13px}.card{background:var(--card);border-radius:14px;padding:12px 14px;margin:8px 0}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px}.dep{cursor:pointer}.name{font-weight:600;word-break:break-all}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:var(--hint)}.dot.active{background:var(--ok)}.dot.crashed,.dot.failed,.dot.error{background:var(--bad)}
+button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--btn);color:var(--btnfg)}button.sec{background:var(--card);color:var(--fg)}button:disabled{opacity:.5}
+pre{white-space:pre-wrap;word-break:break-all;background:var(--card);border-radius:12px;padding:10px;font-size:12px;max-height:46vh;overflow:auto;margin:0}
+svg{width:100%;height:64px;display:block}.stats{display:flex;gap:10px}.stats .card{flex:1}.big{font-size:20px;font-weight:700}
+.back{background:none;color:var(--btn);padding:6px 0;margin-bottom:6px}.err{color:var(--bad)}
+</style></head><body><div id="app"><div class="sub">Loading…</div></div>
+<script>
+const tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand()}
+const H={'X-Init-Data':tg?tg.initData:''};let cur=null,timer=null;
+async function api(p,m){const r=await fetch(p,{method:m||'GET',headers:H,cache:'no-store'});let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function spark(vals,color){const v=vals.map(x=>x==null?null:x);const pts=v.filter(x=>x!=null);const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 200 60');s.setAttribute('preserveAspectRatio','none');
+if(pts.length<2){return s}const mx=Math.max(...pts,1);let d='';v.forEach((x,i)=>{if(x==null)return;d+=(d&&v[i-1]!=null?'L':'M')+(i/(v.length-1)*200).toFixed(1)+' '+(58-(x/mx)*54).toFixed(1)});
+const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',d);p.setAttribute('fill','none');p.setAttribute('stroke',color);p.setAttribute('stroke-width','2');p.setAttribute('vector-effect','non-scaling-stroke');s.appendChild(p);return s}
+async function home(){cur=null;const a=document.getElementById('app');try{const[m,l]=await Promise.all([api('/api/me'),api('/api/deployments')]);a.replaceChildren();
+a.append(el('h1','','Dashboard'));a.append(el('div','sub',(m.tier?m.tier+' plan until '+m.tier_until:(m.premium?'Premium':'Free plan'))));
+const st=el('div','stats');[['🪙 Coins',m.coins],['⭐ Stars',m.stars],['🤖 Bots',m.deployments]].forEach(x=>{const c=el('div','card');c.append(el('div','sub',x[0]),el('div','big',x[1]));st.append(c)});a.append(st);
+a.append(el('h2','','Your bots'));if(!l.deployments.length)a.append(el('div','sub','No deployments yet.'));
+l.deployments.forEach(d=>{const c=el('div','card dep');const r=el('div','row');const n=el('div');const nm=el('div','name');nm.append(el('span','dot '+d.status),document.createTextNode('#'+d.id+' '+d.name));n.append(nm,el('div','sub',d.status+(d.shared?' · shared with you':'')+(d.expire?' · until '+d.expire.slice(0,10):'')));r.append(n,el('div','sub','›'));c.append(r);c.onclick=()=>detail(d.id);a.append(c)})}
+catch(e){a.replaceChildren(el('div','err','Could not load: '+e.message+'. Open this page from the bot.'))}}
+async function detail(id){cur=id;const a=document.getElementById('app');try{const d=await api('/api/deployment/'+id);if(cur!==id)return;a.replaceChildren();const b=el('button','back','‹ Back');b.onclick=home;a.append(b);
+const t=el('h1');t.append(el('span','dot '+d.status),document.createTextNode(d.name));a.append(t,el('div','sub','#'+d.id+' · '+d.status+(d.shared?' · shared':'')));
+if(d.can_control){const r=el('div','row');r.style.margin='12px 0';const rb=el('button','','↻ Restart'),sb=el('button','sec','■ Stop');
+const act=(k)=>{const go=async()=>{rb.disabled=sb.disabled=true;try{await api('/api/deployment/'+id+'/'+k,'POST');setTimeout(()=>detail(id),k==='restart'?6000:2500)}catch(e){alert(e.message);rb.disabled=sb.disabled=false}};
+if(tg&&tg.showConfirm)tg.showConfirm((k==='restart'?'Restart':'Stop')+' this bot?',ok=>ok&&go());else if(confirm('Are you sure?'))go()};rb.onclick=()=>act('restart');sb.onclick=()=>act('stop');r.append(rb,sb);a.append(r)}
+a.append(el('h2','','RAM (MB) · last 24h'));a.append(spark(d.usage.ram,'#2481cc'));a.append(el('h2','','CPU (%) · last 24h'));a.append(spark(d.usage.cpu,'#e08a1e'));
+a.append(el('h2','','Latest logs'));a.append(el('pre','',d.logs||'(no output yet)'));clearTimeout(timer);timer=setTimeout(()=>cur===id&&detail(id),15000)}
+catch(e){a.replaceChildren(el('div','err',e.message));const b=el('button','back','‹ Back');b.onclick=home;a.append(b)}}
+home();
+</script></body></html>"""
+
+
+def p2_app_http(h, method, path):
+    if path == "/app":
+        _p2_send(h, 200, _MA_HTML, "text/html; charset=utf-8",
+                 {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                  "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; "
+                                             "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
+                                             "frame-ancestors https://*.telegram.org https://telegram.org"})
+        return True
+    if path.startswith("/api/"):
+        user = ma_verify_init_data(h.headers.get("X-Init-Data", ""))
+        if not user:
+            _p2_send(h, 401, json.dumps({"error": "unauthorized"}), "application/json", {"Cache-Control": "no-store"})
+            return True
+        code, body = ma_handle_api(int(user["id"]), method, path)
+        _p2_send(h, code, json.dumps(body), "application/json", {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+        return True
+    return False
+
+
+def _p2_http_app(h, method, path):
+    return p2_app_http(h, method, path) if (path == "/app" or path.startswith("/api/")) else False
+
+
+_P2_HTTP.append(_p2_http_app)
+
+
+def _p2_dash_button():
+    base = _public_base_url()
+    return {"text": "📱 Dashboard", "web_app": {"url": base + "/app"}} if base.startswith("https://") else None
+
+
+def _p2_more_rows():
+    b = _p2_dash_button()
+    return ([[b]] if b else []) + list(_P2_MORE_ROWS)
+
+
+# ---------------------------------------------------------------- UPGRADE 1: admin health dashboard + alerts
+_P2_BOOT = time.time()
+HEALTH_DISK_PCT = float(os.environ.get("HEALTH_DISK_PCT", "85"))
+HEALTH_RAM_PCT = float(os.environ.get("HEALTH_RAM_PCT", "92"))
+HEALTH_BACKUP_STALE_H = float(os.environ.get("HEALTH_BACKUP_STALE_H", "6"))
+HEALTH_ALERT_COOLDOWN = 6 * 3600
+_HEALTH_ALERTED = {}           # key -> time of the last alert (present while the problem persists)
+_HEALTH_RAM_HITS = [0]
+
+
+def host_stats():
+    """RAM / CPU / disk of the host. Every field is None when it can't be read."""
+    s = {"ram_pct": None, "ram_used": None, "ram_total": None, "cpu_pct": None, "load": None,
+         "disk_pct": None, "disk_free_gb": None, "disk_total_gb": None}
+    total, used, _avail = _read_proc_meminfo()
+    if not total and _psutil:
+        try:
+            vm = _psutil.virtual_memory(); total, used = vm.total / 1048576, (vm.total - vm.available) / 1048576
+        except Exception:
+            pass
+    if total:
+        s.update(ram_total=round(total), ram_used=round(used), ram_pct=round(used / total * 100, 1))
+    try:
+        s["cpu_pct"] = round(_psutil.cpu_percent(interval=0.3), 1) if _psutil else None
+    except Exception:
+        pass
+    try:
+        s["load"] = round(os.getloadavg()[0], 2)
+    except Exception:
+        pass
+    try:
+        du = shutil.disk_usage(BASE_DIR if Path(BASE_DIR).exists() else "/")
+        s.update(disk_pct=round(du.used / du.total * 100, 1), disk_free_gb=round(du.free / 2 ** 30, 2),
+                 disk_total_gb=round(du.total / 2 ** 30, 1))
+    except Exception:
+        pass
+    return s
+
+
+def backup_status():
+    """-> (state, text). state: 'off' | 'ok' | 'stale' | 'never'"""
+    if not GITHUB_ENABLED:
+        return "off", "not configured"
+    last = _last_backup_time
+    try:
+        db_mtime = Path(DATABASE_FILE).stat().st_mtime
+    except Exception:
+        db_mtime = 0
+    if not last:
+        return ("stale" if time.time() - _P2_BOOT > HEALTH_BACKUP_STALE_H * 3600 and db_mtime > _P2_BOOT else "never"), "no backup since start"
+    age_h = (time.time() - last) / 3600
+    changed_since = db_mtime > last + 1800
+    ago = f"{int(age_h * 60)} min ago" if age_h < 1 else f"{age_h:.1f} h ago"
+    if changed_since and age_h > HEALTH_BACKUP_STALE_H:
+        return "stale", f"last OK {ago}, newer data NOT backed up"
+    return "ok", f"last OK {ago}"
+
+
+def _bar(pct, n=10):
+    if pct is None:
+        return "n/a"
+    f = max(0, min(n, round(pct / 100 * n)))
+    return "▓" * f + "░" * (n - f) + f" {pct:g}%"
+
+
+def health_report():
+    h = host_stats()
+    bots = dict(_q("SELECT status, COUNT(*) FROM deployments GROUP BY status", fetch='all') or [])
+    users = _q("SELECT COUNT(*) FROM users", fetch='one')[0]
+    new24 = _q("SELECT COUNT(*) FROM users WHERE join_date >= ?", ((datetime.now() - timedelta(days=1)).isoformat(),), fetch='one')[0]
+    tickets = _q("SELECT COUNT(*) FROM tickets WHERE status = 'open'", fetch='one')[0]
+    try:
+        bugs = db_execute("SELECT COUNT(*) FROM bug_reports WHERE status = 'open'", fetch='one')[0]
+    except Exception:
+        bugs = 0
+    bstate, btxt = backup_status()
+    up = int(time.time() - _P2_BOOT)
+    running, down = bots.get("active", 0), sum(v for k, v in bots.items() if k in ("crashed", "failed", "error"))
+    lines = [
+        "*🩺 SYSTEM HEALTH*", "",
+        f"🖥 CPU   `{_bar(h['cpu_pct'])}`" + (f"  load {h['load']}" if h['load'] is not None else ""),
+        f"🧠 RAM   `{_bar(h['ram_pct'])}`" + (f"  {h['ram_used']}/{h['ram_total']} MB" if h['ram_total'] else ""),
+        f"💽 Disk  `{_bar(h['disk_pct'])}`" + (f"  {h['disk_free_gb']} GB free" if h['disk_free_gb'] is not None else ""),
+        "",
+        f"🤖 Bots: 🟢 `{running}` running · 🔴 `{down}` crashed · ⏹ `{bots.get('stopped', 0)}` stopped · ⌛ `{bots.get('expired', 0)}` expired",
+        f"👥 Users: `{users}` (+`{new24}` in 24h)",
+        f"🎫 Open tickets: `{tickets}` · 🐛 bug reports: `{bugs}`",
+        f"💾 DB backup: {'✅' if bstate == 'ok' else ('⚠️' if bstate == 'stale' else '➖')} {btxt}",
+        f"⏱ Process uptime: `{up // 86400}d {up % 86400 // 3600}h {up % 3600 // 60}m`",
+    ]
+    alerts = health_problems(h, bstate)
+    if alerts:
+        lines += ["", "*⚠️ Active problems*"] + [f"• {a[1]}" for a in alerts]
+    return "\n".join(lines)
+
+
+def health_problems(h=None, bstate=None):
+    """-> [(key, text)] for the conditions that currently need attention."""
+    h = h or host_stats()
+    bstate = bstate or backup_status()[0]
+    out = []
+    if h["disk_pct"] is not None and h["disk_pct"] >= HEALTH_DISK_PCT:
+        out.append(("disk", f"Disk is {h['disk_pct']:g}% full ({h['disk_free_gb']} GB free)"))
+    if h["ram_pct"] is not None and h["ram_pct"] >= HEALTH_RAM_PCT:
+        out.append(("ram", f"RAM is {h['ram_pct']:g}% used"))
+    if bstate == "stale":
+        out.append(("backup", "The GitHub database backup is stale — newer data isn't being saved"))
+    return out
+
+
+def health_check_once(now=None):
+    """Alert admins about NEW problems (rate-limited) and tell them when a problem is gone. -> messages sent"""
+    now = now or time.time()
+    h = host_stats()
+    probs = health_problems(h)
+    if any(k == "ram" for k, _ in probs):                  # one RAM spike isn't an alert; two in a row is
+        _HEALTH_RAM_HITS[0] += 1
+        if _HEALTH_RAM_HITS[0] < 2:
+            probs = [p for p in probs if p[0] != "ram"]
+    else:
+        _HEALTH_RAM_HITS[0] = 0
+    sent = 0
+    if kv_get("health_alerts", "1") != "0":
+        for key, text in probs:
+            last = _HEALTH_ALERTED.get(key)
+            if last is None or now - last >= HEALTH_ALERT_COOLDOWN:
+                _HEALTH_ALERTED[key] = now
+                for a in list(ADMIN_IDS):
+                    try:
+                        send_message(a, f"🚨 *Host alert*\n\n{text}", _fp_kb([_fp_btn("🩺 System health", "p2_ah")]))
+                    except Exception:
+                        pass
+                sent += 1
+    active = {k for k, _ in probs}
+    for key in [k for k in _HEALTH_ALERTED if k not in active]:
+        del _HEALTH_ALERTED[key]
+        if kv_get("health_alerts", "1") != "0":
+            for a in list(ADMIN_IDS):
+                try:
+                    send_message(a, f"✅ *Resolved:* the {key} problem is gone.")
+                except Exception:
+                    pass
+            sent += 1
+    return sent
+
+
+def p2_health_monitor():
+    sleep(150)
+    print("✅ Host-health monitor started")
+    while True:
+        try:
+            health_check_once()
+        except Exception as e:
+            print(f"⚠️ health monitor: {e}")
+        sleep(300)
+
+
+def _p2_r_ah(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_ahtog":
+        kv_set("health_alerts", "0" if kv_get("health_alerts", "1") != "0" else "1")
+    on = kv_get("health_alerts", "1") != "0"
+    edit_message(chat_id, mid, health_report(),
+                 _fp_kb([_fp_btn("🔄 Refresh", "p2_ah")], [_fp_btn(f"🔔 Alerts: {'ON' if on else 'OFF'}", "p2_ahtog")],
+                        [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_ah", _p2_r_ah))
+_P2_ADMIN_ROWS.insert(0, [_fp_btn("🩺 System health", "p2_ah")])
 
 
 def _p2_route(callback, data, uid, chat_id, mid):
@@ -18502,6 +19452,8 @@ def main():
     threading.Thread(target=metrics_sampler,            daemon=True, name="UsageSampler").start()
     threading.Thread(target=health_check_monitor,       daemon=True, name="HealthPing").start()
     threading.Thread(target=p2_autorenew_monitor,       daemon=True, name="AutoRenew").start()
+    threading.Thread(target=p2_sched_broadcast_monitor, daemon=True, name="SchedBroadcast").start()
+    threading.Thread(target=p2_health_monitor,          daemon=True, name="HostHealth").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
