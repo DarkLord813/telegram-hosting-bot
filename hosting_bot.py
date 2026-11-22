@@ -2825,20 +2825,17 @@ def _relaunch_followup(dep_id, reason, result):
     if reason not in ("crash", "watchdog") or result not in ("cap_exceeded", "launch_failed"):
         return
     row = db_execute("SELECT user_id FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
-    if not row:
+    if not row or not notif_allows(row[0], "crash", "failed"):
         return
     try:
         _tail = _log_tail_text(get_deploy_folder(row[0], dep_id), 15)
         _logs = f"\n\n*Last log lines:*\n```\n{_tail}\n```" if _tail else ""
         why = ("It crashed too many times in the last hour, so auto-restart stopped."
                if result == "cap_exceeded" else "Automatic restart didn't succeed.")
+        _diag = crash_diagnose(_log_tail_text(get_deploy_folder(row[0], dep_id), 60, 6000))
         send_message(row[0],
-            f"⚠️ *Bot #{dep_id} Crashed*\n\n"
-            f"{why} Your database is safe — fix the problem (see the log below) "
-            f"and click Restart.{_logs}",
-            {"inline_keyboard": [
-                [{"text": "🔄 Restart Bot", "callback_data": f"restart_deploy_{dep_id}"}],
-                [{"text": "📄 View Logs",   "callback_data": f"view_runtime_logs_{dep_id}"}]]})
+            crash_alert_text(dep_id, f"⚠️ *Bot #{dep_id} Crashed*\n\n{why} Your database is safe.", _diag, _tail),
+            {"inline_keyboard": crash_fix_rows(dep_id, _diag)})
     except Exception:
         pass
 
@@ -3414,7 +3411,7 @@ def quota_monitor():
 
                 strikes = _quota_strikes.get(uid, 0) + 1
                 _quota_strikes[uid] = strikes
-                if strikes == 1:
+                if strikes == 1 and notif_allows(uid, "usage"):
                     try:
                         send_message(uid,
                             f"⚠️ *Over your resource share*\n\n"
@@ -9323,6 +9320,8 @@ def check_expiry_reminders(now=None):
             continue                              # this (or a tighter) stage was already sent
         db_execute("INSERT OR IGNORE INTO expiry_reminders (deployment_id, expire_time, stage, sent_at) "
                    "VALUES (?,?,?,?)", (dep_id, exp_s, stage, now.isoformat()))
+        if not notif_allows(uid, "expiry", stage):
+            continue                              # the user opted out of this reminder (it stays marked as handled)
         left = (f"{int(left_h * 60)} minutes" if left_h < 1.5 else
                 f"{left_h:.0f} hours" if left_h < 48 else f"{left_h / 24:.0f} days")
         rows_kb = [[{"text": "📈 Resource Plans (renew)", "callback_data": "resource_tiers"}],
@@ -9389,6 +9388,8 @@ def abuse_guard_tick(now_ts=None, cpu_probe=None):
     for kind, dep_id, uid in actions:
         try:
             if kind == "warn":
+                if not notif_allows(uid, "usage"):
+                    continue
                 send_message(uid,
                     f"⚠️ *Bot #{dep_id} is using too much CPU*\n\n"
                     f"It has been running at ~100% of a core for {ABUSE_WARN_MIN}+ minutes. "
@@ -9465,7 +9466,9 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
             cost_text = f"{cost_coins}🪙"
         remaining_text = f"{remaining_days}d" if remaining_secs > 0 else "Expired"
     
-    if status == "active":
+    if status == "active" and not dep_files_ok(user_id, dep_id, fname):
+        status_emoji = "⚠️ FILES MISSING (not running)"
+    elif status == "active":
         status_emoji = "🟢 ACTIVE"
     elif status == "paused":
         status_emoji = "⏸️ PAUSED"
@@ -9551,6 +9554,10 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
             text += _live_stats_block(dep_id, _proc_pid, None if is_admin(user_id) else get_user_quota_mb(user_id))
         except Exception as _e:
             print(f"⚠️ live stats failed: {_e}")
+    try:
+        text += uptime_block(dep_id, start_str)
+    except Exception as _e:
+        print(f"⚠️ uptime block failed: {_e}")
     keyboard = _fp_filter_shared_kb(keyboard, dep_id)
     edit_message(chat_id, message_id, text[:4096], keyboard)
 
@@ -9889,6 +9896,7 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
         header = "📦 *Your Deployments*\n\n"
     
     keyboard = {"inline_keyboard": []}
+    _any_missing = False
     for dep_id, fname, fsize, plan, exp_str, status, is_free, payment, is_paused, framework in rows:
         if exp_str is None:
             remaining_text = "♾️"
@@ -9901,7 +9909,10 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
                 remaining = (exp_time - datetime.now()).days
                 remaining_text = f"{remaining}d"
         
-        if status == "active":
+        if status == "active" and not dep_files_ok(user_id, dep_id, fname):
+            status_icon = "⚠️"
+            _any_missing = True
+        elif status == "active":
             status_icon = "✅"
         elif status == "paused":
             status_icon = "⏸️"
@@ -9933,6 +9944,9 @@ def handle_deployments_list(chat_id, user_id, message_id=None):
         keyboard["inline_keyboard"].append([{"text": f"{icon}{status_icon}{fw_icon} ID:{dep_id} - {clean_fname[:20]} ({size_str}) [{remaining_text}]", 
                          "callback_data": f"view_deploy_{dep_id}"}])
     
+    if _any_missing:
+        header += "⚠️ = files missing on the server (not running). Press the bot, then Restart to bring it back.\n\n"
+    keyboard["inline_keyboard"].append([{"text": "🔄 Restart all", "callback_data": "p2_rall"}])
     keyboard["inline_keyboard"].append([{"text": "🔙 Back", "callback_data": "main_menu"}])
     
     if message_id:
@@ -10482,7 +10496,6 @@ def show_admin_panel(chat_id, message_id):
         f"⭐ Premium: `{stats.get('premium_users', 0)}`\n"
         f"💰 Revenue: `${stats.get('revenue_usd', 0):.2f}`\n"
         f"🪙 Coins Created: `{stats.get('coins_created', 0)}`\n"
-        f"🐛 Bug Reports: `{open_bugs}` open / `{total_bugs}` total\n"
         f"👥 Referrals: `{total_refs}` total\n"
         + (f"🏆 Top Referrer: `{top_referrer[0]}` ({top_referrer[1]} refs)\n" if top_referrer else "")
         + f"\n━━━━━━━━━━━━━━━━━━━━━━"
@@ -10503,8 +10516,7 @@ def show_admin_panel(chat_id, message_id):
 
     keyboard = {
         "inline_keyboard": [
-            [{"text": f"🔒 Security Reviews{sec_badge}", "callback_data": "admin_sec_reviews"},
-             {"text": f"🐛 Bug Reports{open_badge}",     "callback_data": "admin_bug_reports"}],
+            [{"text": f"🔒 Security Reviews{sec_badge}", "callback_data": "admin_sec_reviews"}],
             [{"text": "📊 Dashboard",                    "callback_data": "admin_dashboard"}],
             *_fp_admin_rows(),
             [{"text": "👥 Referral Stats",               "callback_data": "admin_referral_stats"},
@@ -11568,7 +11580,7 @@ def admin_dashboard_text():
     active_24h   = q1("SELECT COUNT(*) FROM users WHERE last_active > ?", d1)
     premium_n    = len(broadcast_audience_ids("premium"))
     banned_n     = q1("SELECT COUNT(*) FROM users WHERE is_banned = 1")
-    bots_active  = q1("SELECT COUNT(*) FROM deployments WHERE status = 'active'")
+    bots_active  = max(0, q1("SELECT COUNT(*) FROM deployments WHERE status = 'active'") - len(missing_active_ids()))
     bots_total   = q1("SELECT COUNT(*) FROM deployments")
     expiring     = q1("SELECT COUNT(*) FROM deployments WHERE status = 'active' AND expire_time IS NOT NULL "
                       "AND expire_time > ? AND expire_time <= ?", now.isoformat(), (now + timedelta(hours=72)).isoformat())
@@ -14309,14 +14321,25 @@ def _auto_relaunch_deployment(deployment_id, reason="crash", bypass_cap=False):
             active_deployments[deployment_id] = new_pid
         print(f"🔄 Auto-restarted deployment {deployment_id} ({reason})")
         try:
+            if not notif_allows(owner_id, "crash", "recovered"):
+                return "restarted"
             _inst = (f"\n📦 Installed missing package(s): `{', '.join(dict.fromkeys(auto_installed))[:200]}`"
                      if auto_installed else "")
-            send_message(owner_id,
-                f"🔄 *Bot #{deployment_id} auto-restarted*\n\n"
-                f"It stopped unexpectedly and has been brought back online automatically.{_inst}\n"
-                f"Your database and settings are untouched."
-                + (f"\n\n*Why it crashed (last log lines):*\n```\n{crash_tail}\n```" if crash_tail else ""),
-                {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]})
+            if crash_tail:
+                _diag = crash_diagnose(crash_tail)
+                if auto_installed and _diag["code"] == "missing_module":
+                    _diag = dict(_diag, code="unknown", title="A package was missing (now installed)", detail="")
+                _rows = crash_fix_rows(deployment_id, _diag) if _diag["code"] not in ("unknown",) else [
+                    [{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]
+                send_message(owner_id,
+                    crash_alert_text(deployment_id, f"🔄 *Bot #{deployment_id} auto-restarted*\n\nIt stopped unexpectedly and is back online.{_inst}\nYour database and settings are untouched.",
+                                     _diag, crash_tail) if _diag["code"] != "unknown" or _diag["detail"] else
+                    f"🔄 *Bot #{deployment_id} auto-restarted*\n\nIt stopped unexpectedly and has been brought back online automatically.{_inst}\nYour database and settings are untouched.\n\n*Why it crashed (last log lines):*\n```\n{crash_tail}\n```",
+                    {"inline_keyboard": _rows})
+            else:
+                send_message(owner_id,
+                    f"🔄 *Bot #{deployment_id} auto-restarted*\n\nIt stopped unexpectedly and has been brought back online automatically.{_inst}\nYour database and settings are untouched.",
+                    {"inline_keyboard": [[{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{deployment_id}"}]]})
         except Exception:
             pass
         return "restarted"
@@ -17329,6 +17352,8 @@ def p2_autorenew_tick():
                 key = f"renewrem_{dep_id}_{exp_s}"
                 if not kv_get(key):
                     kv_set(key, "1")
+                    if not notif_allows(uid, "expiry", 72):
+                        continue
                     send_message(uid, f"🔁 *Auto-renew #{dep_id}* — in about {int(left.total_seconds() // 3600 // 24) + 1} day(s) "
                                       f"I'll renew this {plan} bot for `{price}🪙`.\nYour balance: `{bal}🪙`"
                                       + ("" if bal >= price else "\n⚠️ That's not enough — top up so it doesn't expire."),
@@ -18708,9 +18733,17 @@ def _ma_series(dep_id, hours=24, points=48):
     return {"cpu": cpu, "ram": ram}
 
 
+def _ma_latest(dep_id):
+    r = _q("SELECT cpu, ram FROM dep_metrics WHERE deployment_id = ? ORDER BY ts DESC LIMIT 1", (dep_id,), fetch='one')
+    return (r[0], r[1]) if r else (None, None)
+
+
 def _ma_dep_summary(d, uid):
-    return {"id": d["id"], "name": display_filename(d["file"]), "status": d["status"], "expire": d["expire"],
-            "shared": d["owner"] != uid}
+    cpu, ram = _ma_latest(d["id"])
+    _st = _q("SELECT start_time FROM deployments WHERE deployment_id = ?", (d["id"],), fetch='one')
+    _u = bot_uptime(d["id"], _st[0] if _st else None)
+    return {"uptime": _u["pct"] if _u else None, "uptime_days": _u["days"] if _u else None, "id": d["id"], "name": display_filename(d["file"]), "status": effective_status(d["owner"], d["id"], d["file"], d["status"]), "expire": d["expire"],
+            "shared": d["owner"] != uid, "cpu": cpu, "ram": ram}
 
 
 def ma_handle_api(uid, method, path):
@@ -18732,6 +18765,13 @@ def ma_handle_api(uid, method, path):
                   (uid, uid), fetch='all') or []
         out = [_ma_dep_summary(d, uid) for d in (ma_access(uid, r[0]) for r in rows) if d]
         return 200, {"deployments": sorted(out, key=lambda x: -x["id"])}
+    if path == "/api/restart-all" and method == "POST":
+        if not _ma_rate_ok(uid, "rall", 3):
+            return 429, {"error": "too many actions"}
+        started, wait = restart_all(uid, uid, RALL_USER_COOLDOWN)
+        if wait:
+            return 429, {"error": f"wait {wait}s"}
+        return 202, {"ok": True, "started": started or 0}
     m = re.match(r'^/api/deployment/(\d+)(?:/(restart|stop))?$', path)
     if m:
         dep_id, action = int(m.group(1)), m.group(2)
@@ -18749,7 +18789,9 @@ def ma_handle_api(uid, method, path):
             except Exception:
                 pass
             r = _ma_dep_summary(d, uid)
-            r.update({"usage": _ma_series(dep_id), "logs": tail[-MA_TAIL_CHARS:], "can_control": d["status"] in ("active", "stopped", "crashed", "failed", "error")})
+            meta = _q("SELECT plan, start_time FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one') or (None, None)
+            r.update({"plan": meta[0], "started": meta[1], "source": d["source"]})
+            r.update({"usage": _ma_series(dep_id), "logs": tail[-MA_TAIL_CHARS:], "can_control": r["status"] in ("active", "missing", "stopped", "crashed", "failed", "error")})
             return 200, r
         if action and method == "POST":
             if not _ma_rate_ok(uid, "act", 6):
@@ -18774,39 +18816,74 @@ def ma_handle_api(uid, method, path):
 _MA_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>Dashboard</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:var(--tg-theme-bg-color,#fff);--fg:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#777);--card:var(--tg-theme-secondary-bg-color,#f3f3f5);--btn:var(--tg-theme-button-color,#2481cc);--btnfg:var(--tg-theme-button-text-color,#fff);--ok:#2e9e5b;--bad:#d6453d}
-*{box-sizing:border-box}body{margin:0;padding:14px 16px 40px;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,sans-serif}
-h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:18px 0 8px;color:var(--hint);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.sub{color:var(--hint);font-size:13px}.card{background:var(--card);border-radius:14px;padding:12px 14px;margin:8px 0}
-.row{display:flex;align-items:center;justify-content:space-between;gap:10px}.dep{cursor:pointer}.name{font-weight:600;word-break:break-all}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:var(--hint)}.dot.active{background:var(--ok)}.dot.crashed,.dot.failed,.dot.error{background:var(--bad)}
-button{font:inherit;border:0;border-radius:10px;padding:10px 14px;background:var(--btn);color:var(--btnfg)}button.sec{background:var(--card);color:var(--fg)}button:disabled{opacity:.5}
-pre{white-space:pre-wrap;word-break:break-all;background:var(--card);border-radius:12px;padding:10px;font-size:12px;max-height:46vh;overflow:auto;margin:0}
-svg{width:100%;height:64px;display:block}.stats{display:flex;gap:10px}.stats .card{flex:1}.big{font-size:20px;font-weight:700}
-.back{background:none;color:var(--btn);padding:6px 0;margin-bottom:6px}.err{color:var(--bad)}
-</style></head><body><div id="app"><div class="sub">Loading…</div></div>
+:root{--bg:#f6f7f9;--panel:#fff;--line:#e4e7ec;--fg:#101828;--mut:#667085;--acc:#4353ff;--accfg:#fff;--ok:#12a150;--okbg:#e3f6ec;--bad:#d92d20;--badbg:#fde7e5;--warn:#b54708;--warnbg:#fef0c7;--idle:#667085;--idlebg:#eceff3;--term:#0d1117;--termfg:#d0d7de}
+body.dark{--bg:#0b0d12;--panel:#14171f;--line:#262b36;--fg:#eef0f4;--mut:#8b93a3;--acc:#6b79ff;--okbg:#10301f;--badbg:#3a1613;--warnbg:#3a2a0a;--idlebg:#1e2330;--ok:#3ccf7e;--bad:#ff6b5e;--warn:#f5b84a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+.top{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:12px}
+.logo{font-weight:800;letter-spacing:-.02em;font-size:16px;display:flex;align-items:center;gap:8px}.logo i{width:22px;height:22px;border-radius:6px;background:var(--acc);display:inline-block}
+.sp{flex:1}.wrap{max-width:980px;margin:0 auto;padding:18px 16px 60px}
+h1{font-size:22px;margin:0;letter-spacing:-.02em}h2{font-size:12px;margin:22px 0 8px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.mut{color:var(--mut);font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}.big{font-size:24px;font-weight:700;letter-spacing:-.02em}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:16px 0 10px}
+input.s{flex:1;min-width:140px;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font:inherit}
+.chip{border:1px solid var(--line);background:var(--panel);color:var(--mut);border-radius:999px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}.chip.on{background:var(--acc);color:var(--accfg);border-color:var(--acc)}
+button.b{font:inherit;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:9px;padding:8px 14px;cursor:pointer}
+button.b.p{background:var(--acc);color:var(--accfg);border-color:var(--acc)}button.b.d{color:var(--bad)}button.b:disabled{opacity:.5;cursor:default}
+.svc{display:flex;align-items:center;gap:12px;padding:14px;border:1px solid var(--line);background:var(--panel);border-radius:12px;margin-bottom:8px;cursor:pointer}
+.svc:hover{border-color:var(--acc)}.svc .nm{font-weight:600;word-break:break-all}.svc .meta{flex:1;min-width:0}
+.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;background:var(--idlebg);color:var(--idle);white-space:nowrap}
+.pill:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.active{background:var(--okbg);color:var(--ok)}.pill.crashed,.pill.failed,.pill.error{background:var(--badbg);color:var(--bad)}.pill.paused,.pill.expired,.pill.missing{background:var(--warnbg);color:var(--warn)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:16px 0}.tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--mut);padding:9px 12px;font:inherit;font-weight:600;cursor:pointer}.tab.on{color:var(--fg);border-color:var(--acc)}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:8px 12px}.kv div:nth-child(odd){color:var(--mut)}
+pre{margin:0;background:var(--term);color:var(--termfg);border-radius:10px;padding:12px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;max-height:62vh;overflow:auto}
+svg{width:100%;height:110px;display:block}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.err{color:var(--bad)}
+.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 16px;border-radius:9px;font-weight:600;z-index:9}
+</style></head><body><div class="top"><div class="logo"><i></i>Dashboard</div><div class="sp"></div><div class="mut" id="who"></div></div>
+<div class="wrap" id="app"><div class="mut">Loading…</div></div>
 <script>
 const tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand()}
-const H={'X-Init-Data':tg?tg.initData:''};let cur=null,timer=null;
+if((tg&&tg.colorScheme==='dark')||(!tg&&matchMedia('(prefers-color-scheme: dark)').matches))document.body.classList.add('dark');
+const H={'X-Init-Data':tg?tg.initData:''};let cur=null,timer=null,filt='all',q='',tab='overview',DEPS=[];
 async function api(p,m){const r=await fetch(p,{method:m||'GET',headers:H,cache:'no-store'});let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-function spark(vals,color){const v=vals.map(x=>x==null?null:x);const pts=v.filter(x=>x!=null);const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 200 60');s.setAttribute('preserveAspectRatio','none');
-if(pts.length<2){return s}const mx=Math.max(...pts,1);let d='';v.forEach((x,i)=>{if(x==null)return;d+=(d&&v[i-1]!=null?'L':'M')+(i/(v.length-1)*200).toFixed(1)+' '+(58-(x/mx)*54).toFixed(1)});
-const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',d);p.setAttribute('fill','none');p.setAttribute('stroke',color);p.setAttribute('stroke-width','2');p.setAttribute('vector-effect','non-scaling-stroke');s.appendChild(p);return s}
-async function home(){cur=null;const a=document.getElementById('app');try{const[m,l]=await Promise.all([api('/api/me'),api('/api/deployments')]);a.replaceChildren();
-a.append(el('h1','','Dashboard'));a.append(el('div','sub',(m.tier?m.tier+' plan until '+m.tier_until:(m.premium?'Premium':'Free plan'))));
-const st=el('div','stats');[['🪙 Coins',m.coins],['⭐ Stars',m.stars],['🤖 Bots',m.deployments]].forEach(x=>{const c=el('div','card');c.append(el('div','sub',x[0]),el('div','big',x[1]));st.append(c)});a.append(st);
-a.append(el('h2','','Your bots'));if(!l.deployments.length)a.append(el('div','sub','No deployments yet.'));
-l.deployments.forEach(d=>{const c=el('div','card dep');const r=el('div','row');const n=el('div');const nm=el('div','name');nm.append(el('span','dot '+d.status),document.createTextNode('#'+d.id+' '+d.name));n.append(nm,el('div','sub',d.status+(d.shared?' · shared with you':'')+(d.expire?' · until '+d.expire.slice(0,10):'')));r.append(n,el('div','sub','›'));c.append(r);c.onclick=()=>detail(d.id);a.append(c)})}
+function toast(m){const t=el('div','toast',m);document.body.append(t);setTimeout(()=>t.remove(),2600)}
+function ask(msg,go){if(tg&&tg.showConfirm)tg.showConfirm(msg,ok=>ok&&go());else if(confirm(msg))go()}
+function pill(s){return el('span','pill '+s,s==='active'?'Running':s==='missing'?'Files missing':s.charAt(0).toUpperCase()+s.slice(1))}
+function chart(vals,color,unit){const pts=vals.filter(x=>x!=null);const w=el('div','card');if(pts.length<2){w.append(el('div','mut','Not enough data yet'));return w}
+const mx=Math.max(...pts,1),last=pts[pts.length-1],avg=pts.reduce((a,b)=>a+b,0)/pts.length;
+const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 200 60');s.setAttribute('preserveAspectRatio','none');
+let d='';vals.forEach((x,i)=>{if(x==null)return;d+=(d&&vals[i-1]!=null?'L':'M')+(i/(vals.length-1)*200).toFixed(1)+' '+(57-(x/mx)*52).toFixed(1)});
+const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',d);p.setAttribute('fill','none');p.setAttribute('stroke',color);p.setAttribute('stroke-width','2');p.setAttribute('vector-effect','non-scaling-stroke');s.append(p);
+const r=el('div','row');r.style.justifyContent='space-between';r.append(el('span','mut','now '+last.toFixed(1)+unit),el('span','mut','avg '+avg.toFixed(1)+unit),el('span','mut','peak '+mx.toFixed(1)+unit));w.append(s,r);return w}
+async function home(){cur=null;clearTimeout(timer);const a=document.getElementById('app');
+try{const[m,l]=await Promise.all([api('/api/me'),api('/api/deployments')]);DEPS=l.deployments;document.getElementById('who').textContent=m.tier?m.tier:(m.premium?'Premium':'Free');
+a.replaceChildren();const hd=el('div','row');hd.style.justifyContent='space-between';const t=el('div');t.append(el('h1','','Services'),el('div','mut',DEPS.length+' deployment'+(DEPS.length===1?'':'s')));hd.append(t);
+const ra=el('button','b','↻ Restart all');ra.onclick=()=>ask('Restart all your running bots one by one?',async()=>{ra.disabled=true;try{const r=await api('/api/restart-all','POST');toast(r.started?'Restarting '+r.started+' bot(s)…':'Nothing to restart');setTimeout(home,8000)}catch(e){toast(e.message)}ra.disabled=false});hd.append(ra);a.append(hd);
+const cnt=k=>DEPS.filter(d=>k==='bad'?['crashed','failed','error','missing'].includes(d.status):d.status===k).length;
+const g=el('div','grid');g.style.marginTop='14px';[['Running',cnt('active')],['Failed',cnt('bad')],['Stopped',cnt('stopped')],['Coins',m.coins],['Stars',m.stars]].forEach(x=>{const c=el('div','card');c.append(el('div','mut',x[0]),el('div','big',x[1]));g.append(c)});a.append(g);
+const bar=el('div','bar');const si=el('input','s');si.placeholder='Search services…';si.value=q;si.oninput=()=>{q=si.value;list()};bar.append(si);
+[['all','All'],['active','Running'],['bad','Failed'],['stopped','Stopped']].forEach(f=>{const c=el('button','chip'+(filt===f[0]?' on':''),f[1]);c.onclick=()=>{filt=f[0];home()};bar.append(c)});a.append(bar);
+const box=el('div');box.id='list';a.append(box);list()}
 catch(e){a.replaceChildren(el('div','err','Could not load: '+e.message+'. Open this page from the bot.'))}}
-async function detail(id){cur=id;const a=document.getElementById('app');try{const d=await api('/api/deployment/'+id);if(cur!==id)return;a.replaceChildren();const b=el('button','back','‹ Back');b.onclick=home;a.append(b);
-const t=el('h1');t.append(el('span','dot '+d.status),document.createTextNode(d.name));a.append(t,el('div','sub','#'+d.id+' · '+d.status+(d.shared?' · shared':'')));
-if(d.can_control){const r=el('div','row');r.style.margin='12px 0';const rb=el('button','','↻ Restart'),sb=el('button','sec','■ Stop');
-const act=(k)=>{const go=async()=>{rb.disabled=sb.disabled=true;try{await api('/api/deployment/'+id+'/'+k,'POST');setTimeout(()=>detail(id),k==='restart'?6000:2500)}catch(e){alert(e.message);rb.disabled=sb.disabled=false}};
-if(tg&&tg.showConfirm)tg.showConfirm((k==='restart'?'Restart':'Stop')+' this bot?',ok=>ok&&go());else if(confirm('Are you sure?'))go()};rb.onclick=()=>act('restart');sb.onclick=()=>act('stop');r.append(rb,sb);a.append(r)}
-a.append(el('h2','','RAM (MB) · last 24h'));a.append(spark(d.usage.ram,'#2481cc'));a.append(el('h2','','CPU (%) · last 24h'));a.append(spark(d.usage.cpu,'#e08a1e'));
-a.append(el('h2','','Latest logs'));a.append(el('pre','',d.logs||'(no output yet)'));clearTimeout(timer);timer=setTimeout(()=>cur===id&&detail(id),15000)}
-catch(e){a.replaceChildren(el('div','err',e.message));const b=el('button','back','‹ Back');b.onclick=home;a.append(b)}}
+function list(){const box=document.getElementById('list');if(!box)return;box.replaceChildren();
+const f=DEPS.filter(d=>(filt==='all'||(filt==='bad'?['crashed','failed','error','missing'].includes(d.status):d.status===filt))&&(!q||(d.name+' #'+d.id).toLowerCase().includes(q.toLowerCase())));
+if(!f.length)box.append(el('div','mut','No services match.'));
+f.forEach(d=>{const c=el('div','svc');const m=el('div','meta');m.append(el('div','nm',d.name),el('div','mut','#'+d.id+(d.shared?' · shared':'')+(d.expire?' · renews '+d.expire.slice(0,10):'')+(d.uptime!=null?' · '+d.uptime+'% up':'')+(d.ram!=null?' · '+d.ram.toFixed(0)+' MB':'')+(d.cpu!=null?' · '+d.cpu.toFixed(0)+'% CPU':'')));c.append(m,pill(d.status),el('span','mut','›'));c.onclick=()=>{tab='overview';detail(d.id)};box.append(c)})}
+async function detail(id){cur=id;const a=document.getElementById('app');
+try{const d=await api('/api/deployment/'+id);if(cur!==id)return;a.replaceChildren();const b=el('button','b','‹ All services');b.onclick=home;a.append(b);
+const hd=el('div','row');hd.style.cssText='margin-top:14px;justify-content:space-between';const t=el('div');t.append(el('h1','',d.name),el('div','mut','#'+d.id+(d.shared?' · shared with you':'')));
+const r=el('div','row');r.append(pill(d.status));
+if(d.can_control){const rb=el('button','b p','↻ Restart'),sb=el('button','b d','■ Stop');
+const act=k=>ask((k==='restart'?'Restart':'Stop')+' this bot?',async()=>{rb.disabled=sb.disabled=true;try{await api('/api/deployment/'+id+'/'+k,'POST');toast(k==='restart'?'Restarting…':'Stopping…');setTimeout(()=>detail(id),k==='restart'?6000:2500)}catch(e){toast(e.message);rb.disabled=sb.disabled=false}});
+rb.onclick=()=>act('restart');sb.onclick=()=>act('stop');r.append(rb,sb)}hd.append(t,r);a.append(hd);
+const tb=el('div','tabs');[['overview','Overview'],['metrics','Metrics'],['logs','Logs']].forEach(x=>{const c=el('button','tab'+(tab===x[0]?' on':''),x[1]);c.onclick=()=>{tab=x[0];detail(id)};tb.append(c)});a.append(tb);
+if(tab==='overview'){const c=el('div','card kv');[['Status',d.status==='active'?'Running':d.status],['Plan',d.plan||'—'],['Source',d.source||'upload'],['Started',d.started?d.started.slice(0,16).replace('T',' '):'—'],['Expires',d.expire?d.expire.slice(0,10):'never'],['Uptime (7d)',d.uptime!=null?d.uptime+'%':'collecting…'],['CPU now',d.cpu!=null?d.cpu.toFixed(1)+'%':'—'],['RAM now',d.ram!=null?d.ram.toFixed(0)+' MB':'—']].forEach(x=>c.append(el('div','',x[0]),el('div','',x[1])));a.append(c)}
+if(tab==='metrics'){a.append(el('h2','','CPU · last 24h'),chart(d.usage.cpu,'#e08a1e','%'),el('h2','','Memory · last 24h'),chart(d.usage.ram,'#4353ff',' MB'))}
+if(tab==='logs'){const row=el('div','row');row.style.marginBottom='8px';const cp=el('button','b','Copy');cp.onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(d.logs||'').then(()=>toast('Copied'))};row.append(cp,el('span','mut','auto-refreshing · last '+(d.logs||'').length+' chars'));const pr=el('pre','',d.logs||'(no output yet)');a.append(row,pr);pr.scrollTop=pr.scrollHeight}
+clearTimeout(timer);timer=setTimeout(()=>cur===id&&detail(id),tab==='logs'?8000:20000)}
+catch(e){a.replaceChildren(el('div','err',e.message));const b=el('button','b','‹ Back');b.onclick=home;a.append(b)}}
 home();
 </script></body></html>"""
 
@@ -18924,15 +19001,17 @@ def health_report():
         bugs = 0
     bstate, btxt = backup_status()
     up = int(time.time() - _P2_BOOT)
-    running, down = bots.get("active", 0), sum(v for k, v in bots.items() if k in ("crashed", "failed", "error"))
+    nmiss = len(missing_active_ids())
+    running, down = max(0, bots.get("active", 0) - nmiss), sum(v for k, v in bots.items() if k in ("crashed", "failed", "error"))
     lines = [
         "*🩺 SYSTEM HEALTH*", "",
         f"🖥 CPU   `{_bar(h['cpu_pct'])}`" + (f"  load {h['load']}" if h['load'] is not None else ""),
         f"🧠 RAM   `{_bar(h['ram_pct'])}`" + (f"  {h['ram_used']}/{h['ram_total']} MB" if h['ram_total'] else ""),
         f"💽 Disk  `{_bar(h['disk_pct'])}`" + (f"  {h['disk_free_gb']} GB free" if h['disk_free_gb'] is not None else ""),
         "",
-        f"🤖 Bots: 🟢 `{running}` running · 🔴 `{down}` crashed · ⏹ `{bots.get('stopped', 0)}` stopped · ⌛ `{bots.get('expired', 0)}` expired",
+        f"🤖 Bots: 🟢 `{running}` running · 🔴 `{down}` crashed · 📂 `{nmiss}` files missing · ⏹ `{bots.get('stopped', 0)}` stopped · ⌛ `{bots.get('expired', 0)}` expired",
         f"👥 Users: `{users}` (+`{new24}` in 24h)",
+        f"🧾 Deploy queue: `{len(_DQ)}` waiting · `{_DQ_INFLIGHT[0]}` deploying",
         f"🎫 Open tickets: `{tickets}` · 🐛 bug reports: `{bugs}`",
         f"💾 DB backup: {'✅' if bstate == 'ok' else ('⚠️' if bstate == 'stale' else '➖')} {btxt}",
         f"⏱ Process uptime: `{up // 86400}d {up % 86400 // 3600}h {up % 3600 // 60}m`",
@@ -19018,6 +19097,646 @@ def _p2_r_ah(callback, data, uid, chat_id, mid):
 
 _P2_ROUTES.append(("p2_ah", _p2_r_ah))
 _P2_ADMIN_ROWS.insert(0, [_fp_btn("🩺 System health", "p2_ah")])
+
+
+# ---------------------------------------------------------------- FILES-ON-DISK CHECK
+def dep_files_ok(owner, dep_id, fname):
+    """True when the bot's main script is really on the disk (a wiped/ephemeral disk leaves 'active' rows with no files)."""
+    try:
+        if not fname:
+            return False
+        return (get_deploy_folder(owner, dep_id) / fname).is_file()
+    except Exception:
+        return False
+
+
+def effective_status(owner, dep_id, fname, status):
+    """DB status, except an 'active' bot whose files are gone is 'missing' - never counted as running."""
+    return "missing" if status == "active" and not dep_files_ok(owner, dep_id, fname) else status
+
+
+def missing_active_ids(owner=None):
+    q = "SELECT deployment_id, user_id, file_name FROM deployments WHERE status = 'active'"
+    p = ()
+    if owner is not None:
+        q += " AND user_id = ?"; p = (owner,)
+    return [r[0] for r in (db_execute(q, p, fetch='all') or []) if not dep_files_ok(r[1], r[0], r[2])]
+
+
+# ---------------------------------------------------------------- RESTART ALL
+RESTART_ALL_STATUSES = ("active", "crashed", "failed", "error")
+_RALL_LAST = {}
+_RALL_LOCK = threading.Lock()
+RALL_USER_COOLDOWN = 120
+RALL_ADMIN_COOLDOWN = 600
+
+
+def restartable_ids(owner=None):
+    """Bots a 'restart all' touches: running or crashed ones (never stopped, paused or expired)."""
+    q = "SELECT deployment_id FROM deployments WHERE status IN (%s)" % ",".join("?" * len(RESTART_ALL_STATUSES))
+    p = list(RESTART_ALL_STATUSES)
+    if owner is not None:
+        q += " AND user_id = ?"; p.append(owner)
+    gone = set(missing_active_ids(owner))
+    return [r[0] for r in (db_execute(q + " ORDER BY deployment_id", tuple(p), fetch='all') or []) if r[0] not in gone]
+
+
+RALL_GAP = 2.0
+
+
+def restart_all(scope, requester, cooldown, on_done=None, gap=None):
+    """Restart many bots one after another (a gap avoids a RAM spike). scope = owner id or None for every bot.
+    -> (started, wait_seconds): started False means cooldown or nothing to restart."""
+    key = ("all" if scope is None else scope)
+    with _RALL_LOCK:
+        left = cooldown - (time.time() - _RALL_LAST.get(key, 0))
+        if left > 0:
+            return False, int(left) + 1
+        ids = restartable_ids(scope)
+        if not ids:
+            return False, 0
+        _RALL_LAST[key] = time.time()
+
+    def run():
+        ok = bad = 0
+        for i in ids:
+            try:
+                _fp_restart(i, "restart_all")
+                ok += 1
+            except Exception as e:
+                bad += 1
+                print(f"⚠️ restart-all #{i}: {e}")
+            sleep(RALL_GAP if gap is None else gap)
+        try:
+            audit(requester, "restart_all", f"{'all' if scope is None else scope}:{ok}ok/{bad}fail")
+        except Exception:
+            pass
+        if on_done:
+            try:
+                on_done(ok, bad)
+            except Exception:
+                pass
+    threading.Thread(target=run, daemon=True, name="RestartAll").start()
+    return len(ids), 0
+
+
+def _p2_r_rall(callback, data, uid, chat_id, mid):
+    admin = data.startswith("p2_arall")
+    if admin and not is_admin(uid):
+        return True
+    scope = None if admin else uid
+    n = len(restartable_ids(scope))
+    back = "admin_panel" if admin else "my_deployments"
+    if data in ("p2_rall", "p2_arall"):
+        txt = (f"🔄 *Restart ALL platform bots?*\n\n`{n}` bot(s) of every user will be restarted one by one (about 2s apart). "
+               "Stopped, paused and expired bots are skipped." if admin else
+               f"🔄 *Restart all your bots?*\n\n`{n}` bot(s) will be restarted one by one. Stopped, paused and expired bots are skipped.")
+        rows = [[_fp_btn(f"✅ Restart {n}" if n else "Nothing to restart", data + "go" if n else back)],
+                [_fp_btn("🔙 Cancel", back)]]
+        edit_message(chat_id, mid, txt, _fp_kb(*rows))
+        return True
+    if data in ("p2_rallgo", "p2_arallgo"):
+        def done(ok, bad):
+            send_message(chat_id, f"✅ Restart all finished: `{ok}` restarted" + (f", `{bad}` failed" if bad else "") + ".")
+        started, wait = restart_all(scope, uid, RALL_ADMIN_COOLDOWN if admin else RALL_USER_COOLDOWN, done)
+        if started:
+            edit_message(chat_id, mid, f"🔄 Restarting `{started}` bot(s)… I'll message you when it's done.",
+                         _fp_kb([_fp_btn("📦 My Deployments" if not admin else "🔙 Admin Panel", back)]))
+        elif wait:
+            edit_message(chat_id, mid, f"⏳ Restart all was just used. Try again in `{wait}`s.", _fp_kb([_fp_btn("🔙 Back", back)]))
+        else:
+            edit_message(chat_id, mid, "Nothing to restart.", _fp_kb([_fp_btn("🔙 Back", back)]))
+        return True
+    return False
+
+
+_P2_ROUTES.append(("p2_rall", _p2_r_rall))
+_P2_ROUTES.append(("p2_arall", _p2_r_rall))
+_P2_ADMIN_ROWS.insert(1, [_fp_btn("🔄 Restart ALL bots", "p2_arall")])
+
+
+# ---------------------------------------------------------------- UPGRADE 2: crash alerts with reason + Fix buttons
+_CF_RULES = [
+    ("missing_module", re.compile(r"No module named ['\"]?([A-Za-z0-9_.\-]+)|Cannot find module ['\"]([^'\"\n]+)['\"]")),
+    ("conflict", re.compile(r"terminated by other getUpdates|Conflict: terminated|409 Conflict", re.I)),
+    ("bad_token", re.compile(r"InvalidToken|Improper token|LoginFailure|Invalid token|token is invalid|TokenValidationError|"
+                             r"401:? Unauthorized|Unauthorized\b.*token|token.*(?:rejected|not valid)|ETELEGRAM: 401", re.I)),
+    ("missing_env", re.compile(r"KeyError: ['\"]([A-Z][A-Z0-9_]{2,})['\"]|\b([A-Z][A-Z0-9_]{2,}) (?:environment variable )?(?:is )?(?:not set|missing|required)\b")),
+    ("syntax", re.compile(r"SyntaxError|IndentationError|TabError")),
+    ("port", re.compile(r"Address already in use|EADDRINUSE")),
+    ("memory", re.compile(r"MemoryError|Cannot allocate memory|heap out of memory|OOMKilled|\bKilled\b")),
+]
+_CF_TITLES = {
+    "missing_module": "A package is missing",
+    "conflict": "The same bot token is running somewhere else",
+    "bad_token": "Telegram/Discord rejected the bot token",
+    "missing_env": "A required variable isn't set",
+    "syntax": "There's a syntax error in the code",
+    "port": "The port is already in use",
+    "memory": "The bot ran out of memory",
+    "unknown": "The bot hit an error",
+}
+_CF_BUSY = set()
+
+
+def crash_diagnose(text):
+    """Classify a crash from the tail of its log. -> {'code','title','detail','pkg','var'}"""
+    text = (text or "")[-6000:]
+    out = {"code": "unknown", "title": _CF_TITLES["unknown"], "detail": "", "pkg": None, "var": None}
+    for code, rx in _CF_RULES:
+        ms = list(rx.finditer(text))
+        if not ms:
+            continue
+        m = ms[-1]
+        out["code"], out["title"] = code, _CF_TITLES[code]
+        g = [x for x in m.groups() if x]
+        if code == "missing_module" and g:
+            if m.group(2):      # node: keep the full package name (discord.js, @scope/pkg)
+                out["pkg"] = "/".join(g[0].split("/")[:2 if g[0].startswith("@") else 1])
+            else:
+                out["pkg"] = g[0].split(".")[0]
+            out["detail"] = f"`{out['pkg']}` isn't installed."
+        elif code == "missing_env" and g:
+            out["var"] = g[0].upper()
+            out["detail"] = f"`{out['var']}` is not set."
+        elif code == "syntax":
+            loc = re.findall(r'File "([^"]+)", line (\d+)', text)
+            if loc:
+                out["detail"] = f"`{Path(loc[-1][0]).name}` line {loc[-1][1]}."
+        break
+    if out["code"] == "unknown":
+        errs = [l.strip() for l in text.splitlines() if re.search(r"\b\w*(Error|Exception)\b", l) and not l.startswith(" ")]
+        if errs:
+            out["detail"] = "`" + errs[-1][:140].replace("`", "'") + "`"
+    return out
+
+
+_CF_ADVICE = {
+    "missing_module": "Tap *Install* and I'll add it and restart the bot.",
+    "conflict": "Another copy of this bot is polling with the same token. Stop the other copy (or this one).",
+    "bad_token": "Check the token in your variables (get a fresh one from @BotFather if needed).",
+    "missing_env": "Add the variable and restart.",
+    "syntax": "Fix the line in the code editor and restart.",
+    "port": "Use the PORT variable the host gives you instead of a fixed port.",
+    "memory": "Your plan's RAM limit was hit. Trim memory use or upgrade your resources.",
+    "unknown": "Open the logs to see the full error.",
+}
+
+
+def crash_fix_rows(dep_id, diag):
+    rows = []
+    c = diag["code"]
+    if c == "missing_module":
+        rows.append([_fp_btn(f"📦 Install {diag['pkg'] or 'package'} & restart", f"p2_cf_pkg_{dep_id}")])
+    elif c == "bad_token":
+        rows.append([_fp_btn("🔑 Update token / variables", f"edit_env_{dep_id}")])
+    elif c == "missing_env":
+        rows.append([_fp_btn(f"➕ Set {diag['var'] or 'variable'}", f"edit_envadd_{dep_id}")])
+    elif c == "syntax":
+        rows.append([_fp_btn("✏️ Edit code", f"edit_code_{dep_id}")])
+    elif c == "memory":
+        rows.append([_fp_btn("📈 Upgrade resources", "resource_tiers")])
+    elif c == "conflict":
+        rows.append([_fp_btn("🛑 Stop this bot", f"stop_deploy_{dep_id}")])
+    rows.append([_fp_btn("🔄 Restart", f"restart_deploy_{dep_id}"), _fp_btn("📄 Logs", f"view_runtime_logs_{dep_id}")])
+    return rows
+
+
+def crash_alert_text(dep_id, headline, diag, tail=""):
+    t = f"{headline}\n\n🔎 *Reason:* {diag['title']}" + (f" — {diag['detail']}" if diag["detail"] else "")
+    t += f"\n💡 {_CF_ADVICE[diag['code']]}"
+    if tail:
+        t += f"\n\n*Last log lines:*\n```\n{tail}\n```"
+    return t
+
+
+def _p2_r_cf(callback, data, uid, chat_id, mid):
+    m = re.match(r"^p2_cf_pkg_(\d+)$", data)
+    if not m:
+        return False
+    dep_id = int(m.group(1))
+    d = _fp_own(uid, dep_id)
+    if not d:
+        return True
+    if dep_id in _CF_BUSY:
+        edit_message(chat_id, mid, "⏳ Already installing…", None)
+        return True
+    _CF_BUSY.add(dep_id)
+    edit_message(chat_id, mid, f"📦 Installing the missing package for bot #{dep_id}…\nThis can take a minute.", None)
+
+    def run():
+        try:
+            script = d["folder"] / d["file"]
+            pkgs = _install_missing_from_log(d["folder"], script)
+            if pkgs:
+                req = d["folder"] / "requirements.txt"
+                try:
+                    have = req.read_text(errors="replace") if req.exists() else ""
+                    names = {re.split(r"[=<>!~\[ ;]", l.strip(), 1)[0].lower() for l in have.splitlines() if l.strip() and not l.startswith("#")}
+                    add = [p for p in pkgs if re.split(r"[=<>!~\[ ;]", p, 1)[0].lower() not in names]
+                    if add and d["source"] != "github":
+                        req.write_text(have.rstrip("\n") + ("\n" if have.strip() else "") + "\n".join(add) + "\n")
+                except Exception:
+                    pass
+            _fp_restart(dep_id, "fix")
+            audit(uid, "crash_fix_pkg", f"{dep_id}:{','.join(pkgs)[:80]}")
+            if pkgs:
+                send_message(chat_id, f"✅ Installed `{', '.join(pkgs)[:200]}` and restarted bot #{dep_id}.",
+                             _fp_kb([_fp_btn("📄 Logs", f"view_runtime_logs_{dep_id}")]))
+            else:
+                send_message(chat_id, f"⚠️ I couldn't work out which package to install for bot #{dep_id}, so I only restarted it. "
+                                      "Check the logs and add the package to requirements.txt.",
+                             _fp_kb([_fp_btn("📄 Logs", f"view_runtime_logs_{dep_id}")]))
+        except Exception as e:
+            send_message(chat_id, f"❌ Fix failed: {str(e)[:150]}")
+        finally:
+            _CF_BUSY.discard(dep_id)
+    threading.Thread(target=run, daemon=True, name="CrashFixPkg").start()
+    return True
+
+
+_P2_ROUTES.append(("p2_cf", _p2_r_cf))
+
+
+# ---------------------------------------------------------------- UPGRADE 4: deploy queue
+DEPLOY_MAX_CONCURRENT = int(os.environ.get("DEPLOY_MAX_CONCURRENT", "2"))      # deploys running at once (0 = queue disabled)
+DEPLOY_QUEUE_RAM_PCT = float(os.environ.get("DEPLOY_QUEUE_RAM_PCT", "92"))     # host RAM % at which new deploys wait
+DEPLOY_QUEUE_MAX = int(os.environ.get("DEPLOY_QUEUE_MAX", "20"))
+DEPLOY_QUEUE_PER_USER = int(os.environ.get("DEPLOY_QUEUE_PER_USER", "2"))
+DEPLOY_QUEUE_MAX_WAIT = int(os.environ.get("DEPLOY_QUEUE_MAX_WAIT", str(25 * 60)))
+DEPLOY_EST_SECS = 120
+_DQ = []                      # waiting jobs, oldest first
+_DQ_LOCK = threading.Lock()
+_DQ_INFLIGHT = [0]
+_DQ_SECRETS = {}              # job id -> GitHub token (memory only, never written to the DB)
+_DQ_ORIG = {}                 # kind -> the real deploy function
+_DQ_STARTED = [False]
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS deploy_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, "
+               "kind TEXT, args TEXT, cost_coins INTEGER DEFAULT 0, method TEXT, is_free INTEGER DEFAULT 0, "
+               "created TEXT, status TEXT DEFAULT 'queued')")
+
+
+def _ram_pct():
+    total, used, _a = _read_proc_meminfo()
+    return (used / total * 100) if total else None
+
+
+def dq_busy():
+    if _DQ_INFLIGHT[0] >= DEPLOY_MAX_CONCURRENT:
+        return True
+    p = _ram_pct()
+    return p is not None and p >= DEPLOY_QUEUE_RAM_PCT
+
+
+def dq_position(job_id):
+    with _DQ_LOCK:
+        for i, j in enumerate(_DQ):
+            if j["id"] == job_id:
+                return i + 1
+    return 0
+
+
+def _dq_eta_min(pos):
+    return max(1, -(-pos // max(1, DEPLOY_MAX_CONCURRENT)) * DEPLOY_EST_SECS // 60)
+
+
+def _dq_refund(job, why):
+    a = job["args"]
+    if a.get("payment_method") == "coins" and (a.get("cost_coins") or 0) > 0:
+        try:
+            update_user_coins(job["uid"], a["cost_coins"], "deployment_refund", f"queue_{job['id']}")
+            send_message(job["chat"], f"↩️ {why} `{a['cost_coins']}🪙` refunded.")
+            return
+        except Exception as e:
+            print(f"⚠️ queue refund failed for job {job['id']}: {e}")
+    send_message(job["chat"], f"ℹ️ {why}")
+
+
+def _dq_set(job_id, status):
+    try:
+        _q("UPDATE deploy_queue SET status = ? WHERE id = ?", (status, job_id))
+    except Exception:
+        pass
+
+
+def _dq_drop_temp(job):
+    try:
+        tf = job["args"].get("temp_file")
+        if tf:
+            Path(tf).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _dq_enqueue(kind, args):
+    uid, chat = args.get("user_id"), args.get("chat_id")
+    with _DQ_LOCK:
+        mine = [j for j in _DQ if j["uid"] == uid]
+        full = len(_DQ) >= DEPLOY_QUEUE_MAX
+        dup_free = args.get("is_free") and any(j["args"].get("is_free") for j in mine)
+        too_many = len(mine) >= DEPLOY_QUEUE_PER_USER
+    if full or dup_free or too_many:
+        send_message(chat, "⏳ " + ("The deploy queue is full — please try again in a few minutes." if full else
+                                    "You already have a deployment waiting in the queue."))
+        if args.get("temp_file"):
+            Path(args["temp_file"]).unlink(missing_ok=True)
+        return False
+    stored = dict(args)
+    token = stored.pop("token", None) if kind == "github" else None
+    cur_id = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        cur = conn.execute("INSERT INTO deploy_queue (user_id, chat_id, kind, args, cost_coins, method, is_free, created) VALUES (?,?,?,?,?,?,?,?)",
+                           (uid, chat, kind, json.dumps(stored, default=str), args.get("cost_coins") or 0,
+                            args.get("payment_method"), 1 if args.get("is_free") else 0, _now()))
+        cur_id = cur.lastrowid
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"⚠️ deploy_queue insert: {e}")
+    job = {"id": cur_id or int(time.time() * 1000), "kind": kind, "uid": uid, "chat": chat, "args": stored, "ts": time.time()}
+    if token:
+        _DQ_SECRETS[job["id"]] = token
+    with _DQ_LOCK:
+        _DQ.append(job)
+        pos = len(_DQ)
+    send_message(chat, f"⏳ *The host is busy right now*\n\nYour deployment is in the queue — position *#{pos}* "
+                       f"(about {_dq_eta_min(pos)} min). It will start by itself and I'll message you.\n"
+                       + ("Your coins are held and refunded if it can't start." if (args.get('cost_coins') or 0) and args.get('payment_method') == 'coins' else ""),
+                 _fp_kb([_fp_btn("🔄 Position", f"p2_dq_pos_{job['id']}"), _fp_btn("❌ Cancel", f"p2_dq_cancel_{job['id']}")]))
+    return True
+
+
+def _dq_wrap(kind, orig):
+    import inspect
+    sig = inspect.signature(orig)
+    _DQ_ORIG[kind] = orig
+
+    def wrapper(*a, **k):
+        try:
+            b = sig.bind(*a, **k); b.apply_defaults(); args = dict(b.arguments)
+        except TypeError:
+            return orig(*a, **k)
+        uid = args.get("user_id")
+        immune = DEPLOY_MAX_CONCURRENT <= 0 or is_admin(uid) or args.get("payment_method") == "stars"
+        if not immune:
+            with _DQ_LOCK:
+                waiting = bool(_DQ)
+            if waiting or dq_busy():
+                return _dq_enqueue(kind, args)
+        _DQ_INFLIGHT[0] += 1
+        try:
+            return orig(**args)
+        finally:
+            _DQ_INFLIGHT[0] = max(0, _DQ_INFLIGHT[0] - 1)
+    wrapper.__wrapped__ = orig
+    return wrapper
+
+
+def _dq_run_job(job):
+    try:
+        _dq_set(job["id"], "running")
+        send_message(job["chat"], "🚀 *Your turn!* Starting your deployment now…")
+        args = dict(job["args"])
+        if job["kind"] == "github":
+            args["token"] = _DQ_SECRETS.pop(job["id"], None)
+        try:
+            ok = _DQ_ORIG[job["kind"]](**args)
+        except Exception as e:
+            print(f"❌ queued deploy {job['id']}: {e}")
+            ok = False
+        _dq_set(job["id"], "done" if ok else "failed")
+        if not ok:
+            _dq_refund(job, "Your queued deployment didn't complete.")
+    finally:
+        _DQ_INFLIGHT[0] = max(0, _DQ_INFLIGHT[0] - 1)
+
+
+def dq_tick(now=None):
+    """One scheduling pass: expire stale jobs, then start as many as capacity allows. -> started job ids"""
+    now = now or time.time()
+    with _DQ_LOCK:
+        stale = [j for j in _DQ if now - j["ts"] > DEPLOY_QUEUE_MAX_WAIT]
+        for j in stale:
+            _DQ.remove(j)
+    for j in stale:
+        _DQ_SECRETS.pop(j["id"], None)
+        _dq_set(j["id"], "expired"); _dq_drop_temp(j)
+        _dq_refund(j, "The host stayed busy too long, so your deployment was cancelled.")
+    started = []
+    while True:
+        with _DQ_LOCK:
+            if not _DQ or dq_busy():
+                break
+            job = _DQ.pop(0)
+            _DQ_INFLIGHT[0] += 1
+        started.append(job["id"])
+        threading.Thread(target=_dq_run_job, args=(job,), daemon=True, name=f"QueuedDeploy-{job['id']}").start()
+    return started
+
+
+def dq_resume():
+    """After a restart: queued uploads continue; queued GitHub jobs (token not stored) are refunded."""
+    rows = _q("SELECT id, user_id, chat_id, kind, args, created FROM deploy_queue WHERE status = 'queued' ORDER BY id", fetch='all') or []
+    for jid, uid, chat, kind, a, created in rows:
+        try:
+            args = json.loads(a)
+        except Exception:
+            args = {}
+        job = {"id": jid, "kind": kind, "uid": uid, "chat": chat, "args": args, "ts": time.time()}
+        if kind == "upload" and args.get("temp_file") and Path(args["temp_file"]).exists():
+            with _DQ_LOCK:
+                _DQ.append(job)
+        else:
+            _dq_set(jid, "lost")
+            _dq_refund(job, "The server restarted while you were queued." if kind == "github" else "Your upload was lost in a server restart.")
+    _q("UPDATE deploy_queue SET status = 'lost' WHERE status = 'running'")
+
+
+def p2_deploy_queue_worker():
+    try:
+        dq_resume()
+    except Exception as e:
+        print(f"⚠️ deploy queue resume: {e}")
+    print("✅ Deploy queue worker started")
+    while True:
+        try:
+            dq_tick()
+        except Exception as e:
+            print(f"⚠️ deploy queue: {e}")
+        sleep(3)
+
+
+def _p2_r_dq(callback, data, uid, chat_id, mid):
+    m = re.match(r"^p2_dq_(pos|cancel)_(\d+)$", data)
+    if not m:
+        return False
+    jid = int(m.group(2))
+    with _DQ_LOCK:
+        job = next((j for j in _DQ if j["id"] == jid), None)
+    if not job or job["uid"] != uid:
+        edit_message(chat_id, mid, "✅ This deployment has already started (or isn't in the queue anymore).", None)
+        return True
+    if m.group(1) == "pos":
+        pos = dq_position(jid)
+        edit_message(chat_id, mid, f"⏳ *In the deploy queue* — position *#{pos}* (about {_dq_eta_min(pos)} min).",
+                     _fp_kb([_fp_btn("🔄 Position", f"p2_dq_pos_{jid}"), _fp_btn("❌ Cancel", f"p2_dq_cancel_{jid}")]))
+        return True
+    with _DQ_LOCK:
+        if job not in _DQ:
+            edit_message(chat_id, mid, "✅ It just started — too late to cancel.", None)
+            return True
+        _DQ.remove(job)
+    _DQ_SECRETS.pop(jid, None)
+    _dq_set(jid, "cancelled"); _dq_drop_temp(job)
+    edit_message(chat_id, mid, "❌ Queued deployment cancelled.", None)
+    _dq_refund(job, "Cancelled.")
+    return True
+
+
+_P2_ROUTES.append(("p2_dq", _p2_r_dq))
+deploy_with_logs_enhanced = _dq_wrap("upload", deploy_with_logs_enhanced)
+deploy_from_github = _dq_wrap("github", deploy_from_github)
+
+
+# ---------------------------------------------------------------- UPGRADE 6: bot health score (uptime this week)
+UPTIME_SLOT = 300                  # the usage sampler writes one point every 5 minutes while a bot is alive
+UPTIME_MIN_SECS = 3600             # don't show a percentage before there is an hour of history
+
+
+def _start_epoch(start_time):
+    try:
+        return datetime.fromisoformat(start_time).timestamp() if start_time else None
+    except Exception:
+        return None
+
+
+def bot_uptime(dep_id, start_time=None, days=7, now=None):
+    """Share of the last `days` days (or since the bot started) in which the bot was alive, from the 5-minute usage
+    samples. -> {'pct','grade','label','down_secs','days':[pct per day, oldest first]} or None when there isn't an hour of data."""
+    now = now or time.time()
+    w0 = now - days * 86400
+    st = _start_epoch(start_time)
+    if st:
+        w0 = max(w0, st)
+    secs = now - w0
+    if secs < UPTIME_MIN_SECS:
+        return None
+    rows = _q("SELECT DISTINCT ts / ? FROM dep_metrics WHERE deployment_id = ? AND ts >= ?", (UPTIME_SLOT, dep_id, int(w0)), fetch='all') or []
+    if not rows:
+        return None
+    slots = {r[0] for r in rows}
+    expected = secs / UPTIME_SLOT
+    pct = min(100.0, len(slots) / expected * 100)
+    per_day = []
+    for i in range(days):
+        d0, d1 = now - (days - i) * 86400, now - (days - i - 1) * 86400
+        lo, hi = max(d0, w0), d1
+        if hi - lo < 3600:
+            per_day.append(None)
+            continue
+        n = sum(1 for s in slots if lo <= s * UPTIME_SLOT < hi)
+        per_day.append(min(100.0, n / ((hi - lo) / UPTIME_SLOT) * 100))
+    grade, label = (("🟢", "Excellent") if pct >= 99.5 else ("🟢", "Good") if pct >= 98 else
+                    ("🟡", "Fair") if pct >= 90 else ("🔴", "Poor"))
+    return {"pct": round(pct, 1), "grade": grade, "label": label, "down_secs": int(max(0, secs - len(slots) * UPTIME_SLOT)),
+            "days": per_day}
+
+
+def uptime_bar(per_day):
+    blocks = "▁▂▃▄▅▆▇█"
+    return "".join("·" if p is None else blocks[min(7, int(p / 100 * 8 - 1e-9))] for p in per_day)
+
+
+def uptime_block(dep_id, start_time):
+    u = bot_uptime(dep_id, start_time)
+    if not u:
+        return "\n\n*🩺 HEALTH (7 days)*\n📶 Uptime: _collecting data (needs 1 hour)_"
+    dn = u["down_secs"]
+    down = f"{dn // 3600}h {dn % 3600 // 60}m" if dn >= 3600 else f"{dn // 60}m"
+    return (f"\n\n*🩺 HEALTH (7 days)*\n📶 Uptime: `{u['pct']:g}%` {u['grade']} {u['label']}\n"
+            f"⏳ Estimated downtime: `{down}`\n📅 Per day: `{uptime_bar(u['days'])}`")
+
+
+# ---------------------------------------------------------------- UPGRADE 7: notification preferences
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS user_notif (user_id INTEGER PRIMARY KEY, expiry INTEGER DEFAULT 1, "
+               "crash INTEGER DEFAULT 1, usage INTEGER DEFAULT 1)")
+# category -> {mode: (label, explanation)}; mode 1 is the default and sends everything
+NOTIF_CATS = {
+    "expiry": ("⏰ Expiry reminders", {1: ("All (3 days, 1 day, 1 hour)", "You're warned 3 days, 1 day and 1 hour before a bot expires."),
+                                       2: ("Last day only", "Only the 1-day and 1-hour warnings."),
+                                       0: ("Off", "No expiry reminders. Bots stop at expiry without warning.")}),
+    "crash": ("💥 Crash alerts", {1: ("All", "Every crash, including ones that fixed themselves."),
+                                  2: ("Only when it can't recover", "Silent when a bot restarts by itself; you hear about the ones that stay down."),
+                                  0: ("Off", "No crash alerts at all.")}),
+    "usage": ("📊 Usage warnings", {1: ("On", "Warnings about CPU hogging and going over your resource share."),
+                                    0: ("Off", "No usage warnings (a bot can still be stopped if the limit is ignored).")}),
+}
+
+
+def notif_mode(uid, cat):
+    try:
+        r = _q(f"SELECT {cat} FROM user_notif WHERE user_id = ?", (uid,), fetch='one') if cat in NOTIF_CATS else None
+        return 1 if r is None or r[0] is None else int(r[0])
+    except Exception:
+        return 1
+
+
+def notif_allows(uid, cat, level=None):
+    """Should a `cat` notification (of importance `level`) be sent to this user?
+    expiry level = hours-stage (72/24/1); crash level = 'recovered' | 'failed'; usage has no level."""
+    m = notif_mode(uid, cat)
+    if m == 0:
+        return False
+    if cat == "expiry":
+        return m == 1 or (level is not None and level <= 24)
+    if cat == "crash":
+        return m == 1 or level == "failed"
+    return True
+
+
+def notif_set(uid, cat, mode):
+    _q("INSERT OR IGNORE INTO user_notif (user_id) VALUES (?)", (uid,))
+    _q(f"UPDATE user_notif SET {cat} = ? WHERE user_id = ?", (int(mode), uid))
+
+
+def _nt_screen(uid):
+    lines = ["*🔔 NOTIFICATIONS*", "", "Choose which reminders the bot sends you. Tap one to change it.", ""]
+    rows = []
+    off = []
+    for cat, (title, modes) in NOTIF_CATS.items():
+        m = notif_mode(uid, cat)
+        label, expl = modes[m]
+        lines.append(f"{title}: *{label}*\n_{expl}_\n")
+        rows.append([_fp_btn(f"{title}: {label}", f"p2_nt_{cat}")])
+        if m == 0:
+            off.append(title)
+    lines.append("Security and payment messages (PIN changes, purchases, bans) are always sent.")
+    if off:
+        lines.append("\n⚠️ Off: " + ", ".join(off))
+    rows.append([_fp_btn("🔕 Turn all off", "p2_nt_all0"), _fp_btn("🔔 Restore all", "p2_nt_all1")])
+    rows.append([_fp_btn("🔙 More", "fp_more")])
+    return "\n".join(lines), _fp_kb(*rows)
+
+
+def _p2_r_nt(callback, data, uid, chat_id, mid):
+    if data == "p2_nt_all0" or data == "p2_nt_all1":
+        for cat in NOTIF_CATS:
+            notif_set(uid, cat, 0 if data == "p2_nt_all0" else 1)
+    else:
+        m = re.match(r"^p2_nt_(expiry|crash|usage)$", data)
+        if m:
+            cat = m.group(1)
+            order = list(NOTIF_CATS[cat][1].keys())             # e.g. [1, 2, 0]: cycles All → limited → Off → All
+            notif_set(uid, cat, order[(order.index(notif_mode(uid, cat)) + 1) % len(order)])
+        elif data != "p2_nt":
+            return False
+    txt, kb = _nt_screen(uid)
+    edit_message(chat_id, mid, txt, kb)
+    return True
+
+
+_P2_ROUTES.append(("p2_nt", _p2_r_nt))
+_P2_MORE_ROWS.append([_fp_btn("🔔 Notifications", "p2_nt")])
 
 
 def _p2_route(callback, data, uid, chat_id, mid):
@@ -19454,6 +20173,7 @@ def main():
     threading.Thread(target=p2_autorenew_monitor,       daemon=True, name="AutoRenew").start()
     threading.Thread(target=p2_sched_broadcast_monitor, daemon=True, name="SchedBroadcast").start()
     threading.Thread(target=p2_health_monitor,          daemon=True, name="HostHealth").start()
+    threading.Thread(target=p2_deploy_queue_worker,     daemon=True, name="DeployQueue").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
