@@ -4747,6 +4747,7 @@ def show_referral_menu(chat_id, user_id, message_id=None):
     )
     keyboard = {"inline_keyboard": [
         [{"text": "📤 Share Link", "switch_inline_query": f"Join this bot hosting platform! {ref_link}"}],
+        [{"text": "🏆 Leaderboard", "callback_data": "p2_lb"}],
         [{"text": "🔙 Back to Menu", "callback_data": "main_menu"}]
     ]}
     if message_id:
@@ -9543,8 +9544,8 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         f"📋 Plan: `{plan.upper()}`\n"
         f"💰 Cost: {cost_text}\n"
         f"📅 Started: `{start_time.strftime('%Y-%m-%d %H:%M')}`\n"
-        f"⏰ Expires: `{'Never (lifetime)' if is_lifetime else expire_time.strftime('%Y-%m-%d %H:%M')}`\n"
-        f"📊 Remaining: `{remaining_text}`\n"
+        f"⏰ Expires: `{'Never (lifetime)' if is_lifetime else ('paused' if is_paused == _PAUSE_FROZEN else expire_time.strftime('%Y-%m-%d %H:%M'))}`\n"
+        f"📊 Remaining: `{'frozen' if is_paused == _PAUSE_FROZEN else remaining_text}`\n"
         f"🔘 Status: {status_emoji}\n"
         f"📦 Requirements:\n`{reqs_text}`\n\n"
         f"🔧 Environment Variables: {len(env_vars)}\n{env_text}{error_text}{free_status_text}"
@@ -9558,6 +9559,18 @@ def view_deployment(chat_id, message_id, user_id, dep_id):
         text += uptime_block(dep_id, start_str)
     except Exception as _e:
         print(f"⚠️ uptime block failed: {_e}")
+    try:
+        _pzb = pause_view_block(dep_id)
+        if _pzb:
+            text += _pzb
+            keyboard = {"inline_keyboard": [[{"text": "▶️ Resume plan", "callback_data": f"p2_pzres_{dep_id}"}],
+                                            [{"text": "📄 View Logs", "callback_data": f"view_runtime_logs_{dep_id}"}],
+                                            [{"text": "🔙 My Deployments", "callback_data": "my_deployments"}]]}
+        elif pause_check(dep_id, user_id)[0]:
+            keyboard["inline_keyboard"].insert(max(0, len(keyboard["inline_keyboard"]) - 1),
+                                               [{"text": "⏸ Pause plan", "callback_data": f"p2_pz_{dep_id}"}])
+    except Exception as _e:
+        print(f"⚠️ pause block failed: {_e}")
     keyboard = _fp_filter_shared_kb(keyboard, dep_id)
     edit_message(chat_id, message_id, text[:4096], keyboard)
 
@@ -16395,6 +16408,10 @@ def _p2_ensure():
             db_execute("ALTER TABLE dep_settings ADD COLUMN public INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            db_execute("ALTER TABLE payment_orders ADD COLUMN bonus INTEGER DEFAULT 0")
+        except Exception:
+            pass
         _P2["init"] = True
 
 
@@ -17125,14 +17142,14 @@ def p2_create_order(uid, provider, coins, price, email=None):
         return False, "Unknown provider."
     if not url:
         return False, "The payment provider didn't accept the request. Try again later."
-    _q("INSERT INTO payment_orders (ref, user_id, provider, coins, amount_minor, currency, status, created_at, email) "
-       "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)", (ref, uid, provider, coins, minor, cur, _now(), email))
+    _q("INSERT INTO payment_orders (ref, user_id, provider, coins, amount_minor, currency, status, created_at, email, bonus) "
+       "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)", (ref, uid, provider, coins, minor, cur, _now(), email, bonus_for(coins)))
     return True, url
 
 
 def p2_credit_order(ref, provider, paid_minor, currency):
     """Idempotent. Amount/currency must match what we asked for. -> True if credited now."""
-    o = _q("SELECT user_id, coins, amount_minor, currency, status, provider FROM payment_orders WHERE ref = ?", (ref,), fetch='one')
+    o = _q("SELECT user_id, coins, amount_minor, currency, status, provider, COALESCE(bonus, 0) FROM payment_orders WHERE ref = ?", (ref,), fetch='one')
     if not o or o[5] != provider or o[4] == 'paid':
         return False
     if currency and str(currency).upper() != o[3].upper():
@@ -17147,13 +17164,13 @@ def p2_credit_order(ref, provider, paid_minor, currency):
             return False
     finally:
         conn.close()
-    update_user_coins(o[0], int(o[1]), "local_payment", ref)
-    audit("system", "payment_paid", o[0], f"{provider} {ref} +{o[1]}")
+    update_user_coins(o[0], int(o[1]) + int(o[6]), "local_payment", ref)
+    audit("system", "payment_paid", o[0], f"{provider} {ref} +{o[1]}" + (f" +{o[6]} bonus" if o[6] else ""))
     try:
         async_backup(f"payment_{ref}")
     except Exception:
         pass
-    send_message(o[0], f"✅ *Payment received!*\n\n+{o[1]} 🪙 added to your balance.", _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+    send_message(o[0], f"✅ *Payment received!*\n\n+{o[1]} 🪙 added to your balance." + (f"\n🎁 Bonus: *+{o[6]} 🪙* free!" if o[6] else ""), _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
     return True
 
 
@@ -17229,7 +17246,7 @@ def _p2_r_buy(callback, data, uid, chat_id, mid):
         packs = _p2_packs("usd" if p[2] == "usdt" else "local")
         cur = provs[p[2]][1]
         edit_message(chat_id, mid, f"*{provs[p[2]][0]}*\n\nChoose a coin pack:",
-                     _fp_kb(*[[_fp_btn(f"{c} 🪙 — {pr:g} {cur}", f"p2_bpack_{p[2]}_{i}")] for i, (c, pr) in enumerate(packs)],
+                     _fp_kb(*[[_fp_btn(f"{c} 🪙" + (f" +{bonus_for(c)} 🎁" if bonus_for(c) else "") + f" — {pr:g} {cur}", f"p2_bpack_{p[2]}_{i}")] for i, (c, pr) in enumerate(packs)],
                             [_fp_btn("🔙 Back", "p2_buy")])); return True
     if p[1] == "bpack" and len(p) > 3 and p[2] in provs and p[3].isdigit():
         packs = _p2_packs("usd" if p[2] == "usdt" else "local")
@@ -17249,7 +17266,7 @@ def _p2_r_buy(callback, data, uid, chat_id, mid):
         edit_message(chat_id, mid, "⏳ Creating your payment link…")
         ok, res = p2_create_order(uid, p[2], coins, price, em)
         if ok:
-            edit_message(chat_id, mid, f"*💳 PAY — {coins} 🪙*\n\nOpen the secure payment page below. Coins are added automatically "
+            edit_message(chat_id, mid, f"*💳 PAY — {coins} 🪙*" + (f" *+ {bonus_for(coins)} 🎁 bonus*" if bonus_for(coins) else "") + "\n\nOpen the secure payment page below. Coins are added automatically "
                          f"a moment after you pay.", _fp_kb([{"text": "💳 Pay now", "url": res}], [_fp_btn("🔙 Back", "p2_buy")]))
         else:
             edit_message(chat_id, mid, f"❌ {res}", _fp_kb([_fp_btn("🔙 Back", "p2_buy")]))
@@ -18740,6 +18757,8 @@ def _ma_latest(dep_id):
 
 def _ma_dep_summary(d, uid):
     cpu, ram = _ma_latest(d["id"])
+    if d["status"] == "paused" and pause_row(d["id"]):
+        d = dict(d, expire=None)
     _st = _q("SELECT start_time FROM deployments WHERE deployment_id = ?", (d["id"],), fetch='one')
     _u = bot_uptime(d["id"], _st[0] if _st else None)
     return {"uptime": _u["pct"] if _u else None, "uptime_days": _u["days"] if _u else None, "id": d["id"], "name": display_filename(d["file"]), "status": effective_status(d["owner"], d["id"], d["file"], d["status"]), "expire": d["expire"],
@@ -19138,7 +19157,10 @@ def restartable_ids(owner=None):
     if owner is not None:
         q += " AND user_id = ?"; p.append(owner)
     gone = set(missing_active_ids(owner))
-    return [r[0] for r in (db_execute(q + " ORDER BY deployment_id", tuple(p), fetch='all') or []) if r[0] not in gone]
+    ids = [r[0] for r in (db_execute(q + " ORDER BY deployment_id", tuple(p), fetch='all') or [])]
+    if FILES_REPO_ENABLED:
+        return ids                          # bots with missing files are brought back from the GitHub backup first
+    return [i for i in ids if i not in gone]
 
 
 RALL_GAP = 2.0
@@ -19158,9 +19180,20 @@ def restart_all(scope, requester, cooldown, on_done=None, gap=None):
         _RALL_LAST[key] = time.time()
 
     def run():
-        ok = bad = 0
+        ok = bad = restored = 0
+        nofiles = []
         for i in ids:
             try:
+                row = db_execute("SELECT user_id, file_name FROM deployments WHERE deployment_id = ?", (i,), fetch='one')
+                if row and not dep_files_ok(row[0], i, row[1]):
+                    folder = get_deploy_folder(row[0], i)
+                    got, _env = _files_restore_for_relaunch(row[0], i, folder, folder / row[1],
+                                                            log=lambda m, _d=i: print(f"   [restart-all dep#{_d}] {m}"))
+                    if not (got and dep_files_ok(row[0], i, row[1])):
+                        bad += 1
+                        nofiles.append(i)
+                        continue
+                    restored += 1
                 _fp_restart(i, "restart_all")
                 ok += 1
             except Exception as e:
@@ -19168,12 +19201,12 @@ def restart_all(scope, requester, cooldown, on_done=None, gap=None):
                 print(f"⚠️ restart-all #{i}: {e}")
             sleep(RALL_GAP if gap is None else gap)
         try:
-            audit(requester, "restart_all", f"{'all' if scope is None else scope}:{ok}ok/{bad}fail")
+            audit(requester, "restart_all", f"{'all' if scope is None else scope}:{ok}ok/{restored}restored/{bad}fail")
         except Exception:
             pass
         if on_done:
             try:
-                on_done(ok, bad)
+                on_done(ok, bad, restored, nofiles)
             except Exception:
                 pass
     threading.Thread(target=run, daemon=True, name="RestartAll").start()
@@ -19185,19 +19218,33 @@ def _p2_r_rall(callback, data, uid, chat_id, mid):
     if admin and not is_admin(uid):
         return True
     scope = None if admin else uid
-    n = len(restartable_ids(scope))
+    ids_ = restartable_ids(scope)
+    n = len(ids_)
+    nmiss = len(set(missing_active_ids(scope)) & set(ids_))
     back = "admin_panel" if admin else "my_deployments"
     if data in ("p2_rall", "p2_arall"):
         txt = (f"🔄 *Restart ALL platform bots?*\n\n`{n}` bot(s) of every user will be restarted one by one (about 2s apart). "
                "Stopped, paused and expired bots are skipped." if admin else
                f"🔄 *Restart all your bots?*\n\n`{n}` bot(s) will be restarted one by one. Stopped, paused and expired bots are skipped.")
+        if nmiss:
+            txt += f"\n📥 `{nmiss}` of them have missing files — those will be re-downloaded from the GitHub backup first."
+        elif FILES_REPO_ENABLED is False and missing_active_ids(scope):
+            txt += "\n⚠️ Bots with missing files are skipped (no GitHub file backup is configured to restore them)."
         rows = [[_fp_btn(f"✅ Restart {n}" if n else "Nothing to restart", data + "go" if n else back)],
                 [_fp_btn("🔙 Cancel", back)]]
         edit_message(chat_id, mid, txt, _fp_kb(*rows))
         return True
     if data in ("p2_rallgo", "p2_arallgo"):
-        def done(ok, bad):
-            send_message(chat_id, f"✅ Restart all finished: `{ok}` restarted" + (f", `{bad}` failed" if bad else "") + ".")
+        def done(ok, bad, restored=0, nofiles=()):
+            msg = f"✅ Restart all finished: `{ok}` restarted"
+            if restored:
+                msg += f" (`{restored}` had missing files and were re-downloaded from the backup)"
+            if bad:
+                msg += f", `{bad}` failed"
+            msg += "."
+            if nofiles:
+                msg += "\n⚠️ No usable backup for bot(s): " + ", ".join(f"#{i}" for i in nofiles[:20]) + " — re-upload or re-deploy them."
+            send_message(chat_id, msg)
         started, wait = restart_all(scope, uid, RALL_ADMIN_COOLDOWN if admin else RALL_USER_COOLDOWN, done)
         if started:
             edit_message(chat_id, mid, f"🔄 Restarting `{started}` bot(s)… I'll message you when it's done.",
@@ -19739,6 +19786,694 @@ _P2_ROUTES.append(("p2_nt", _p2_r_nt))
 _P2_MORE_ROWS.append([_fp_btn("🔔 Notifications", "p2_nt")])
 
 
+# ---------------------------------------------------------------- UPGRADE 9: coin top-up bonus tiers
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS coin_bonus (min_coins INTEGER PRIMARY KEY, pct INTEGER)")
+BONUS_SUGGESTED = ((500, 5), (1000, 10), (2500, 15))
+
+
+def bonus_enabled():
+    return kv_get("bonus_on", "1") != "0"
+
+
+def bonus_tiers():
+    return [(r[0], r[1]) for r in (_q("SELECT min_coins, pct FROM coin_bonus ORDER BY min_coins", fetch='all') or [])]
+
+
+def bonus_for(coins):
+    """Extra coins for buying a `coins` pack: the highest tier whose minimum the pack reaches."""
+    if not bonus_enabled():
+        return 0
+    best = 0
+    for mn, pct in bonus_tiers():
+        if coins >= mn:
+            best = pct
+    return int(coins * best // 100)
+
+
+def _bn_screen():
+    tiers = bonus_tiers()
+    on = bonus_enabled()
+    lines = ["*🎁 TOP-UP BONUSES*", "",
+             f"Status: *{'ON' if on else 'OFF'}* — extra coins when a user buys a bigger coin pack (Paystack / Flutterwave / USDT).", ""]
+    rows = []
+    if tiers:
+        for mn, pct in tiers:
+            lines.append(f"• Buy `{mn}`+ coins → *+{pct}%*  (e.g. {mn} → {mn + mn * pct // 100})")
+            rows.append([_fp_btn(f"🗑 Remove {mn}+ (+{pct}%)", f"p2_abn_del_{mn}")])
+    else:
+        lines.append("_No tiers yet._")
+    packs = _p2_packs()
+    if packs and tiers:
+        lines += ["", "*Your current packs:*"] + [f"• {c} 🪙 → {'+%d bonus' % bonus_for(c) if bonus_for(c) else 'no bonus'}" for c, _ in packs]
+    rows.insert(0, [_fp_btn("➕ Add tier", "p2_abn_add"), _fp_btn("🔴 Turn OFF" if on else "🟢 Turn ON", "p2_abn_tog")])
+    if not tiers:
+        rows.insert(1, [_fp_btn("✨ Load suggested (500→5%, 1000→10%, 2500→15%)", "p2_abn_sug")])
+    rows.append([_fp_btn("🔙 Admin Panel", "admin_panel")])
+    return "\n".join(lines), _fp_kb(*rows)
+
+
+def _p2_r_abn(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_abn_tog":
+        kv_set("bonus_on", "0" if bonus_enabled() else "1")
+    elif data == "p2_abn_sug":
+        for mn, pct in BONUS_SUGGESTED:
+            _q("INSERT OR REPLACE INTO coin_bonus (min_coins, pct) VALUES (?, ?)", (mn, pct))
+        audit(uid, "bonus_tiers", "suggested")
+    elif data == "p2_abn_add":
+        set_user_step(uid, 'fp_p2bn')
+        edit_message(chat_id, mid, "➕ *Add a bonus tier*\n\nSend: `minimum_coins percent`\nExample: `500 10` → anyone buying a pack of 500+ coins gets 10% extra (500 → 550).\n"
+                     "Sending a minimum that already exists replaces it.", _fp_kb([_fp_btn("❌ Cancel", "p2_abn")]))
+        return True
+    else:
+        m = re.match(r"^p2_abn_del_(\d+)$", data)
+        if m:
+            _q("DELETE FROM coin_bonus WHERE min_coins = ?", (int(m.group(1)),))
+            audit(uid, "bonus_tiers", f"del {m.group(1)}")
+        elif data != "p2_abn":
+            return False
+    set_user_step(uid, None)
+    txt, kb = _bn_screen()
+    edit_message(chat_id, mid, txt, kb)
+    return True
+
+
+def _p2_text_bn(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    m = re.fullmatch(r"\s*(\d{1,7})\s+(\d{1,3})\s*%?\s*", text or "")
+    if not m or not (1 <= int(m.group(2)) <= 100) or int(m.group(1)) < 1:
+        set_user_step(uid, 'fp_p2bn')
+        send_message(chat_id, "❌ Send two numbers, e.g. `500 10` (minimum coins, then percent 1-100).", _fp_kb([_fp_btn("❌ Cancel", "p2_abn")]))
+        return True
+    mn, pct = int(m.group(1)), int(m.group(2))
+    _q("INSERT OR REPLACE INTO coin_bonus (min_coins, pct) VALUES (?, ?)", (mn, pct))
+    audit(uid, "bonus_tiers", f"{mn}:{pct}")
+    txt, kb = _bn_screen()
+    send_message(chat_id, f"✅ Saved: `{mn}`+ coins → +{pct}%\n\n" + txt, kb)
+    return True
+
+
+_P2_TEXT['fp_p2bn'] = _p2_text_bn
+_P2_ROUTES.append(("p2_abn", _p2_r_abn))
+_P2_ADMIN_ROWS.append([_fp_btn("🎁 Top-up bonuses", "p2_abn")])
+
+
+# ---------------------------------------------------------------- UPGRADE 10: subscription pause
+PAUSE_MAX_DAYS = int(os.environ.get("PAUSE_MAX_DAYS", "14"))                 # longest single pause (auto-resumes after)
+PAUSE_MAX_TOTAL_DAYS = int(os.environ.get("PAUSE_MAX_TOTAL_DAYS", "30"))     # paused days allowed per bot per rolling year
+PAUSE_COOLDOWN_DAYS = int(os.environ.get("PAUSE_COOLDOWN_DAYS", "7"))        # gap required between pauses
+PAUSE_MIN_LEFT_DAYS = int(os.environ.get("PAUSE_MIN_LEFT_DAYS", "2"))        # plan must have this much time left
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS plan_pauses (id INTEGER PRIMARY KEY AUTOINCREMENT, deployment_id INTEGER, user_id INTEGER, "
+               "paused_at TEXT, resume_by TEXT, remaining_secs INTEGER, resumed_at TEXT, state TEXT DEFAULT 'paused')")
+_P2_DDL.append("CREATE INDEX IF NOT EXISTS idx_plan_pauses_dep ON plan_pauses (deployment_id, state)")
+_PAUSE_FROZEN = 2                    # deployments.is_paused value for a user pause (1 = premium lapsed, handled elsewhere)
+
+
+def pause_row(dep_id):
+    r = _q("SELECT id, paused_at, resume_by, remaining_secs FROM plan_pauses WHERE deployment_id = ? AND state = 'paused' "
+           "ORDER BY id DESC LIMIT 1", (dep_id,), fetch='one')
+    return None if not r else {"id": r[0], "paused_at": r[1], "resume_by": r[2], "remaining": r[3]}
+
+
+def _pause_used_days(dep_id, now):
+    used = 0.0
+    for pa, ra in (_q("SELECT paused_at, COALESCE(resumed_at, ?) FROM plan_pauses WHERE deployment_id = ? AND paused_at >= ?",
+                      (now.isoformat(), dep_id, (now - timedelta(days=365)).isoformat()), fetch='all') or []):
+        try:
+            used += (datetime.fromisoformat(ra) - datetime.fromisoformat(pa)).total_seconds() / 86400
+        except Exception:
+            pass
+    return used
+
+
+def pause_check(dep_id, uid, now=None):
+    """-> (ok, reason_or_days_allowed). When ok the second value is how many days this pause may last."""
+    now = now or datetime.now()
+    r = _q("SELECT user_id, status, is_free, plan, payment_method, expire_time FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    if not r or r[0] != uid:
+        return False, "Only the owner can pause a plan."
+    owner, status, is_free, plan, pm, exp = r
+    if pause_row(dep_id) or (status == "paused" and True and _q("SELECT is_paused FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')[0] == _PAUSE_FROZEN):
+        return False, "This plan is already paused."
+    if is_free or plan not in ("monthly", "yearly"):
+        return False, "Only paid monthly/yearly plans can be paused."
+    if pm == "premium_free":
+        return False, "This bot runs on your Premium subscription, so it can't be paused separately."
+    if status not in ("active", "stopped"):
+        return False, f"A {status} bot can't be paused."
+    try:
+        left = datetime.fromisoformat(exp) - now
+    except Exception:
+        return False, "This plan has no valid expiry."
+    if left < timedelta(days=PAUSE_MIN_LEFT_DAYS):
+        return False, f"Less than {PAUSE_MIN_LEFT_DAYS} days are left, so it can't be paused. Renew instead."
+    last = _q("SELECT resumed_at FROM plan_pauses WHERE deployment_id = ? AND resumed_at IS NOT NULL ORDER BY id DESC LIMIT 1", (dep_id,), fetch='one')
+    if last and last[0]:
+        wait = datetime.fromisoformat(last[0]) + timedelta(days=PAUSE_COOLDOWN_DAYS) - now
+        if wait > timedelta(0):
+            return False, f"You can pause again in {max(1, int(wait.total_seconds() // 86400) + 1)} day(s)."
+    allowed = min(PAUSE_MAX_DAYS, int(PAUSE_MAX_TOTAL_DAYS - _pause_used_days(dep_id, now)))
+    if allowed < 1:
+        return False, f"This bot has used its {PAUSE_MAX_TOTAL_DAYS} paused days for the year."
+    return True, allowed
+
+
+def pause_plan(dep_id, uid, now=None):
+    """Freeze the remaining time and stop the bot. -> (ok, msg)"""
+    now = now or datetime.now()
+    ok, info = pause_check(dep_id, uid, now)
+    if not ok:
+        return False, info
+    exp = datetime.fromisoformat(_q("SELECT expire_time FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')[0])
+    remaining = int((exp - now).total_seconds())
+    try:
+        stop_deployment(dep_id)
+    except Exception as e:
+        print(f"⚠️ pause stop #{dep_id}: {e}")
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE deployments SET status='paused', is_paused=?, proc_pid=NULL, expire_time=? "
+                           "WHERE deployment_id=? AND user_id=? AND status IN ('active','stopped') AND is_paused IN (0)",
+                           (_PAUSE_FROZEN, (now + timedelta(days=3650)).isoformat(), dep_id, uid))
+        conn.commit()
+        if cur.rowcount != 1:
+            return False, "This plan can't be paused right now."
+    finally:
+        conn.close()
+    resume_by = now + timedelta(days=info)
+    _q("INSERT INTO plan_pauses (deployment_id, user_id, paused_at, resume_by, remaining_secs) VALUES (?,?,?,?,?)",
+       (dep_id, uid, now.isoformat(), resume_by.isoformat(), remaining))
+    audit(uid, "plan_pause", f"{dep_id}: {remaining // 86400}d left frozen, resume by {resume_by.date()}")
+    try:
+        with deployment_lock:
+            active_deployments.pop(dep_id, None)
+    except Exception:
+        pass
+    return True, (f"⏸ *Plan paused.* The bot is stopped and your remaining *{remaining // 86400}d {remaining % 86400 // 3600}h* is frozen.\n"
+                  f"It resumes automatically on `{resume_by.strftime('%Y-%m-%d')}` (or whenever you tap Resume).")
+
+
+def resume_plan(dep_id, auto=False, now=None):
+    """Unfreeze: expiry = now + the saved remaining time, then start the bot. -> (ok, msg)"""
+    now = now or datetime.now()
+    pr = pause_row(dep_id)
+    if not pr:
+        return False, "This plan isn't paused."
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    try:
+        cur = conn.execute("UPDATE plan_pauses SET state='done', resumed_at=? WHERE id=? AND state='paused'", (now.isoformat(), pr["id"]))
+        conn.commit()
+        if cur.rowcount != 1:
+            return False, "Already resumed."
+        new_exp = now + timedelta(seconds=int(pr["remaining"]))
+        conn.execute("UPDATE deployments SET status='stopped', is_paused=0, proc_pid=NULL, expire_time=? WHERE deployment_id=?",
+                     (new_exp.isoformat(), dep_id))
+        conn.commit()
+    finally:
+        conn.close()
+    row = _q("SELECT user_id, file_name FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+    started = False
+    try:
+        if row and not dep_files_ok(row[0], dep_id, row[1]) and FILES_REPO_ENABLED:
+            f = get_deploy_folder(row[0], dep_id)
+            _files_restore_for_relaunch(row[0], dep_id, f, f / row[1])
+        _fp_restart(dep_id, "resume")
+        started = True
+    except Exception as e:
+        print(f"⚠️ resume start #{dep_id}: {e}")
+    audit(row[0] if row else 0, "plan_resume", f"{dep_id} auto={auto} expires {new_exp.date()}")
+    return True, (f"▶️ *Plan resumed*{' automatically' if auto else ''}. Your plan now expires on `{new_exp.strftime('%Y-%m-%d')}`."
+                  + (" The bot is starting." if started else " Start the bot from its page."))
+
+
+def pause_view_block(dep_id):
+    pr = pause_row(dep_id)
+    if not pr:
+        return None
+    rem = int(pr["remaining"])
+    return (f"\n\n⏸ *Plan frozen* — `{rem // 86400}d {rem % 86400 // 3600}h` of your plan are saved.\n"
+            f"Resumes automatically on `{pr['resume_by'][:10]}`.")
+
+
+def _p2_r_pz(callback, data, uid, chat_id, mid):
+    m = re.match(r"^p2_pz(go|res)?_(\d+)$", data)
+    if not m:
+        return False
+    kind, dep_id = m.group(1), int(m.group(2))
+    back = _fp_kb([_fp_btn("📦 Open bot", f"view_deploy_{dep_id}")])
+    if kind == "go":
+        ok_, msg = pause_plan(dep_id, uid)
+        edit_message(chat_id, mid, msg if ok_ else f"❌ {msg}", _fp_kb([_fp_btn("▶️ Resume now", f"p2_pzres_{dep_id}")] if ok_ else [],
+                                                                          [_fp_btn("📦 Open bot", f"view_deploy_{dep_id}")]))
+        return True
+    if kind == "res":
+        d = _q("SELECT user_id FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+        if not d or d[0] != uid:
+            return True
+        ok_, msg = resume_plan(dep_id)
+        edit_message(chat_id, mid, msg if ok_ else f"❌ {msg}", back)
+        return True
+    ok_, info = pause_check(dep_id, uid)
+    if not ok_:
+        edit_message(chat_id, mid, f"⏸ *Pause plan*\n\n❌ {info}", back)
+        return True
+    edit_message(chat_id, mid,
+                 f"⏸ *Pause plan for bot #{dep_id}?*\n\n• The bot is *stopped* while paused.\n• Your remaining plan time is *frozen* and nothing is lost.\n"
+                 f"• You can pause for up to *{info} days*; it resumes by itself after that (or tap Resume any time).\n"
+                 f"• Limits: {PAUSE_MAX_TOTAL_DAYS} paused days per bot per year, and {PAUSE_COOLDOWN_DAYS} days between pauses.",
+                 _fp_kb([_fp_btn("⏸ Yes, pause", f"p2_pzgo_{dep_id}")], [_fp_btn("🔙 Cancel", f"view_deploy_{dep_id}")]))
+    return True
+
+
+def p2_pause_monitor():
+    sleep(200)
+    print("✅ Plan-pause monitor started")
+    while True:
+        try:
+            pause_monitor_tick()
+        except Exception as e:
+            print(f"⚠️ pause monitor: {e}")
+        sleep(1800)
+
+
+def pause_monitor_tick(now=None):
+    now = now or datetime.now()
+    n = 0
+    for dep_id, uid, resume_by in (_q("SELECT deployment_id, user_id, resume_by FROM plan_pauses WHERE state = 'paused'", fetch='all') or []):
+        try:
+            rb = datetime.fromisoformat(resume_by)
+        except Exception:
+            rb = now
+        if rb <= now:
+            ok_, msg = resume_plan(dep_id, auto=True, now=now)
+            if ok_:
+                n += 1
+                send_message(uid, f"⏰ Bot #{dep_id}: your pause limit was reached.\n\n{msg}", _fp_kb([_fp_btn("📦 Open bot", f"view_deploy_{dep_id}")]))
+        elif rb - now <= timedelta(hours=24) and not kv_get(f"pzwarn_{dep_id}_{resume_by}"):
+            kv_set(f"pzwarn_{dep_id}_{resume_by}", "1")
+            send_message(uid, f"⏸ Bot #{dep_id} resumes automatically in under 24 hours.", _fp_kb([_fp_btn("▶️ Resume now", f"p2_pzres_{dep_id}")]))
+    return n
+
+
+_P2_ROUTES.append(("p2_pz", _p2_r_pz))
+_pz_orig_restart = restart_deployment
+
+
+def restart_deployment(deployment_id, user_id, chat_id, *a, **k):       # noqa: F811 - a paused plan must not be restarted by hand
+    if pause_row(deployment_id):
+        send_message(chat_id, "⏸ This plan is paused. Resume it first to start the bot.",
+                     _fp_kb([_fp_btn("▶️ Resume now", f"p2_pzres_{deployment_id}")]))
+        return False
+    return _pz_orig_restart(deployment_id, user_id, chat_id, *a, **k)
+
+
+# ---------------------------------------------------------------- UPGRADE 11: admin revenue report (+ CSV)
+REV_DAYS = 14
+REV_WEEKS = 8
+_PROV_LABEL = {"paystack": "Paystack", "flutterwave": "Flutterwave", "usdt": "USDT"}
+
+
+def _rev_orders(since_admin=None):
+    """Paid orders with paid_at converted to the admin's clock. -> [dict]"""
+    rows = _q("SELECT ref, user_id, provider, coins, COALESCE(bonus,0), amount_minor, currency, paid_at FROM payment_orders "
+              "WHERE status = 'paid' AND paid_at IS NOT NULL ORDER BY paid_at", fetch='all') or []
+    out = []
+    for ref, uid, prov, coins, bonus, minor, cur, pa in rows:
+        try:
+            at = sb_server_to_admin(datetime.fromisoformat(pa))
+        except Exception:
+            continue
+        if since_admin and at < since_admin:
+            continue
+        out.append({"ref": ref, "uid": uid, "provider": prov, "coins": int(coins or 0), "bonus": int(bonus or 0),
+                    "amount": (minor or 0) / 100.0, "currency": cur or "", "at": at})
+    return out
+
+
+def _rev_bucket_key(at, mode):
+    d = at.date()
+    return d if mode == "d" else d - timedelta(days=d.weekday())
+
+
+def rev_report(mode="d"):
+    """-> {'rows': [(bucket_date, provider, orders, coins, bonus, amount, currency)], 'buckets': [...], 'orders': n, ...}"""
+    now_a = sb_server_to_admin(datetime.now())
+    today = now_a.date()
+    if mode == "d":
+        first = today - timedelta(days=REV_DAYS - 1)
+        buckets = [first + timedelta(days=i) for i in range(REV_DAYS)]
+    else:
+        monday = today - timedelta(days=today.weekday())
+        buckets = [monday - timedelta(weeks=REV_WEEKS - 1 - i) for i in range(REV_WEEKS)]
+    orders = _rev_orders(datetime.combine(buckets[0], datetime.min.time()))
+    agg = {}
+    for o in orders:
+        k = (_rev_bucket_key(o["at"], mode), o["provider"], o["currency"])
+        a = agg.setdefault(k, [0, 0, 0, 0.0])
+        a[0] += 1; a[1] += o["coins"]; a[2] += o["bonus"]; a[3] += o["amount"]
+    rows = [(b, p, c, *v) for (b, p, c), v in sorted(agg.items(), key=lambda kv: (kv[0][0], kv[0][1]))]
+    return {"mode": mode, "buckets": buckets, "rows": rows, "today": today}
+
+
+def _fmt_money(v, cur):
+    return f"{v:,.2f}".rstrip("0").rstrip(".") + (f" {cur}" if cur else "")
+
+
+def rev_text(mode="d", detail=True):
+    r = rev_report(mode)
+    title = f"Daily — last {REV_DAYS} days" if mode == "d" else f"Weekly — last {REV_WEEKS} weeks"
+    lines = [f"*📈 REVENUE — {title}*", ""]
+    by_b = {}
+    for b, p, cur, n, coins, bonus, amt in r["rows"]:
+        by_b.setdefault(b, []).append((p, cur, n, coins, bonus, amt))
+    tot = {}
+    for b in reversed(r["buckets"]):
+        items = by_b.get(b, [])
+        label = b.strftime("%a %d %b") if mode == "d" else f"Week of {b.strftime('%d %b')}"
+        if not items:
+            lines.append(f"`{label}` — no sales")
+            continue
+        n = sum(i[2] for i in items); c = sum(i[3] for i in items); bo = sum(i[4] for i in items)
+        money = {}
+        for p, cur, nn, cc, bb, amt in items:
+            money[cur] = money.get(cur, 0) + amt
+        lines.append(f"`{label}` — *{n}* order(s) · *{c:,}*🪙" + (f" (+{bo:,} bonus)" if bo else "") + " · " + ", ".join(_fmt_money(v, k) for k, v in money.items()))
+        for p, cur, nn, cc, bb, amt in items:
+            if detail:
+                lines.append(f"   ↳ {_PROV_LABEL.get(p, p)}: {nn} · {cc:,}🪙 · {_fmt_money(amt, cur)}")
+            t = tot.setdefault(p, [0, 0, 0, {}]); t[0] += nn; t[1] += cc; t[2] += bb; t[3][cur] = t[3].get(cur, 0) + amt
+    lines += ["", "*Total in this view*"]
+    if tot:
+        for p, (n, c, bo, money) in sorted(tot.items()):
+            lines.append(f"• {_PROV_LABEL.get(p, p)}: {n} order(s) · {c:,}🪙" + (f" (+{bo:,} bonus)" if bo else "") + " · " + ", ".join(_fmt_money(v, k) for k, v in money.items()))
+    else:
+        lines.append("_No paid orders in this period._")
+    free = _q("SELECT COALESCE(SUM(amount),0) FROM coin_transactions WHERE amount > 0 AND transaction_type IN ('admin_add','redeem','referral_reward') AND timestamp >= ?",
+              ((datetime.now() - timedelta(days=REV_DAYS if mode == 'd' else REV_WEEKS * 7)).isoformat(),), fetch='one')
+    lines.append(f"\n🎁 Free coins issued in the same window (admin / redeem / referral): `{int(free[0]):,}`")
+    text = "\n".join(lines)
+    return text if (len(text) <= 3900 or not detail) else rev_text(mode, detail=False)
+
+
+def rev_csv(kind="d"):
+    """-> (filename, csv_text). kind: 'd' | 'w' (per period & provider) | 'all' (every paid order)."""
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    if kind == "all":
+        w.writerow(["ref", "user_id", "provider", "coins", "bonus_coins", "total_credited", "amount", "currency", "paid_at"])
+        for o in _rev_orders():
+            w.writerow([o["ref"], o["uid"], o["provider"], o["coins"], o["bonus"], o["coins"] + o["bonus"], f"{o['amount']:.2f}", o["currency"], o["at"].isoformat(timespec="seconds")])
+        return "orders_all.csv", buf.getvalue()
+    r = rev_report(kind)
+    w.writerow(["period_start", "period", "provider", "orders", "coins_sold", "bonus_coins", "total_credited", "amount", "currency"])
+    for b, p, cur, n, coins, bonus, amt in r["rows"]:
+        w.writerow([b.isoformat(), "day" if kind == "d" else "week", p, n, coins, bonus, coins + bonus, f"{amt:.2f}", cur])
+    return ("revenue_daily.csv" if kind == "d" else "revenue_weekly.csv"), buf.getvalue()
+
+
+def _rev_kb(mode):
+    return _fp_kb([_fp_btn(("✅ " if mode == "d" else "") + "📅 Daily", "p2_rev"), _fp_btn(("✅ " if mode == "w" else "") + "🗓 Weekly", "p2_rev_w")],
+                  [_fp_btn("⬇️ CSV (this view)", f"p2_revcsv_{mode}"), _fp_btn("⬇️ CSV (all orders)", "p2_revcsv_all")],
+                  [_fp_btn("🔙 Admin Panel", "admin_panel")])
+
+
+def _p2_r_rev(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    m = re.match(r"^p2_revcsv_(d|w|all)$", data)
+    if m:
+        name, text = rev_csv(m.group(1))
+        path = Path(tempfile.gettempdir()) / f"{secrets.token_hex(4)}_{name}"
+        try:
+            path.write_text(text, encoding="utf-8")
+            send_document(chat_id, str(path), caption=f"📈 {name} — {text.count(chr(10)) - 1} row(s)", filename=name)
+            audit(uid, "revenue_csv", name)
+        finally:
+            path.unlink(missing_ok=True)
+        return True
+    if data in ("p2_rev", "p2_rev_w"):
+        mode = "w" if data == "p2_rev_w" else "d"
+        edit_message(chat_id, mid, rev_text(mode), _rev_kb(mode))
+        return True
+    return False
+
+
+_P2_ROUTES.append(("p2_rev", _p2_r_rev))
+_P2_ADMIN_ROWS.append([_fp_btn("📈 Revenue report", "p2_rev")])
+
+
+# ---------------------------------------------------------------- UPGRADE 12: referral leaderboard (monthly) + prizes
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS lb_awards (month TEXT, rank INTEGER, user_id INTEGER, coins INTEGER, awarded_at TEXT, "
+               "PRIMARY KEY (month, rank))")
+LB_TOP = 10
+LB_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+def _lb_month(dt):
+    return dt.strftime("%Y-%m")
+
+
+def lb_prizes():
+    try:
+        v = [max(0, int(x)) for x in (kv_get("lb_prizes", "") or "").split(",") if x.strip() != ""]
+    except Exception:
+        v = []
+    return v[:3]
+
+
+def lb_standings(month_key=None):
+    """Verified referrals per referrer in an admin-clock month. -> [(user_id, count)] best first (banned users excluded)."""
+    month_key = month_key or _lb_month(sb_server_to_admin(datetime.now()))
+    counts, last = {}, {}
+    for rid, ca in (_q("SELECT referrer_id, created_at FROM referrals WHERE reward_given = 1", fetch='all') or []):
+        try:
+            at = sb_server_to_admin(datetime.fromisoformat(ca))
+        except Exception:
+            continue
+        if _lb_month(at) != month_key:
+            continue
+        counts[rid] = counts.get(rid, 0) + 1
+        last[rid] = max(last.get(rid, at), at)
+    ranked = sorted(((u, n) for u, n in counts.items() if not is_banned(u)), key=lambda x: (-x[1], last[x[0]], x[0]))
+    return ranked
+
+
+def _lb_name(uid, viewer=None):
+    if uid == viewer:
+        return "*You*"
+    r = _q("SELECT first_name FROM users WHERE user_id = ?", (uid,), fetch='one')
+    n = (r[0] if r and r[0] else "User")
+    return _tk_esc(n[:2]) + "•••"
+
+
+def _month_label(key):
+    try:
+        return datetime.strptime(key, "%Y-%m").strftime("%B %Y")
+    except Exception:
+        return key
+
+
+def _lb_prize_line():
+    pz = lb_prizes()
+    if not pz or not any(pz) or kv_get("lb_on", "1") == "0":
+        return ""
+    line = "🎁 *Prizes:* " + "  ".join(f"{LB_MEDALS[i + 1]} {p}🪙" for i, p in enumerate(pz) if p)
+    note = kv_get("lb_note", "")
+    return line + (f"\n_{_tk_esc(note)}_" if note else "")
+
+
+def lb_user_text(uid):
+    mk = _lb_month(sb_server_to_admin(datetime.now()))
+    st = lb_standings(mk)
+    lines = [f"*🏆 REFERRAL LEADERBOARD — {_month_label(mk)}*", ""]
+    pl = _lb_prize_line()
+    if pl:
+        lines += [pl, ""]
+    if not st:
+        lines.append("_No verified referrals yet this month — be the first!_")
+    for i, (u, n) in enumerate(st[:LB_TOP], 1):
+        lines.append(f"{LB_MEDALS.get(i, f'{i}.')} {_lb_name(u, uid)} — *{n}*")
+    mine = next(((i, n) for i, (u, n) in enumerate(st, 1) if u == uid), None)
+    lines.append("")
+    if mine:
+        lines.append(f"Your rank: *#{mine[0]}* with *{mine[1]}* referral(s)" + ("" if mine[0] <= LB_TOP else ""))
+    else:
+        lines.append("You have no verified referrals this month yet.")
+    now_a = sb_server_to_admin(datetime.now())
+    nxt = (now_a.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    left = nxt - now_a
+    lines.append(f"\n⏳ Resets in {left.days}d {left.seconds // 3600}h. Only friends who join *and verify* count.")
+    return "\n".join(lines)
+
+
+def lb_award(month_key, now=None):
+    """Pay the configured prizes for a finished month — each rank at most once. -> [(rank, uid, coins)]"""
+    pz = lb_prizes()
+    st = lb_standings(month_key)
+    paid = []
+    for rank, (uid, n) in enumerate(st[:len(pz)], 1):
+        coins = pz[rank - 1]
+        if coins <= 0:
+            continue
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        try:
+            cur = conn.execute("INSERT OR IGNORE INTO lb_awards (month, rank, user_id, coins, awarded_at) VALUES (?,?,?,?,?)",
+                               (month_key, rank, uid, coins, _now()))
+            conn.commit()
+            claimed = cur.rowcount == 1
+        finally:
+            conn.close()
+        if not claimed:
+            continue
+        update_user_coins(uid, coins, "leaderboard_prize", f"lb_{month_key}_{rank}")
+        audit("system", "lb_prize", uid, f"{month_key} #{rank} +{coins}")
+        paid.append((rank, uid, coins))
+        try:
+            send_message(uid, f"🏆 *You placed #{rank} on the {_month_label(month_key)} referral leaderboard!*\n\n"
+                              f"{n} verified referral(s) — *+{coins} 🪙* added to your balance."
+                              + (f"\n\n_{_tk_esc(kv_get('lb_note', ''))}_" if kv_get("lb_note", "") else ""),
+                         _fp_kb([_fp_btn("🏆 Leaderboard", "p2_lb")]))
+        except Exception:
+            pass
+    return paid
+
+
+def lb_monthly_tick(now=None):
+    """Once the admin-clock month has rolled over, pay (or skip) last month's prizes. -> paid list or None"""
+    now_a = sb_server_to_admin(now or datetime.now())
+    prev = _lb_month(now_a.replace(day=1) - timedelta(days=1))
+    if kv_get(f"lb_done_{prev}"):
+        return None
+    kv_set(f"lb_done_{prev}", "1")
+    if kv_get("lb_on", "1") == "0" or not any(lb_prizes()):
+        kv_set(f"lb_done_{prev}", "skipped")
+        return None
+    paid = lb_award(prev)
+    if paid:
+        txt = f"🏆 Leaderboard prizes for {_month_label(prev)} paid:\n" + "\n".join(f"#{r} `{u}` +{c}🪙" for r, u, c in paid)
+        for a in list(ADMIN_IDS):
+            try:
+                send_message(a, txt)
+            except Exception:
+                pass
+    return paid
+
+
+def p2_lb_monitor():
+    sleep(240)
+    print("✅ Leaderboard monitor started")
+    while True:
+        try:
+            lb_monthly_tick()
+        except Exception as e:
+            print(f"⚠️ leaderboard monitor: {e}")
+        sleep(3600)
+
+
+def _alb_screen():
+    mk = _lb_month(sb_server_to_admin(datetime.now()))
+    st = lb_standings(mk)
+    pz = lb_prizes()
+    on = kv_get("lb_on", "1") != "0"
+    lines = [f"*🏆 REFERRAL LEADERBOARD — admin*", "",
+             f"Month: *{_month_label(mk)}* · prizes: *{'ON' if on else 'OFF'}*",
+             "Prizes: " + (", ".join(f"{LB_MEDALS[i + 1]} {p}🪙" for i, p in enumerate(pz)) if pz else "_none set_"),
+             "Note: " + (f"_{_tk_esc(kv_get('lb_note', ''))}_" if kv_get("lb_note", "") else "_none_"), "", "*Current top 10*"]
+    for i, (u, n) in enumerate(st[:LB_TOP], 1):
+        lines.append(f"{LB_MEDALS.get(i, f'{i}.')} `{u}` — {n}")
+    if not st:
+        lines.append("_No verified referrals yet._")
+    prev = _lb_month(sb_server_to_admin(datetime.now()).replace(day=1) - timedelta(days=1))
+    done = kv_get(f"lb_done_{prev}")
+    lines.append(f"\nLast month ({_month_label(prev)}): " + ("paid ✅" if done == "1" else "skipped (no prizes were set)" if done == "skipped" else "not processed yet"))
+    return "\n".join(lines), _fp_kb([_fp_btn("💰 Set prizes", "p2_alb_pz"), _fp_btn("📝 Set note", "p2_alb_note")],
+                                    [_fp_btn("🔴 Turn OFF" if on else "🟢 Turn ON", "p2_alb_tog"), _fp_btn("🏁 Pay last month now", "p2_alb_pay")],
+                                    [_fp_btn("🔙 Admin Panel", "admin_panel")])
+
+
+def _p2_r_alb(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_alb_tog":
+        kv_set("lb_on", "0" if kv_get("lb_on", "1") != "0" else "1")
+    elif data == "p2_alb_pz":
+        set_user_step(uid, 'fp_p2lbpz')
+        edit_message(chat_id, mid, "💰 Send prize coins for ranks 1, 2, 3 separated by spaces, e.g. `300 150 50`.\n"
+                     "Use `0` to skip a rank, or send just `500` to reward only the winner. Send `none` to clear.",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_alb")]))
+        return True
+    elif data == "p2_alb_note":
+        set_user_step(uid, 'fp_p2lbnote')
+        edit_message(chat_id, mid, "📝 Send a short note shown with the prizes (e.g. `Plus a free month for #1!`). Send `none` to clear.",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_alb")]))
+        return True
+    elif data == "p2_alb_pay":
+        prev = _lb_month(sb_server_to_admin(datetime.now()).replace(day=1) - timedelta(days=1))
+        if kv_get(f"lb_done_{prev}") == "1":
+            edit_message(chat_id, mid, f"ℹ️ {_month_label(prev)} was already paid.", _fp_kb([_fp_btn("🔙 Back", "p2_alb")]))
+            return True
+        if not any(lb_prizes()):
+            edit_message(chat_id, mid, "⚠️ Set prizes first.", _fp_kb([_fp_btn("🔙 Back", "p2_alb")]))
+            return True
+        kv_set(f"lb_done_{prev}", "1")
+        paid = lb_award(prev)
+        edit_message(chat_id, mid, f"🏁 Paid {len(paid)} prize(s) for {_month_label(prev)}." + "".join(f"\n#{r} `{u}` +{c}🪙" for r, u, c in paid),
+                     _fp_kb([_fp_btn("🔙 Back", "p2_alb")]))
+        return True
+    elif data != "p2_alb":
+        return False
+    set_user_step(uid, None)
+    txt, kb = _alb_screen()
+    edit_message(chat_id, mid, txt, kb)
+    return True
+
+
+def _p2_text_lbpz(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    t = (text or "").strip().lower()
+    if t == "none":
+        kv_set("lb_prizes", "")
+    else:
+        parts = t.replace(",", " ").split()
+        if not (1 <= len(parts) <= 3 and all(p.isdigit() and int(p) <= 1_000_000 for p in parts)):
+            set_user_step(uid, 'fp_p2lbpz')
+            send_message(chat_id, "❌ Send 1-3 whole numbers, e.g. `300 150 50`.", _fp_kb([_fp_btn("❌ Cancel", "p2_alb")]))
+            return True
+        kv_set("lb_prizes", ",".join(str(int(p)) for p in parts))
+    audit(uid, "lb_prizes", kv_get("lb_prizes", ""))
+    txt, kb = _alb_screen()
+    send_message(chat_id, "✅ Saved.\n\n" + txt, kb)
+    return True
+
+
+def _p2_text_lbnote(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    t = (text or "").strip()
+    kv_set("lb_note", "" if t.lower() == "none" else t[:200])
+    txt, kb = _alb_screen()
+    send_message(chat_id, "✅ Saved.\n\n" + txt, kb)
+    return True
+
+
+def _p2_r_lb(callback, data, uid, chat_id, mid):
+    if data != "p2_lb":
+        return False
+    edit_message(chat_id, mid, lb_user_text(uid), _fp_kb([_fp_btn("👥 My referral link", "my_referral")], [_fp_btn("🔙 Menu", "main_menu")]))
+    return True
+
+
+_P2_TEXT['fp_p2lbpz'] = _p2_text_lbpz
+_P2_TEXT['fp_p2lbnote'] = _p2_text_lbnote
+_P2_ROUTES.append(("p2_alb", _p2_r_alb))
+_P2_ROUTES.append(("p2_lb", _p2_r_lb))
+_P2_ADMIN_ROWS.append([_fp_btn("🏆 Referral leaderboard", "p2_alb")])
+
+
 def _p2_route(callback, data, uid, chat_id, mid):
     for prefix, fn in _P2_ROUTES:
         if data.startswith(prefix):
@@ -20174,6 +20909,8 @@ def main():
     threading.Thread(target=p2_sched_broadcast_monitor, daemon=True, name="SchedBroadcast").start()
     threading.Thread(target=p2_health_monitor,          daemon=True, name="HostHealth").start()
     threading.Thread(target=p2_deploy_queue_worker,     daemon=True, name="DeployQueue").start()
+    threading.Thread(target=p2_pause_monitor,           daemon=True, name="PlanPause").start()
+    threading.Thread(target=p2_lb_monitor,              daemon=True, name="Leaderboard").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
