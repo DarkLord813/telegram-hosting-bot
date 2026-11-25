@@ -3945,28 +3945,43 @@ def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
                    datetime.now().isoformat(), end_date.isoformat(), 'active'))
         conn.commit()
         conn.close()
+    except Exception as e:
+        print(f"❌ Activate premium error: {e}")
+        return False, 0
 
-        # 1. Stop all free-tier bots (no duplicates while premium runs)
-        stopped_free = stop_free_deployments_for_user(user_id)
-
-        # 2. Resume the most recent stopped/paused premium deployment
-        resumed_dep_id, premium_resumed = resume_premium_deployment(user_id, duration_days)
-
-        # 3. If no prior premium deployment exists, fall back to resuming paused ones
-        paused_resumed = 0
-        if not premium_resumed:
-            paused_resumed = resume_paused_deployments(user_id)
-
-        # 4. Deployments that were free-because-of-premium and capped to the previous
-        #    subscription end keep running for the renewed period.
-        extend_premium_deployments(user_id, end_date)
+    # The subscription is saved. Nothing below may report the purchase as failed
+    # (the buyer has already paid) - each follow-up step is isolated.
+    try:
+        stopped_free, resumed_dep_id, premium_resumed, paused_resumed = 0, None, False, 0
+        try:
+            # 1. Stop all free-tier bots (no duplicates while premium runs)
+            stopped_free = stop_free_deployments_for_user(user_id)
+        except Exception as e:
+            print(f"⚠️ premium: stop free bots failed: {e}")
+        try:
+            # 2. Resume the most recent stopped/paused premium deployment
+            resumed_dep_id, premium_resumed = resume_premium_deployment(user_id, duration_days)
+        except Exception as e:
+            print(f"⚠️ premium: resume failed: {e}")
+        try:
+            # 3. If no prior premium deployment exists, fall back to resuming paused ones
+            if not premium_resumed:
+                paused_resumed = resume_paused_deployments(user_id)
+        except Exception as e:
+            print(f"⚠️ premium: resume paused failed: {e}")
+        try:
+            # 4. Deployments that were free-because-of-premium and capped to the previous
+            #    subscription end keep running for the renewed period.
+            extend_premium_deployments(user_id, end_date)
+        except Exception as e:
+            print(f"⚠️ premium: extend failed: {e}")
 
         update_system_stats()
 
         user_info   = get_user_info(user_id)
         notify_admin(
             f"🎉 NEW PREMIUM!\n"
-            f"User: {user_info.get('first_name','?')} ({user_id})\n"
+            f"User: {escape_md_v1(user_info.get('first_name','?'))} ({user_id})\n"
             f"Plan: {plan.upper()} | Amount: {amount_stars}⭐\n"
             f"Premium dep resumed: #{resumed_dep_id} ({premium_resumed})\n"
             f"Free bots stopped: {stopped_free}")
@@ -3976,8 +3991,8 @@ def activate_premium(user_id, plan, amount_stars, amount_coins, duration_days):
         return True, total_resumed
 
     except Exception as e:
-        print(f"❌ Activate premium error: {e}")
-        return False, 0
+        print(f"⚠️ Activate premium follow-up error (premium itself is active): {e}")
+        return True, 0
 
 def resume_paused_deployments(user_id):
     try:
@@ -4770,12 +4785,12 @@ def submit_bug_report(user_id, username, first_name, message_text):
     conn.close()
 
     # Notify all admins
-    user_link = f"@{username}" if username else f"User `{user_id}`"
+    user_link = f"@{escape_md_v1(username)}" if username else f"User `{user_id}`"
     admin_text = (
         f"*🐛 NEW BUG REPORT #{report_id}*\n\n"
         f"From: {user_link} (`{user_id}`)\n"
         f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M')}`\n\n"
-        f"*Message:*\n{message_text}"
+        f"*Message:*\n{escape_md_v1(message_text)}"
     )
     admin_kb = {"inline_keyboard": [
         [{"text": f"✉️ Reply to #{report_id}", "callback_data": f"bug_reply_{report_id}"}],
@@ -4808,7 +4823,7 @@ def reply_to_bug_report(report_id, admin_id, reply_text):
     send_message(target_user_id,
         f"*✉️ REPLY TO YOUR BUG REPORT #{report_id}*\n\n"
         f"An admin has replied to your report:\n\n"
-        f"_{reply_text}_\n\n"
+        f"_{escape_md_v1(reply_text)}_\n\n"
         f"Thank you for helping us improve the service! 🙏",
         {"inline_keyboard": [[{"text": "🎫 Open a support ticket", "callback_data": "p2_tk"}],
                               [{"text": "🏠 Main Menu",            "callback_data": "main_menu"}]]})
@@ -4835,9 +4850,9 @@ def show_admin_bug_reports(chat_id, admin_id, message_id=None):
     buttons = []
     for rep_id, uid, uname, fname, msg, status, created in reports:
         icon   = "🔴" if status == "open" else "✅" if status == "replied" else "⚫"
-        who    = f"@{uname}" if uname else f"#{uid}"
+        who    = f"@{escape_md_v1(uname)}" if uname else f"#{uid}"
         dt     = datetime.fromisoformat(created).strftime("%d/%m %H:%M")
-        preview = msg[:40].replace("\n", " ") + ("…" if len(msg) > 40 else "")
+        preview = escape_md_v1(msg[:40].replace("\n", " ")) + ("…" if len(msg) > 40 else "")
         text  += f"{icon} *#{rep_id}* {who} — {dt}\n   _{preview}_\n\n"
         row_btns = [{"text": f"✉️ #{rep_id}", "callback_data": f"bug_reply_{rep_id}"},
                     {"text": f"✅ Close",      "callback_data": f"bug_close_{rep_id}"}]
@@ -5052,8 +5067,6 @@ def activate_resource_tier(user_id, key, period, stars_paid, coins_paid):
     cur = get_user_tier(user_id)
     base = cur[2] if cur and cur[2] > now else now
     end = base + timedelta(days=days)
-    db_execute("UPDATE users SET resource_tier_key=?, resource_tier_mb=?, resource_tier_expires=? WHERE user_id=?",
-               (key, mb, end.isoformat(), user_id))
     prow = db_execute("SELECT premium_plan FROM users WHERE user_id = ?", (user_id,), fetch='one')
     holds_yearly = bool(is_user_premium(user_id) and prow and (prow[0] or "").lower() == "yearly")
     if holds_yearly and period == "m":
@@ -5061,10 +5074,14 @@ def activate_resource_tier(user_id, key, period, stars_paid, coins_paid):
                    "VALUES (?,?,?,?,?,?,?)",
                    (user_id, f"tier_{key}_{period}", stars_paid, coins_paid, now.isoformat(), end.isoformat(), 'active'))
     else:
-        activate_premium(user_id, pname.lower(), stars_paid, coins_paid, days)
+        _ok, _ = activate_premium(user_id, pname.lower(), stars_paid, coins_paid, days)
+        if not _ok:
+            raise RuntimeError("premium could not be activated")
         db_execute("UPDATE subscriptions SET plan = ? WHERE subscription_id = "
                    "(SELECT MAX(subscription_id) FROM subscriptions WHERE user_id = ?)",
                    (f"tier_{key}_{period}", user_id))
+    db_execute("UPDATE users SET resource_tier_key=?, resource_tier_mb=?, resource_tier_expires=? WHERE user_id=?",
+               (key, mb, end.isoformat(), user_id))
     try:
         notify_admin(f"📈 RESOURCE PLAN\nUser: {user_id}\nPlan: {label} {pname} until {end.strftime('%Y-%m-%d')}\n"
                      f"Paid: {stars_paid}⭐ / {coins_paid}🪙")
@@ -5112,6 +5129,27 @@ def purchase_tier_stars(chat_id, user_id, key, period="m"):
         send_message(chat_id, f"❌ Failed to create invoice: {e}")
 
 
+def _spend_coins_atomic(user_id, cost, transaction_type, source):
+    """Deduct coins only if the balance still covers it (one SQL statement, so a double tap can't spend twice)."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    try:
+        cur = conn.execute("UPDATE users SET coins_balance = coins_balance - ?, total_coins_spent = total_coins_spent + ? "
+                           "WHERE user_id = ? AND coins_balance >= ?", (cost, cost, user_id, cost))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute("INSERT INTO coin_transactions (user_id, amount, transaction_type, source, reference_id, timestamp, status) "
+                     "VALUES (?,?,?,?,?,?,?)", (user_id, -cost, transaction_type, source, None,
+                                                datetime.now().isoformat(), 'completed'))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ spend coins error: {e}")
+        return False
+    finally:
+        conn.close()
+    
+
 def purchase_tier_coins(chat_id, user_id, key, period="m"):
     if period not in TIER_PERIODS:
         return
@@ -5130,8 +5168,16 @@ def purchase_tier_coins(chat_id, user_id, key, period="m"):
             {"inline_keyboard": [[{"text": f"⭐ Pay {stars}⭐", "callback_data": f"tier_stars_{key}_{period}"},
                                   {"text": "🎫 Redeem Code", "callback_data": "redeem_code"}]]})
         return
-    update_user_coins(user_id, -cost, "resource_tier", f"tier_{key}_{period}")
-    end = activate_resource_tier(user_id, key, period, stars, cost)
+    if not _spend_coins_atomic(user_id, cost, "resource_tier", f"tier_{key}_{period}"):
+        send_message(chat_id, "❌ *INSUFFICIENT COINS*\n\nYour balance changed - please check it and try again.")
+        return
+    try:
+        end = activate_resource_tier(user_id, key, period, stars, cost)
+    except Exception as e:
+        print(f"❌ tier activation failed, refunding {cost} coins to {user_id}: {e}")
+        update_user_coins(user_id, cost, "refund", f"tier_{key}_{period}_failed")
+        send_message(chat_id, f"❌ Could not activate the plan. Your `{cost}🪙` were refunded - please try again.")
+        return
     apply_discount_cashback(user_id, cost)
     send_message(chat_id,
         f"✅ *{label} {pname.upper()} PLAN ACTIVE*\n\n💾 Guaranteed: `{label}`\n📅 Until: `{end.strftime('%Y-%m-%d')}`\n"
@@ -5150,8 +5196,12 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
     balances = get_user_balances(user_id)
     
     if balances['coins'] >= cost_coins:
-        update_user_coins(user_id, -cost_coins, "premium_subscription", f"plan_{plan}")
+        if not _spend_coins_atomic(user_id, cost_coins, "premium_subscription", f"plan_{plan}"):
+            send_message(chat_id, "❌ *INSUFFICIENT COINS*\n\nYour balance changed - please check it and try again.")
+            return
         success, resumed = activate_premium(user_id, plan, cost_coins // STARS_PER_COIN, cost_coins, duration_days)
+        if not success:
+            update_user_coins(user_id, cost_coins, "refund", f"plan_{plan}_failed")
         
         if success:
             apply_discount_cashback(user_id, cost_coins)
@@ -5164,7 +5214,7 @@ def purchase_premium_coins(chat_id, user_id, plan, duration_days, cost_coins):
                 f"Thank you! 🙏",
                 {"inline_keyboard": [[{"text": "🏠 Main Menu", "callback_data": "main_menu"}]]})
         else:
-            send_message(chat_id, "❌ Failed to activate premium.")
+            send_message(chat_id, "❌ Failed to activate premium. Your coins were refunded.")
     else:
         send_message(chat_id,
             f"❌ *INSUFFICIENT COINS*\n\nRequired: `{cost_coins}🪙`\nYour balance: `{balances['coins']}🪙`\n\nUse redeem codes or pay with Stars!",
@@ -9388,6 +9438,10 @@ def abuse_guard_tick(now_ts=None, cpu_probe=None):
         _abuse_state.pop(gone, None)
     for kind, dep_id, uid in actions:
         try:
+            abuse_record_spike(dep_id, uid, kind)
+        except Exception as e:
+            print(f"⚠️ abuse spike log: {e}")
+        try:
             if kind == "warn":
                 if not notif_allows(uid, "usage"):
                     continue
@@ -10010,6 +10064,8 @@ def get_main_menu(user_id):
         badge = f" ({open_reports} open)" if open_reports else ""
         keyboard["inline_keyboard"].append(
             [{"text": f"🔧 Admin Panel{badge}", "callback_data": "admin_panel"}])
+    elif is_staff(user_id):
+        keyboard["inline_keyboard"].append([{"text": "🛠 Staff Panel", "callback_data": "p2_sf"}])
 
     return keyboard
 
@@ -10897,7 +10953,7 @@ def admin_subscriptions(chat_id, message_id):
             start_short = start_date[:10] if start_date else "Unknown"
             end_short = end_date[:10] if end_date else "Unknown"
             status_icon = "✅" if status == "active" else "❌"
-            text += f"• #{sub_id} - {name or uid}\n"
+            text += f"• #{sub_id} - {escape_md_v1(str(name or uid))}\n"
             text += f"  Plan: {plan.upper()} ({stars}⭐) | {status_icon}\n"
             text += f"  {start_short} → {end_short}\n\n"
     
@@ -11096,7 +11152,7 @@ def confirm_target_user(admin_id, chat_id, message_id):
     
     edit_message(chat_id, message_id,
         f"*🪙 ADD COINS*\n\n"
-        f"Target user: `{target_user_id}` ({first_name})\n"
+        f"Target user: `{target_user_id}` ({escape_md_v1(first_name)})\n"
         f"Current balance: `{get_user_balances(target_user_id)['coins']}🪙`\n\n"
         f"Enter the amount of coins to add using the number pad below:\n\n"
         f"Amount: `0` 🪙",
@@ -11124,7 +11180,7 @@ def update_coin_amount_display(admin_id, digit, chat_id, message_id):
         user = c.fetchone()
         conn.close()
         first_name = user[0] if user else "User"
-        target_line = f"Target user: `{target_user_id}` ({first_name})\n"
+        target_line = f"Target user: `{target_user_id}` ({escape_md_v1(first_name)})\n"
         balance_line = f"Current balance: `{get_user_balances(targets[0])['coins']}🪙`\n\n"
     else:
         target_line = f"Target: *{len(targets)} users*\n"
@@ -11211,10 +11267,10 @@ def process_coin_preset(admin_id, preset_amount, chat_id, message_id):
     
     if len(targets) == 1:
         balance_line = f"Current balance: `{get_user_balances(targets[0])['coins']}🪙`\n\n"
-        target_line = f"Target user: `{target_user_id}` ({first_name})\n"
+        target_line = f"Target user: `{target_user_id}` ({escape_md_v1(first_name)})\n"
     else:
         balance_line = ""
-        target_line = f"Target: *{first_name}*\n"
+        target_line = f"Target: *{escape_md_v1(first_name)}*\n"
 
     edit_message(chat_id, message_id,
         f"*🪙 ADD COINS*\n\n"
@@ -11549,6 +11605,10 @@ BROADCAST_AUDIENCES = {
     "running":  "🟢 Users with a running bot",
     "expiring": "⏰ Bots expiring within 72h",
     "recent":   "🕒 Active in the last 7 days",
+    "inactive": "😴 Inactive for 30+ days",
+    "crashed":  "💥 Users with a crashed bot",
+    "nobots":   "🆕 Joined but never deployed",
+    "lapsed":   "⌛ Premium expired (win-back)",
 }
 _broadcast_audience = {}          # admin_id -> audience key chosen for the broadcast being composed
 
@@ -11567,6 +11627,13 @@ def broadcast_audience_ids(key="all"):
         "expiring": ("SELECT DISTINCT user_id FROM deployments WHERE status = 'active' AND expire_time IS NOT NULL "
                      "AND expire_time > ? AND expire_time <= ?", (nowi, (now + timedelta(hours=72)).isoformat())),
         "recent":   ("SELECT user_id FROM users WHERE last_active > ?", ((now - timedelta(days=7)).isoformat(),)),
+        "inactive": ("SELECT user_id FROM users WHERE user_id != 0 AND (last_active IS NULL OR last_active < ?)",
+                     ((now - timedelta(days=30)).isoformat(),)),
+        "crashed":  ("SELECT DISTINCT user_id FROM deployments WHERE status IN ('crashed','failed','error')", ()),
+        "nobots":   ("SELECT user_id FROM users WHERE user_id != 0 AND user_id NOT IN "
+                     "(SELECT DISTINCT user_id FROM deployments WHERE user_id IS NOT NULL)", ()),
+        "lapsed":   ("SELECT user_id FROM users WHERE premium_expires IS NOT NULL AND premium_expires < ? "
+                     "AND NOT (resource_tier_mb > 0 AND resource_tier_expires > ?)", (nowi, nowi)),
     }
     q, params = queries.get(key, queries["all"])
     ids = [r[0] for r in (db_execute(q, params, fetch='all') or []) if r and r[0]]
@@ -11809,6 +11876,7 @@ def handle_callback(callback):
     touch_user(callback.get('from') or {})
     _fp_ctx.uid = (callback.get('from') or {}).get('id')
     _fp_ctx.shared = False
+    _fp_ctx.shared_level = None
     callback = _fp_share_remap(callback)
     if _fp_pre_callback(callback):
         return
@@ -12429,6 +12497,9 @@ def handle_callback(callback):
     
     if data.startswith("stop_deploy_"):
         dep_id = int(data.split("_")[2])
+        _own = _q("SELECT user_id FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one')
+        if not _own or (_own[0] != user_id and not is_admin(user_id)):
+            return                                   # defence in depth: only the owner (or an admin) may stop a bot
         stop_deployment(dep_id)
         view_deployment(chat_id, message_id, user_id, dep_id)
         return
@@ -13129,7 +13200,7 @@ def handle_callback(callback):
                     f"Reward per ref:  `{REFERRAL_REWARD_COINS}🪙`\n\n"
                     f"*Top Referrers:*\n")
             for i, (rid, uname, fname, cnt, earned) in enumerate(rows, 1):
-                who = f"@{uname}" if uname else (fname or f"#{rid}")
+                who = f"@{escape_md_v1(uname)}" if uname else escape_md_v1(fname or f"#{rid}")
                 text += f"{i}. {who} — `{cnt}` refs → `{earned}🪙`\n"
             if not rows:
                 text += "_No referrals yet_"
@@ -13207,6 +13278,14 @@ def set_user_step(user_id, step, **kwargs):
 
     updates = ["step = ?"]
     values  = [step]
+
+    # A "waiting for ..." flag must never outlive the prompt it belongs to: otherwise a later,
+    # unrelated message (an env variable, say) is swallowed as a redeem code.
+    if step is None:
+        for _f in ('waiting_for_env', 'waiting_for_reqs', 'waiting_for_redeem'):
+            kwargs.setdefault(_f, 0)
+    elif step != 'awaiting_redeem':
+        kwargs.setdefault('waiting_for_redeem', 0)
 
     for key in _KNOWN:
         if key in kwargs:
@@ -13440,7 +13519,8 @@ def handle_message(message):
             return
 
         # ── Redeem code ──────────────────────────────────────────────
-        if user_step.get('waiting_for_redeem') == 1 and text and not text.startswith('/'):
+        if (user_step.get('step') == 'awaiting_redeem' and user_step.get('waiting_for_redeem') == 1
+                and text and not text.startswith('/')):
             process_redeem(chat_id, user_id, text)
             return
 
@@ -13969,6 +14049,21 @@ def handle_successful_payment(message):
         invoice_payload = successful_payment.get('invoice_payload', '')
         
         print(f"💰 Payment: {total_amount}⭐ from user {user_id}")
+
+        # A payment is processed once: Telegram can re-deliver the update (restart, retry).
+        _charge = successful_payment.get('telegram_payment_charge_id') or invoice_payload
+        if invoice_payload.startswith(("tier_", "premium_")):
+            _c = sqlite3.connect(DATABASE_FILE)
+            try:
+                _c.execute("CREATE TABLE IF NOT EXISTS paid_charges (charge_id TEXT PRIMARY KEY, user_id INTEGER, payload TEXT, ts TEXT)")
+                _cur = _c.execute("INSERT OR IGNORE INTO paid_charges VALUES (?,?,?,?)",
+                                  (str(_charge), user_id, invoice_payload, datetime.now().isoformat()))
+                _c.commit()
+                if _cur.rowcount != 1:
+                    print(f"↩️ duplicate payment update ignored: {_charge}")
+                    return
+            finally:
+                _c.close()
         
         if invoice_payload.startswith("tier_"):
             tparts = invoice_payload.split("_")          # tier, <key>, <m|y>, <user_id>, <ts>
@@ -13982,7 +14077,14 @@ def handle_successful_payment(message):
             if total_amount < tier_price_stars(tkey, tper):
                 send_message(chat_id, "⚠️ Payment amount doesn't match the plan price. Please contact an admin.")
                 return
-            end = activate_resource_tier(user_id, tkey, tper, total_amount, total_amount * STARS_PER_COIN)
+            try:
+                end = activate_resource_tier(user_id, tkey, tper, total_amount, total_amount * STARS_PER_COIN)
+            except Exception as e:
+                print(f"❌ tier activation failed after Stars payment: {e}")
+                send_message(chat_id, "⚠️ Payment received but the plan could not be activated. An admin has been alerted - "
+                                      "you will not be charged twice.")
+                notify_admin(f"🚨 Stars payment {total_amount}⭐ from `{user_id}` ({invoice_payload}) was NOT activated: {e}")
+                return
             send_message(chat_id,
                 f"✅ *{RESOURCE_TIERS[tkey][1]} {TIER_PERIODS[tper][0].upper()} PLAN ACTIVE*\n\n💾 Guaranteed: `{RESOURCE_TIERS[tkey][1]}`\n"
                 f"📅 Until: `{end.strftime('%Y-%m-%d')}`\n\nThank you! 🙏",
@@ -13993,12 +14095,14 @@ def handle_successful_payment(message):
             parts = invoice_payload.split("_")
             plan = parts[1]
             
-            if plan == "monthly":
-                activate_premium(user_id, "monthly", total_amount, total_amount * STARS_PER_COIN, 30)
-                send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\nMonthly plan active for 30 days!\nThank you! 🙏")
-            elif plan == "yearly":
-                activate_premium(user_id, "yearly", total_amount, total_amount * STARS_PER_COIN, 365)
-                send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\nYearly plan active for 365 days!\nThank you! 🙏")
+            _days = {"monthly": 30, "yearly": 365}.get(plan)
+            if _days:
+                _ok, _ = activate_premium(user_id, plan, total_amount, total_amount * STARS_PER_COIN, _days)
+                if _ok:
+                    send_message(chat_id, f"✅ *PREMIUM ACTIVATED!*\n\n{plan.capitalize()} plan active for {_days} days!\nThank you! 🙏")
+                else:
+                    send_message(chat_id, "⚠️ Payment received but Premium could not be activated. An admin has been alerted.")
+                    notify_admin(f"🚨 Premium Stars payment {total_amount}⭐ from `{user_id}` was NOT activated.")
             return
 
         # ── Paid GitHub deployment ───────────────────────────────────
@@ -15773,7 +15877,7 @@ def _fp_share_remap(callback):
     """If a collaborator presses an allowed button for a bot shared with them, act as the owner for that call."""
     try:
         data = callback.get('data') or ''
-        m = _SHARE_ALLOWED.match(data)
+        m = _SHARE_ALLOWED.match(data[4:] if data.startswith("fpc:") else data)      # 'fpc:' = confirmed action
         if not m:
             return callback
         uid = callback['from']['id']
@@ -15783,9 +15887,14 @@ def _fp_share_remap(callback):
             return callback
         if not db_execute("SELECT 1 FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one'):
             return callback
+        lvl = share_level(dep_id, uid)
+        if lvl == "read" and _RO_ACTION.match(data[4:] if data.startswith("fpc:") else data):
+            audit(uid, "shared_denied", dep_id, data)
+            return dict(callback, data=f"p2_ro_{dep_id}")          # stays the collaborator: nothing runs as the owner
         cb = dict(callback)
         cb['from'] = dict(callback['from'], id=d["owner"])
         _fp_ctx.shared = True
+        _fp_ctx.shared_level = lvl
         audit(uid, "shared_action", dep_id, data)
         return cb
     except Exception:
@@ -15798,7 +15907,8 @@ def _fp_filter_shared_kb(keyboard, dep_id):
         return keyboard
     keep = []
     for row in keyboard["inline_keyboard"]:
-        row = [b for b in row if _SHARE_ALLOWED.match(b.get("callback_data", "")) and not b["callback_data"].startswith("edit_")]
+        row = [b for b in row if _SHARE_ALLOWED.match(b.get("callback_data", "")) and not b["callback_data"].startswith("edit_")
+               and not (getattr(_fp_ctx, 'shared_level', 'full') == 'read' and _RO_ACTION.match(b["callback_data"]))]
         if row:
             keep.append(row)
     keep.append([_fp_btn("🔎 Search logs", f"fp_logs_{dep_id}"), _fp_btn("📈 Usage", f"fp_usage_{dep_id}")])
@@ -15943,10 +16053,16 @@ def fp_share_menu(chat_id, message_id, uid, dep_id):
         return
     rows = db_execute("SELECT s.user_id, COALESCE(u.username, u.first_name, '') FROM dep_shares s "
                       "LEFT JOIN users u ON u.user_id = s.user_id WHERE s.deployment_id = ?", (dep_id,), fetch='all') or []
-    btns = [[_fp_btn(f"❌ {(n or '')[:14]} ({u})", f"fp_unshare_{dep_id}_{u}")] for u, n in rows]
-    edit_message(chat_id, message_id, f"*🤝 SHARE BOT #{dep_id}*\n\nCo-owners can view the bot, read its logs and usage, "
-                 f"and stop/restart it. They can't edit, delete or see your env vars.\n\nShared with: "
-                 f"`{len(rows)}`", _fp_kb(*btns, [_fp_btn("➕ Add by user ID", f"fp_shareadd_{dep_id}")],
+    btns = []
+    lines = []
+    for u, n in rows:
+        lv = share_level(dep_id, u) or "full"
+        lines.append(f"• `{u}` {(n or '')[:14]} — {_SL_LABEL[lv]}")
+        other = "full" if lv == "read" else "read"
+        btns.append([_fp_btn(f"❌ {(n or '')[:10]} ({u})", f"fp_unshare_{dep_id}_{u}"),
+                     _fp_btn(f"→ {_SL_LABEL[other]}", f"p2_shl_{dep_id}_{u}_{other}")])
+    edit_message(chat_id, message_id, f"*🤝 SHARE BOT #{dep_id}*\n\n👁 *Read-only:* {_SL_EXPLAIN['read']}\n🛠 *Full control:* {_SL_EXPLAIN['full']}\n\n"
+                 + ("\n".join(lines) + "\n" if lines else "_Not shared with anyone._\n"), _fp_kb(*btns, [_fp_btn("➕ Add by user ID", f"fp_shareadd_{dep_id}")],
                                           [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
 
 
@@ -15961,7 +16077,7 @@ def fp_versions_menu(chat_id, message_id, dep_id):
 def fp_shared_list(chat_id, message_id, uid):
     rows = db_execute("SELECT s.deployment_id, d.file_name, d.status FROM dep_shares s JOIN deployments d "
                       "ON d.deployment_id = s.deployment_id WHERE s.user_id = ?", (uid,), fetch='all') or []
-    btns = [[_fp_btn(f"{'🟢' if st == 'active' else '🔴'} #{i} · {display_filename(f)}"[:40], f"view_deploy_{i}")]
+    btns = [[_fp_btn(f"{'🟢' if st == 'active' else '🔴'} #{i} · {display_filename(f)}"[:34] + (" 👁" if share_level(i, uid) == "read" else ""), f"view_deploy_{i}")]
             for i, f, st in rows]
     edit_message(chat_id, message_id, "*🤝 SHARED WITH ME*\n\n" + ("" if rows else "Nobody has shared a bot with you yet."),
                  _fp_kb(*btns, [_fp_btn("🔙 More", "fp_more")]))
@@ -16212,6 +16328,7 @@ def _fp_route(callback, data, uid, chat_id, mid):
     elif cmd == "unshare" and len(p) > 3 and p[3].lstrip('-').isdigit():
         db_execute("DELETE FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, int(p[3])))
         audit(uid, "unshare", dep_id, p[3])
+        sec_log(uid, "collab_removed", f"user {p[3]} on bot #{dep_id}")
         fp_share_menu(chat_id, mid, uid, dep_id)
     elif cmd == "ver":
         fp_versions_menu(chat_id, mid, dep_id)
@@ -16299,12 +16416,11 @@ def _fp_text(message, user_step):
         d = _fp_dep(dep_id)
         if text.lstrip('-').isdigit() and db_execute("SELECT 1 FROM users WHERE user_id = ?", (int(text),), fetch='one') \
                 and int(text) != d["owner"] and not get_ban_info(int(text)):
-            db_execute("INSERT OR IGNORE INTO dep_shares (deployment_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
-                       (dep_id, int(text), uid, datetime.now().isoformat(timespec='seconds')))
-            audit(uid, "share", dep_id, text)
-            send_message(int(text), f"🤝 A bot (#{dep_id}) was shared with you. You can view it, read its logs/usage and "
-                                    f"restart it.", _fp_kb([_fp_btn("🤝 Shared with me", "fp_shared")]))
-            send_message(chat_id, "✅ Shared.", _fp_kb([_fp_btn("🤝 Sharing", f"fp_share_{dep_id}")]))
+            send_message(chat_id, f"Choose what user `{int(text)}` may do with bot #{dep_id}:\n\n👁 *Read-only* — {_SL_EXPLAIN['read']}\n\n"
+                                  f"🛠 *Full control* — {_SL_EXPLAIN['full']}",
+                         _fp_kb([_fp_btn("👁 Read-only", f"p2_shadd_{dep_id}_{int(text)}_read")],
+                                [_fp_btn("🛠 Full control", f"p2_shadd_{dep_id}_{int(text)}_full")],
+                                [_fp_btn("❌ Cancel", f"fp_share_{dep_id}")]))
         else:
             send_message(chat_id, "❌ No such user (they must have started this bot).",
                          _fp_kb([_fp_btn("🔁 Try again", f"fp_shareadd_{dep_id}")]))
@@ -16412,6 +16528,14 @@ def _p2_ensure():
             db_execute("ALTER TABLE payment_orders ADD COLUMN bonus INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            db_execute("ALTER TABLE dep_shares ADD COLUMN level TEXT DEFAULT 'full'")
+        except Exception:
+            pass
+        try:   # one-time clean-up of stale prompt flags left behind by older versions
+            db_execute("UPDATE users SET waiting_for_redeem = 0 WHERE COALESCE(step, '') != 'awaiting_redeem'")
+        except Exception:
+            pass
         _P2["init"] = True
 
 
@@ -16499,6 +16623,7 @@ def pin_check(uid, pin):
         _q("UPDATE user_pins SET fails = 0, locked_until = ? WHERE user_id = ?",
            ((datetime.now() + timedelta(minutes=PIN_LOCK_MIN)).isoformat(timespec='seconds'), uid))
         audit(uid, "pin_locked", uid)
+        sec_alert(uid, "pin_locked", f"{PIN_MAX_FAILS} wrong PIN attempts — PIN entry is locked for {PIN_LOCK_MIN} minutes.")
         return False, f"🔒 Too many wrong PINs. Locked for {PIN_LOCK_MIN} minutes."
     _q("UPDATE user_pins SET fails = ? WHERE user_id = ?", (fails, uid))
     return False, f"❌ Wrong PIN. {PIN_MAX_FAILS - fails} attempt(s) left."
@@ -18810,13 +18935,17 @@ def ma_handle_api(uid, method, path):
             r = _ma_dep_summary(d, uid)
             meta = _q("SELECT plan, start_time FROM deployments WHERE deployment_id = ?", (dep_id,), fetch='one') or (None, None)
             r.update({"plan": meta[0], "started": meta[1], "source": d["source"]})
-            r.update({"usage": _ma_series(dep_id), "logs": tail[-MA_TAIL_CHARS:], "can_control": r["status"] in ("active", "missing", "stopped", "crashed", "failed", "error")})
+            r.update({"usage": _ma_series(dep_id), "logs": tail[-MA_TAIL_CHARS:], "can_control": r["status"] in ("active", "missing", "stopped", "crashed", "failed", "error")
+                                                                  and (d["owner"] == uid or share_level(dep_id, uid) == "full")})
             return 200, r
         if action and method == "POST":
             if not _ma_rate_ok(uid, "act", 6):
                 return 429, {"error": "too many actions"}
             if d["status"] == "expired":
                 return 409, {"error": "expired"}
+            if d["owner"] != uid and share_level(dep_id, uid) != "full":
+                audit(uid, "shared_denied", dep_id, f"miniapp_{action}")
+                return 403, {"error": "read-only access"}
 
             def run():
                 try:
@@ -20474,6 +20603,756 @@ _P2_ROUTES.append(("p2_lb", _p2_r_lb))
 _P2_ADMIN_ROWS.append([_fp_btn("🏆 Referral leaderboard", "p2_alb")])
 
 
+# ---------------------------------------------------------------- UPGRADE 13: security activity alerts
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS sec_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts TEXT, kind TEXT, detail TEXT)")
+_SA_RECENT = {}
+_SA_LABEL = {"pin_changed": "🔑 PIN changed", "pin_reset": "🔑 PIN reset by an admin", "pin_locked": "🔒 PIN locked after wrong attempts",
+             "collab_added": "🤝 Collaborator added", "collab_removed": "🤝 Collaborator removed"}
+
+
+def sec_log(uid, kind, detail=""):
+    try:
+        _q("INSERT INTO sec_events (user_id, ts, kind, detail) VALUES (?,?,?,?)", (uid, _now(), kind, str(detail)[:200]))
+    except Exception as e:
+        print(f"⚠️ sec_log: {e}")
+
+
+def sec_alert(uid, kind, headline, detail="", rows=None):
+    """Record the event and message the account owner (always sent — not affected by notification preferences).
+    The same alert is not repeated within a minute."""
+    sec_log(uid, kind, detail or headline)
+    key = (uid, kind, detail)
+    now = time.time()
+    if now - _SA_RECENT.get(key, 0) < 60:
+        return False
+    _SA_RECENT[key] = now
+    kb = list(rows or []) + [[_fp_btn("🔑 Change PIN", "p2_pinchg"), _fp_btn("🎫 Support", "p2_tk")], [_fp_btn("🛡 Security activity", "p2_sa")]]
+    try:
+        send_message(uid, f"🛡 *Security alert*\n\n{headline}\n🕒 `{_now().replace('T', ' ')}` (server time)\n\n"
+                          "If this was you, nothing to do. If not, change your PIN now and contact support.", _fp_kb(*kb))
+        return True
+    except Exception as e:
+        print(f"⚠️ sec_alert: {e}")
+        return False
+
+
+_sa_orig_pin_set = pin_set
+_sa_orig_pin_reset = pin_reset
+
+
+def pin_set(uid, pin):                                   # noqa: F811 - first-time setup is silent; a change alerts
+    existed = pin_is_set(uid)
+    _sa_orig_pin_set(uid, pin)
+    if existed:
+        sec_alert(uid, "pin_changed", "Your PIN was *changed*.")
+
+
+def pin_reset(uid):                                      # noqa: F811
+    existed = pin_is_set(uid)
+    _sa_orig_pin_reset(uid)
+    if existed:
+        sec_alert(uid, "pin_reset", "Your PIN was *reset by an administrator*. It is back to the default `0000` — "
+                                    "set a new one before you deploy again.")
+
+
+def _p2_r_sa(callback, data, uid, chat_id, mid):
+    if data != "p2_sa":
+        return False
+    rows = _q("SELECT ts, kind, detail FROM sec_events WHERE user_id = ? ORDER BY id DESC LIMIT 12", (uid,), fetch='all') or []
+    lines = ["*🛡 SECURITY ACTIVITY*", "", "Recent sensitive changes on your account (server time):", ""]
+    for ts, kind, detail in rows:
+        lines.append(f"• `{ts[:16].replace('T', ' ')}` — {_SA_LABEL.get(kind, kind)}" + (f"\n   _{_tk_esc(detail[:80])}_" if kind.startswith("collab") else ""))
+    if not rows:
+        lines.append("_Nothing yet._")
+    lines.append("\nYou're alerted instantly about PIN changes/resets, PIN lockouts and new collaborators.")
+    edit_message(chat_id, mid, "\n".join(lines), _fp_kb([_fp_btn("🔑 Change PIN", "p2_pinchg")], [_fp_btn("🔙 More", "fp_more")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_sa", _p2_r_sa))
+_P2_MORE_ROWS.append([_fp_btn("🛡 Security activity", "p2_sa")])
+
+
+# ---------------------------------------------------------------- UPGRADE 14: collaborator permission levels
+_SL_LABEL = {"read": "👁 Read-only", "full": "🛠 Full control"}
+_SL_EXPLAIN = {"read": "can view the bot, its logs and usage. Cannot restart or stop it.",
+               "full": "can also restart and stop the bot. Can never edit files, see variables, delete it or share it."}
+_RO_ACTION = re.compile(r'^(restart_deploy|stop_deploy)_(\d+)$')
+
+
+def share_level(dep_id, uid):
+    """'read' | 'full' for a collaborator, None when the bot isn't shared with them (rows from before levels = full)."""
+    try:
+        r = _q("SELECT COALESCE(level, 'full') FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one')
+    except Exception:
+        r = _q("SELECT 1 FROM dep_shares WHERE deployment_id = ? AND user_id = ?", (dep_id, uid), fetch='one')
+        return "full" if r else None
+    return (r[0] if r[0] in ("read", "full") else "full") if r else None
+
+
+def _share_candidate_ok(owner_uid, dep_id, target):
+    d = _fp_dep(dep_id)
+    return bool(d and d["owner"] == owner_uid and target != owner_uid
+                and _q("SELECT 1 FROM users WHERE user_id = ?", (target,), fetch='one') and not get_ban_info(target))
+
+
+def share_add(owner_uid, dep_id, target, level):
+    """-> (ok, message). Adds or updates a collaborator at the given level."""
+    if level not in ("read", "full") or not _share_candidate_ok(owner_uid, dep_id, target):
+        return False, "No such user, or you don't own this bot."
+    existed = share_level(dep_id, target)
+    _q("INSERT INTO dep_shares (deployment_id, user_id, added_by, added_at, level) VALUES (?,?,?,?,?) "
+       "ON CONFLICT(deployment_id, user_id) DO UPDATE SET level = excluded.level",
+       (dep_id, target, owner_uid, datetime.now().isoformat(timespec='seconds'), level))
+    audit(owner_uid, "share" if not existed else "share_level", dep_id, f"{target}:{level}")
+    kind = "collab_added" if not existed else "collab_level"
+    sec_alert(owner_uid, kind, (f"User `{target}` was given *{_SL_LABEL[level]}* access to your bot #{dep_id}." if not existed
+                                else f"User `{target}`'s access to bot #{dep_id} is now *{_SL_LABEL[level]}*."),
+              detail=f"user {target} on bot #{dep_id}: {level}", rows=[[_fp_btn("❌ Remove access", f"fp_unshare_{dep_id}_{target}")]])
+    try:
+        send_message(target, f"🤝 Bot #{dep_id} was shared with you — *{_SL_LABEL[level]}*: you {_SL_EXPLAIN[level]}",
+                     _fp_kb([_fp_btn("🤝 Shared with me", "fp_shared")]))
+    except Exception:
+        pass
+    return True, f"✅ User `{target}` now has {_SL_LABEL[level]} access."
+
+
+def _p2_r_sh(callback, data, uid, chat_id, mid):
+    m = re.match(r"^p2_(ro|shadd|shl)(?:_(\d+))?(?:_(-?\d+))?(?:_(read|full))?$", data)
+    if not m:
+        return False
+    kind, dep_id, target, level = m.group(1), int(m.group(2) or 0), int(m.group(3) or 0), m.group(4)
+    if kind == "ro":
+        edit_message(chat_id, mid, "👁 You have *read-only* access to this bot, so you can't restart or stop it.\n"
+                                   "Ask the owner for Full control if you need that.", _fp_kb([_fp_btn("🤝 Shared with me", "fp_shared")]))
+        return True
+    if kind == "shadd" and level:
+        ok_, msg = share_add(uid, dep_id, target, level)
+        edit_message(chat_id, mid, msg, _fp_kb([_fp_btn("🤝 Sharing", f"fp_share_{dep_id}")]))
+        return True
+    if kind == "shl" and level:                              # change an existing collaborator's level
+        if share_level(dep_id, target) is None or not _share_candidate_ok(uid, dep_id, target):
+            return True
+        ok_, msg = share_add(uid, dep_id, target, level)
+        fp_share_menu(chat_id, mid, uid, dep_id)
+        return True
+    return False
+
+
+_P2_ROUTES.append(("p2_ro", _p2_r_sh))
+_P2_ROUTES.append(("p2_shadd", _p2_r_sh))
+_P2_ROUTES.append(("p2_shl", _p2_r_sh))
+_SA_LABEL["collab_level"] = "🤝 Collaborator access changed"
+
+
+# ---------------------------------------------------------------- ABUSE FLAGS (admin review)
+ABUSE_BOTS_N       = int(os.environ.get("ABUSE_BOTS_N", 5))           # this many new bots ...
+ABUSE_BOTS_MINUTES = int(os.environ.get("ABUSE_BOTS_MINUTES", 30))    # ... within this window -> flag
+ABUSE_SPIKES_N     = int(os.environ.get("ABUSE_SPIKES_N", 3))         # this many CPU spikes on one bot ...
+ABUSE_SPIKES_HOURS = int(os.environ.get("ABUSE_SPIKES_HOURS", 24))    # ... within this window -> flag
+ABUSE_FLAG_COOL_H  = int(os.environ.get("ABUSE_FLAG_COOLDOWN_H", 24)) # same flag is not re-raised inside this
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS abuse_flags (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, dep_id INTEGER, "
+               "kind TEXT, detail TEXT, ts TEXT, status TEXT DEFAULT 'open', reviewed_by INTEGER, reviewed_at TEXT)")
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS abuse_spikes (id INTEGER PRIMARY KEY AUTOINCREMENT, dep_id INTEGER, user_id INTEGER, ts TEXT, kind TEXT)")
+_AF_KIND = {"burst": "⚡ Many bots created quickly", "cpu": "🔥 Repeated CPU spikes"}
+
+
+def abuse_flag(uid, kind, detail, dep_id=None, now=None):
+    """Open a review flag (once per user/kind/bot per cool-down) and alert the admins. -> flag id or None."""
+    now = now or datetime.now()
+    since = (now - timedelta(hours=ABUSE_FLAG_COOL_H)).isoformat(timespec='seconds')
+    if _q("SELECT 1 FROM abuse_flags WHERE user_id=? AND kind=? AND COALESCE(dep_id,0)=? AND ts>=? "
+          "AND status IN ('open','dismissed')", (uid, kind, dep_id or 0, since), "one"):
+        return None
+    _q("INSERT INTO abuse_flags (user_id, dep_id, kind, detail, ts) VALUES (?,?,?,?,?)",
+       (uid, dep_id, kind, str(detail)[:300], now.isoformat(timespec='seconds')))
+    row = _q("SELECT MAX(id) FROM abuse_flags WHERE user_id=?", (uid,), "one")
+    fid = row[0] if row else None
+    try:
+        for a in ADMIN_IDS:
+            send_message(a, f"🚩 *Abuse flag #{fid}*\n{_AF_KIND.get(kind, kind)}\nUser: `{uid}`"
+                            + (f" · bot #{dep_id}" if dep_id else "") + f"\n{_tk_esc(str(detail))}",
+                         _fp_kb([_fp_btn("🔎 Review", "p2_abz")]))
+    except Exception as e:
+        print(f"⚠️ abuse flag alert: {e}")
+    return fid
+
+
+def abuse_record_spike(dep_id, uid, kind="warn", now=None):
+    """Called by the CPU guard whenever it warns about / stops a bot. Flags the user after repeated spikes."""
+    now = now or datetime.now()
+    _q("INSERT INTO abuse_spikes (dep_id, user_id, ts, kind) VALUES (?,?,?,?)",
+       (dep_id, uid, now.isoformat(timespec='seconds'), kind))
+    since = (now - timedelta(hours=ABUSE_SPIKES_HOURS)).isoformat(timespec='seconds')
+    r = _q("SELECT COUNT(*) FROM abuse_spikes WHERE dep_id=? AND ts>=?", (dep_id, since), "one")
+    n = r[0] if r else 0
+    if n >= ABUSE_SPIKES_N:
+        return abuse_flag(uid, "cpu", f"Bot #{dep_id}: {n} CPU spikes in {ABUSE_SPIKES_HOURS}h", dep_id, now)
+    return None
+
+
+def abuse_scan_creation(now=None):
+    """Flag non-admin accounts that created >= ABUSE_BOTS_N bots inside ABUSE_BOTS_MINUTES. -> list of flag ids."""
+    now = now or datetime.now()
+    since = now - timedelta(minutes=ABUSE_BOTS_MINUTES)
+    by = {}
+    for uid, st in (_q("SELECT user_id, start_time FROM deployments WHERE start_time IS NOT NULL", (), "all") or []):
+        try:
+            if datetime.fromisoformat(st) >= since:
+                by.setdefault(uid, []).append(st)
+        except Exception:
+            continue
+    out = []
+    for uid, lst in by.items():
+        if len(lst) >= ABUSE_BOTS_N and not is_admin(uid):
+            f = abuse_flag(uid, "burst", f"{len(lst)} bots created in {ABUSE_BOTS_MINUTES} min", None, now)
+            if f:
+                out.append(f)
+    _q("DELETE FROM abuse_spikes WHERE ts < ?", ((now - timedelta(days=7)).isoformat(timespec='seconds'),))
+    return out
+
+
+def p2_abuse_monitor():
+    sleep(200)
+    print("✅ Abuse-flag monitor started")
+    while True:
+        try:
+            abuse_scan_creation()
+        except Exception as e:
+            print(f"⚠️ abuse monitor: {e}")
+        sleep(120)
+
+
+def _abz_screen():
+    rows = _q("SELECT id, user_id, dep_id, kind, detail, ts FROM abuse_flags WHERE status='open' ORDER BY id DESC LIMIT 6", (), "all") or []
+    total = (_q("SELECT COUNT(*) FROM abuse_flags WHERE status='open'", (), "one") or [0])[0]
+    if not rows:
+        return "🚩 *ABUSE FLAGS*\n\n✅ Nothing waiting for review.", _fp_kb([_fp_btn("🔄 Refresh", "p2_abz")], [_fp_btn("🔙 Admin Panel", "admin_panel")])
+    t = f"🚩 *ABUSE FLAGS* — {total} open\n"
+    kb = []
+    for fid, u, d, k, det, ts in rows:
+        t += f"\n*#{fid}* {_AF_KIND.get(k, k)}\n👤 `{u}`" + (f" · bot #{d}" if d else "") + f"\n{_tk_esc(det or '')}\n🕒 `{(ts or '')[:16].replace('T', ' ')}`\n"
+        kb.append([_fp_btn(f"✔ Dismiss #{fid}", f"p2_abzd_{fid}"), _fp_btn("⏹ Stop bots", f"p2_abzs_{fid}"),
+                   _fp_btn("🚫 Ban", f"p2_abzb_{fid}")])
+    kb.append([_fp_btn("🔄 Refresh", "p2_abz")])
+    kb.append([_fp_btn("🔙 Admin Panel", "admin_panel")])
+    return t, _fp_kb(*kb)
+
+
+def _abz_close(fid, admin, status):
+    """Atomically close an open flag so two admins can't act twice. -> (user_id, dep_id) or None."""
+    r = _q("SELECT user_id, dep_id FROM abuse_flags WHERE id=?", (fid,), "one")
+    if not r:
+        return None
+    con = sqlite3.connect(DATABASE_FILE)
+    try:
+        cur = con.execute("UPDATE abuse_flags SET status=?, reviewed_by=?, reviewed_at=? WHERE id=? AND status='open'",
+                          (status, admin, _now(), fid))
+        con.commit()
+        return r if cur.rowcount == 1 else None
+    finally:
+        con.close()
+
+
+def _p2_r_abz(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    m = re.match(r"p2_abz([dsb]c?)_(\d+)$", data)
+    if m:
+        act, fid = m.group(1), int(m.group(2))
+        row = _q("SELECT user_id, status FROM abuse_flags WHERE id=?", (fid,), "one")
+        if not row or row[1] != "open":
+            answer_callback(callback["id"], "Already handled", True)
+        elif act == "b":                                   # confirm step before banning
+            edit_message(chat_id, mid, f"🚫 *Ban user `{row[0]}`?*\n\nAll their bots are stopped and they can't use the bot.",
+                         _fp_kb([_fp_btn("✅ Yes, ban", f"p2_abzbc_{fid}")], [_fp_btn("↩️ Cancel", "p2_abz")]))
+            return True
+        else:
+            tgt = row[0]
+            if act == "d":
+                if _abz_close(fid, uid, "dismissed"):
+                    audit(uid, "abuse_dismiss", tgt, f"flag {fid}")
+                    answer_callback(callback["id"], "Dismissed")
+            elif act == "s":
+                if _abz_close(fid, uid, "stopped"):
+                    n = 0
+                    for (d,) in (_q("SELECT deployment_id FROM deployments WHERE user_id=? AND status='active'", (tgt,), "all") or []):
+                        try:
+                            stop_deployment(d)
+                            n += 1
+                        except Exception as e:
+                            print(f"⚠️ abuse stop #{d}: {e}")
+                    audit(uid, "abuse_stop", tgt, f"flag {fid}: {n} bot(s)")
+                    try:
+                        send_message(tgt, "⏹ *Your bots were stopped for review*\n\nOur system flagged unusual usage on your account. "
+                                          "Contact support if you think this is a mistake.",
+                                     _fp_kb([_fp_btn("🎫 Support", "p2_tk")]))
+                    except Exception:
+                        pass
+                    answer_callback(callback["id"], f"Stopped {n} bot(s)", True)
+            elif act == "bc":
+                if _abz_close(fid, uid, "banned"):
+                    ok, msg = ban_user(uid, tgt, "Abuse detection (admin review)")
+                    audit(uid, "abuse_ban", tgt, f"flag {fid}: {ok}")
+                    answer_callback(callback["id"], "Banned" if ok else str(msg)[:150], True)
+    text, kb = _abz_screen()
+    edit_message(chat_id, mid, text, kb)
+    return True
+
+
+_P2_ROUTES.append(("p2_abz", _p2_r_abz))
+_P2_ADMIN_ROWS.append([_fp_btn("🚩 Abuse flags", "p2_abz")])
+
+
+# ---------------------------------------------------------------- DAILY ADMIN SUMMARY
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", 8))        # in the admin's clock
+
+
+def daily_summary_data(now=None):
+    """Numbers for the last 24 hours. Pure reads - safe to call any time."""
+    now = now or datetime.now()
+    since = (now - timedelta(hours=24)).isoformat()
+    one = lambda q, p=(): (_q(q, p, "one") or [0])[0] or 0
+    d = {
+        "new_users": one("SELECT COUNT(*) FROM users WHERE join_date >= ?", (since,)),
+        "active_users": one("SELECT COUNT(*) FROM users WHERE last_active >= ?", (since,)),
+        "total_users": one("SELECT COUNT(*) FROM users"),
+        "new_bots": one("SELECT COUNT(*) FROM deployments WHERE start_time >= ?", (since,)),
+        "plans_sold": one("SELECT COUNT(*) FROM subscriptions WHERE start_date >= ?", (since,)),
+        "tickets_open": one("SELECT COUNT(*) FROM tickets WHERE status = 'open'"),
+        "abuse_open": one("SELECT COUNT(*) FROM abuse_flags WHERE status = 'open'"),
+        "premium_expiring": one("SELECT COUNT(*) FROM users WHERE is_premium = 1 AND premium_expires > ? AND premium_expires <= ?",
+                                (now.isoformat(), (now + timedelta(days=3)).isoformat())),
+    }
+    rows = _q("SELECT status, COUNT(*) FROM deployments GROUP BY status", (), "all") or []
+    st = {k: v for k, v in rows}
+    try:
+        nmiss = len(missing_active_ids())
+    except Exception:
+        nmiss = 0
+    d["running"] = max(0, st.get("active", 0) - nmiss)
+    d["down"] = sum(v for k, v in st.items() if k in ("crashed", "failed", "error")) + nmiss
+    money, orders = {}, 0
+    cutoff = sb_server_to_admin(now) - timedelta(hours=24)
+    for o in _rev_orders(cutoff):
+        orders += 1
+        money[o["currency"]] = money.get(o["currency"], 0.0) + o["amount"]
+    d["orders"], d["money"] = orders, money
+    try:
+        d["problems"] = [t for _, t in health_problems()]
+    except Exception:
+        d["problems"] = []
+    return d
+
+
+def daily_summary_text(now=None):
+    d = daily_summary_data(now)
+    day = sb_server_to_admin(now or datetime.now()).strftime("%a %d %b")
+    money = " · ".join(_fmt_money(v, c) for c, v in sorted(d["money"].items())) or "no sales"
+    t = (f"☀️ *DAILY SUMMARY* — {day}\n_last 24 hours_\n\n"
+         f"👥 New users: `{d['new_users']}` · active: `{d['active_users']}` · total: `{d['total_users']}`\n"
+         f"🤖 Bots created: `{d['new_bots']}` · running now: `{d['running']}` · down: `{d['down']}`\n"
+         f"💰 Top-ups: `{d['orders']}` — {money}\n"
+         f"📈 Plans sold: `{d['plans_sold']}` · Premium expiring in 3 days: `{d['premium_expiring']}`\n"
+         f"🎫 Open tickets: `{d['tickets_open']}` · 🚩 Abuse flags: `{d['abuse_open']}`\n")
+    if d["problems"]:
+        t += "\n🚨 *Needs attention*\n" + "\n".join(f"• {_tk_esc(p)}" for p in d["problems"]) + "\n"
+    else:
+        t += "\n✅ Host health: all good"
+    return t
+
+
+def daily_summary_send(now=None):
+    text = daily_summary_text(now)
+    kb = _fp_kb([_fp_btn("🩺 Health", "p2_ah"), _fp_btn("🚩 Abuse", "p2_abz")], [_fp_btn("⚙️ Summary settings", "p2_ds")])
+    n = 0
+    for a in list(ADMIN_IDS):
+        try:
+            send_message(a, text, kb)
+            n += 1
+        except Exception as e:
+            print(f"⚠️ daily summary to {a}: {e}")
+    return n
+
+
+def daily_summary_hour():
+    try:
+        return max(0, min(23, int(kv_get("daily_summary_hour", str(DAILY_SUMMARY_HOUR)))))
+    except Exception:
+        return DAILY_SUMMARY_HOUR
+
+
+def daily_summary_tick(now=None):
+    """Send once per admin-clock day at the chosen hour (survives restarts via kv). -> True when sent."""
+    if kv_get("daily_summary", "1") == "0":
+        return False
+    now = now or datetime.now()
+    a = sb_server_to_admin(now)
+    today = a.strftime("%Y-%m-%d")
+    if a.hour < daily_summary_hour() or kv_get("daily_summary_last", "") == today:
+        return False
+    kv_set("daily_summary_last", today)            # claim first: a crash mid-send must not repeat it every minute
+    daily_summary_send(now)
+    return True
+
+
+def p2_summary_monitor():
+    sleep(180)
+    print("✅ Daily-summary monitor started")
+    while True:
+        try:
+            daily_summary_tick()
+        except Exception as e:
+            print(f"⚠️ summary monitor: {e}")
+        sleep(60)
+
+
+def _p2_r_ds(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_dstog":
+        kv_set("daily_summary", "0" if kv_get("daily_summary", "1") != "0" else "1")
+    elif data in ("p2_dsh_up", "p2_dsh_dn"):
+        kv_set("daily_summary_hour", str((daily_summary_hour() + (1 if data.endswith("up") else -1)) % 24))
+    elif data == "p2_dsnow":
+        daily_summary_send()
+        answer_callback(callback["id"], "Sent")
+        return True
+    on = kv_get("daily_summary", "1") != "0"
+    h = daily_summary_hour()
+    edit_message(chat_id, mid, f"*☀️ DAILY SUMMARY*\n\nA short report sent to every admin once a day.\n\n"
+                               f"Status: *{'ON' if on else 'OFF'}*\nSent at: `{h:02d}:00` (your clock)",
+                 _fp_kb([_fp_btn(f"🔔 {'Turn OFF' if on else 'Turn ON'}", "p2_dstog")],
+                        [_fp_btn("⏪ Earlier", "p2_dsh_dn"), _fp_btn(f"{h:02d}:00", "p2_ds"), _fp_btn("Later ⏩", "p2_dsh_up")],
+                        [_fp_btn("📨 Send it now", "p2_dsnow")],
+                        [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_ds", _p2_r_ds))
+_P2_ADMIN_ROWS.append([_fp_btn("☀️ Daily summary", "p2_ds")])
+
+
+# ---------------------------------------------------------------- SUPPORT STAFF ROLE
+# Staff can work the support queue and look users up (read-only). They cannot see balances, ban, change
+# limits, reset PINs, restart bots, touch payments or open the admin panel. Only admins manage the list.
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS staff (user_id INTEGER PRIMARY KEY, added_by INTEGER, ts TEXT)")
+_SF_CTX = {}
+
+
+def staff_ids():
+    return [r[0] for r in (_q("SELECT user_id FROM staff ORDER BY ts", (), "all") or []) if not is_admin(r[0])]
+
+
+def is_staff(uid):
+    try:
+        return (not is_admin(uid)) and bool(_q("SELECT 1 FROM staff WHERE user_id = ?", (int(uid),), "one"))
+    except Exception:
+        return False
+
+
+def staff_add(admin, uid):
+    uid = int(uid)
+    if is_admin(uid):
+        return False, "That account is already an admin."
+    if not _q("SELECT 1 FROM users WHERE user_id = ?", (uid,), "one"):
+        return False, "No user with that ID — they must have started the bot first."
+    if is_banned(uid):
+        return False, "That user is banned."
+    _q("INSERT OR REPLACE INTO staff (user_id, added_by, ts) VALUES (?,?,?)", (uid, int(admin), _now()))
+    audit(admin, "staff_add", uid)
+    try:
+        send_message(uid, "🛠 *You're now on the support team.*\n\nYou can answer tickets and look users up.",
+                     _fp_kb([_fp_btn("🛠 Staff panel", "p2_sf")]))
+    except Exception:
+        pass
+    return True, ""
+
+
+def staff_remove(admin, uid):
+    _q("DELETE FROM staff WHERE user_id = ?", (int(uid),))
+    audit(admin, "staff_remove", uid)
+
+
+def staff_user_card(target):
+    """Read-only summary: no balances, no PIN, no payment data."""
+    r = _q("SELECT username, first_name, join_date, last_active, is_premium, premium_expires, premium_plan "
+           "FROM users WHERE user_id = ?", (target,), "one")
+    if not r:
+        return f"❌ No user with ID `{target}`."
+    un, fn, joined, last, prem, pexp, plan = r
+    dep = _q("SELECT COUNT(*), SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) FROM deployments WHERE user_id = ?", (target,), "one") or (0, 0)
+    tk = (_q("SELECT COUNT(*) FROM tickets WHERE user_id = ? AND status = 'open'", (target,), "one") or [0])[0]
+    live = bool(prem and pexp and str(pexp) > datetime.now().isoformat())
+    return (f"*👤 USER* `{target}`\n"
+            f"Name: {_tk_esc(fn or '-')}" + (f" · @{_tk_esc(un)}" if un else "") + "\n"
+            f"Joined: `{str(joined or '')[:10]}` · last seen `{str(last or '')[:10]}`\n"
+            f"Plan: {('⭐ ' + _tk_esc(str(plan or 'premium')) + ' until `' + str(pexp)[:10] + '`') if live else '🆓 free'}\n"
+            f"Bots: `{dep[0] or 0}` ({dep[1] or 0} running) · open tickets: `{tk}`\n"
+            + ("🚫 *Banned*\n" if is_banned(target) else ""))
+
+
+def _sf_queue_kb(rows):
+    return [[_fp_btn(f"{'🔴' if u else '🟢'} #{i} {_tk_esc(sub)[:24]}", f"p2_sqv_{i}")] for i, sub, u in rows]
+
+
+def _p2_r_sf(callback, data, uid, chat_id, mid):
+    staff = is_staff(uid)
+    if not (staff or is_admin(uid)):
+        answer_callback(callback["id"], "Staff only", True)
+        return True
+    if data == "p2_sf":
+        n = (_q("SELECT COUNT(*) FROM tickets WHERE status = 'open'", (), "one") or [0])[0]
+        unread = (_q("SELECT COUNT(*) FROM tickets WHERE status = 'open' AND unread_admin = 1", (), "one") or [0])[0]
+        edit_message(chat_id, mid, f"*🛠 STAFF PANEL*\n\nOpen tickets: `{n}` · waiting for a reply: `{unread}`",
+                     _fp_kb([_fp_btn("🎫 Ticket queue", "p2_sq")], [_fp_btn("🔍 Look up a user", "p2_sflook")],
+                            [_fp_btn("🏠 Menu", "main_menu")]))
+        return True
+    if data == "p2_sq":
+        rows = _q("SELECT id, subject, unread_admin FROM tickets WHERE status = 'open' ORDER BY unread_admin DESC, updated_at DESC LIMIT 12", (), "all") or []
+        total = (_q("SELECT COUNT(*) FROM tickets WHERE status = 'open'", (), "one") or [0])[0]
+        edit_message(chat_id, mid, f"*🎫 TICKET QUEUE*\n\nOpen: `{total}` (🔴 = needs a reply)" + ("" if rows else "\n\n_Nothing open. 🎉_"),
+                     _fp_kb(*_sf_queue_kb(rows), [_fp_btn("🔙 Staff panel", "p2_sf")]))
+        return True
+    if data == "p2_sflook":
+        set_user_step(uid, 'fp_p2sflook')
+        edit_message(chat_id, mid, "🔍 Send the user's Telegram ID.", _fp_kb([_fp_btn("❌ Cancel", "p2_sf")]))
+        return True
+    m = re.match(r"p2_sq([vrco])_(\d+)$", data)
+    if m:
+        act, tid = m.group(1), int(m.group(2))
+        t = _q("SELECT user_id, subject, status FROM tickets WHERE id = ?", (tid,), "one")
+        if not t:
+            return True
+        if act == "v":
+            _q("UPDATE tickets SET unread_admin = 0 WHERE id = ?", (tid,))
+            kb = ([[_fp_btn("✍️ Reply", f"p2_sqr_{tid}"), _fp_btn("✅ Close", f"p2_sqc_{tid}")]] if t[2] == 'open'
+                  else [[_fp_btn("🔓 Reopen", f"p2_sqo_{tid}")]])
+            edit_message(chat_id, mid, f"*🎫 #{tid}* · user `{t[0]}` · {'open 🟢' if t[2] == 'open' else 'closed ⚪'}\n\n{_tk_thread(tid, 10)}",
+                         _fp_kb(*kb, [_fp_btn("👤 User", f"p2_sfu_{t[0]}")], [_fp_btn("🔙 Queue", "p2_sq")]))
+        elif act == "r" and t[2] == 'open':
+            _SF_CTX[uid] = tid
+            set_user_step(uid, 'fp_p2sfrep')
+            edit_message(chat_id, mid, f"✍️ Send your reply to ticket #{tid}. The user is notified instantly.",
+                         _fp_kb([_fp_btn("❌ Cancel", f"p2_sqv_{tid}")]))
+        elif act == "c":
+            tk_close(tid, True, uid); audit(uid, "ticket_close", tid, "staff")
+            edit_message(chat_id, mid, f"✅ Ticket #{tid} closed.", _fp_kb([_fp_btn("🔙 Queue", "p2_sq")]))
+        elif act == "o":
+            _q("UPDATE tickets SET status = 'open', updated_at = ? WHERE id = ?", (_now(), tid))
+            edit_message(chat_id, mid, f"🔓 Ticket #{tid} reopened.", _fp_kb([_fp_btn("💬 Open", f"p2_sqv_{tid}")]))
+        return True
+    m = re.match(r"p2_sfu_(\d+)$", data)
+    if m:
+        edit_message(chat_id, mid, staff_user_card(int(m.group(1))), _fp_kb([_fp_btn("🔙 Staff panel", "p2_sf")]))
+        return True
+    return True
+
+
+def _p2_text_sf(message, user_step, uid, chat_id, text):
+    if not (is_staff(uid) or is_admin(uid)):
+        return True
+    step = user_step.get('step')
+    if step == 'fp_p2sfrep':
+        tid = _SF_CTX.get(uid)
+        ok_, res = tk_add(tid, 'admin', uid, text) if tid else (False, "Ticket not found.")
+        if ok_:
+            audit(uid, "ticket_reply", tid, "staff")
+        send_message(chat_id, "✅ Reply sent." if ok_ else f"❌ {res}",
+                     _fp_kb([_fp_btn("💬 Ticket", f"p2_sqv_{tid}")] if tid else [_fp_btn("🎫 Queue", "p2_sq")]))
+    elif step == 'fp_p2sflook':
+        t = (text or "").strip().lstrip("@")
+        if t.isdigit():
+            target = int(t)
+        else:
+            r = _q("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (t,), "one")
+            target = r[0] if r else None
+        send_message(chat_id, staff_user_card(target) if target else "❌ No such user.",
+                     _fp_kb([_fp_btn("🔍 Another", "p2_sflook")], [_fp_btn("🔙 Staff panel", "p2_sf")]))
+    return True
+
+
+def _p2_r_stf(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_stfadd":
+        set_user_step(uid, 'fp_p2stfadd')
+        edit_message(chat_id, mid, "➕ Send the Telegram ID of the person to add to support staff.\n"
+                                   "_They must have started the bot. Staff can answer tickets and look users up — nothing else._",
+                     _fp_kb([_fp_btn("❌ Cancel", "p2_stf")]))
+        return True
+    m = re.match(r"p2_stfrm_(\d+)$", data)
+    if m:
+        staff_remove(uid, int(m.group(1)))
+        answer_callback(callback["id"], "Removed")
+    ids = staff_ids()
+    lines = "\n".join(f"• `{i}`" for i in ids) or "_No staff yet._"
+    edit_message(chat_id, mid, f"*🛠 SUPPORT STAFF*\n\n{lines}\n\n"
+                               "Staff can reply to and close tickets and look users up (read-only). They can't see money, ban, "
+                               "change limits, reset PINs or open the admin panel.",
+                 _fp_kb(*[[_fp_btn(f"➖ Remove {i}", f"p2_stfrm_{i}")] for i in ids[:10]],
+                        [_fp_btn("➕ Add staff", "p2_stfadd")], [_fp_btn("🔙 Admin Panel", "admin_panel")]))
+    return True
+
+
+def _p2_text_stf(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    t = (text or "").strip()
+    ok_, why = staff_add(uid, t) if t.isdigit() else (False, "Send a numeric Telegram ID.")
+    send_message(chat_id, "✅ Added to support staff." if ok_ else f"❌ {why}",
+                 _fp_kb([_fp_btn("🛠 Staff list", "p2_stf")]))
+    return True
+
+
+_sf_orig_notify = _tk_notify_admins
+
+
+def _tk_notify_admins(tid, uid, text, new=False):          # noqa: F811 - staff hear about tickets too
+    _sf_orig_notify(tid, uid, text, new)
+    for s in staff_ids():
+        try:
+            send_message(s, f"🎫 *{'New ticket' if new else 'Reply on ticket'} #{tid}* from `{uid}`\n\n{_tk_esc(text[:600])}",
+                         _fp_kb([_fp_btn("💬 Open", f"p2_sqv_{tid}")]))
+        except Exception:
+            pass
+
+
+_P2_ROUTES.append(("p2_stf", _p2_r_stf))
+for _pfx in ("p2_sf", "p2_sq"):
+    _P2_ROUTES.append((_pfx, _p2_r_sf))
+_P2_TEXT.update({'fp_p2sfrep': _p2_text_sf, 'fp_p2sflook': _p2_text_sf, 'fp_p2stfadd': _p2_text_stf})
+_P2_ADMIN_ROWS.append([_fp_btn("🛠 Support staff", "p2_stf")])
+
+
+# ---------------------------------------------------------------- BULK ACTIONS (admin)
+BULK_MAX_COINS_TOTAL = int(os.environ.get("BULK_MAX_COINS_TOTAL", 100000))     # safety cap per run
+_BK_TOK = {}                                      # admin id -> (token, key, act): one confirmation = one run
+_BK_ACTS = {
+    "x1": ("⏳ Extend bots +1 day", "extend", 1), "x3": ("⏳ Extend bots +3 days", "extend", 3),
+    "x7": ("⏳ Extend bots +7 days", "extend", 7),
+    "c10": ("🪙 Give 10 coins each", "coins", 10), "c50": ("🪙 Give 50 coins each", "coins", 50),
+    "c100": ("🪙 Give 100 coins each", "coins", 100),
+    "s": ("⏹ Stop all their bots", "stop", 0),
+}
+
+
+def bulk_targets(key):
+    return broadcast_audience_ids(key) if key in BROADCAST_AUDIENCES else []
+
+
+def _bulk_bots(uids, statuses=("active",)):
+    if not uids:
+        return []
+    out = []
+    ph = ",".join("?" * len(statuses))
+    for i in range(0, len(uids), 500):
+        chunk = uids[i:i + 500]
+        out += _q(f"SELECT deployment_id, user_id, expire_time, is_paused FROM deployments WHERE status IN ({ph}) "
+                  f"AND user_id IN ({','.join('?' * len(chunk))})", tuple(statuses) + tuple(chunk), "all") or []
+    return out
+
+
+def bulk_preview(key, act):
+    """-> (users, bots, summary line) without changing anything."""
+    uids = bulk_targets(key)
+    _label, kind, n = _BK_ACTS[act]
+    if kind == "coins":
+        return len(uids), 0, f"{n}🪙 to each of `{len(uids)}` users = `{n * len(uids)}🪙` in total"
+    bots = _bulk_bots(uids)
+    if kind == "extend":
+        bots = [b for b in bots if b[2] and not b[3]]
+        return len(uids), len(bots), f"+{n} day(s) on `{len(bots)}` running bots (lifetime and plan-paused bots are skipped)"
+    return len(uids), len(bots), f"stop `{len(bots)}` running bots of `{len(uids)}` users"
+
+
+def bulk_run(admin, key, act):
+    """Apply the action. Returns a dict of results. Each step is isolated so one failure doesn't stop the rest."""
+    uids = bulk_targets(key)
+    label, kind, n = _BK_ACTS[act]
+    res = {"users": len(uids), "done": 0, "failed": 0, "bots": 0}
+    if kind == "coins":
+        if n * len(uids) > BULK_MAX_COINS_TOTAL:
+            res["error"] = f"Over the safety cap of {BULK_MAX_COINS_TOTAL}🪙 per run — pick a smaller group."
+            return res
+        for u in uids:
+            try:
+                update_user_coins(u, n, "admin_bulk", f"bulk_{key}_{admin}")
+                res["done"] += 1
+            except Exception as e:
+                res["failed"] += 1
+                print(f"⚠️ bulk coins {u}: {e}")
+    elif kind == "extend":
+        for dep_id, u, exp, paused in _bulk_bots(uids):
+            if not exp or paused:
+                continue
+            try:
+                new = (datetime.fromisoformat(exp) + timedelta(days=n)).isoformat()
+                _q("UPDATE deployments SET expire_time = ? WHERE deployment_id = ? AND status = 'active'", (new, dep_id))
+                res["done"] += 1
+            except Exception as e:
+                res["failed"] += 1
+                print(f"⚠️ bulk extend #{dep_id}: {e}")
+    else:
+        if key == "all":
+            res["error"] = "Stopping everyone's bots isn't allowed — choose a narrower group."
+            return res
+        for dep_id, u, exp, paused in _bulk_bots(uids):
+            try:
+                stop_deployment(dep_id)
+                res["done"] += 1
+            except Exception as e:
+                res["failed"] += 1
+                print(f"⚠️ bulk stop #{dep_id}: {e}")
+    audit(admin, "bulk_" + kind, key, f"{label}: {res['done']} ok, {res['failed']} failed")
+    return res
+
+
+def _p2_r_bk(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    back = [_fp_btn("🔙 Admin Panel", "admin_panel")]
+    if data == "p2_bk":
+        rows = [[_fp_btn(f"{label} ({len(bulk_targets(k))})", f"p2_bkg_{k}")] for k, label in BROADCAST_AUDIENCES.items()]
+        edit_message(chat_id, mid, "*🧰 BULK ACTIONS*\n\nStep 1 — pick the group of users.\n_(banned users and admins are never included)_",
+                     _fp_kb(*rows, back))
+        return True
+    m = re.match(r"p2_bkg_([a-z]+)$", data)
+    if m and m.group(1) in BROADCAST_AUDIENCES:
+        k = m.group(1)
+        rows = [[_fp_btn(v[0], f"p2_bka_{k}_{a}")] for a, v in _BK_ACTS.items() if not (a == "s" and k == "all")]
+        edit_message(chat_id, mid, f"*🧰 BULK ACTIONS*\n\nGroup: *{_tk_esc(BROADCAST_AUDIENCES[k])}* — `{len(bulk_targets(k))}` users\n\nStep 2 — pick the action.",
+                     _fp_kb(*rows, [_fp_btn("🔙 Groups", "p2_bk")]))
+        return True
+    m = re.match(r"p2_bka_([a-z]+)_([a-z0-9]+)$", data)
+    if m and m.group(1) in BROADCAST_AUDIENCES and m.group(2) in _BK_ACTS:
+        k, a = m.group(1), m.group(2)
+        nu, nb, line = bulk_preview(k, a)
+        tok = f"{int(time.time()) % 100000}{os.urandom(2).hex()}"
+        _BK_TOK[uid] = (tok, k, a)
+        edit_message(chat_id, mid, f"⚠️ *Confirm bulk action*\n\n{_tk_esc(_BK_ACTS[a][0])}\nGroup: *{_tk_esc(BROADCAST_AUDIENCES[k])}*\n\nThis will {line}.\n\nIt can't be undone automatically.",
+                     _fp_kb([_fp_btn("✅ Yes, do it", f"p2_bkgo_{tok}")], [_fp_btn("↩️ Cancel", f"p2_bkg_{k}")]))
+        return True
+    m = re.match(r"p2_bkgo_([a-z0-9]+)$", data)
+    if m:
+        want = _BK_TOK.pop(uid, None)                    # single use: a second tap finds nothing
+        if not want or want[0] != m.group(1):
+            answer_callback(callback["id"], "Expired or already used — start again", True)
+            return True
+        _t, k, a = want
+        edit_message(chat_id, mid, "⏳ Working…", None)
+        res = bulk_run(uid, k, a)
+        txt = (f"❌ {_tk_esc(res['error'])}" if res.get("error") else
+               f"✅ *Done* — {_tk_esc(_BK_ACTS[a][0])}\n\nApplied: `{res['done']}` · failed: `{res['failed']}`")
+        edit_message(chat_id, mid, txt, _fp_kb([_fp_btn("🧰 More bulk actions", "p2_bk")], back))
+        return True
+    return True
+
+
+_P2_ROUTES.append(("p2_bk", _p2_r_bk))
+_P2_ADMIN_ROWS.append([_fp_btn("🧰 Bulk actions", "p2_bk")])
+
+
 def _p2_route(callback, data, uid, chat_id, mid):
     for prefix, fn in _P2_ROUTES:
         if data.startswith(prefix):
@@ -20911,6 +21790,8 @@ def main():
     threading.Thread(target=p2_deploy_queue_worker,     daemon=True, name="DeployQueue").start()
     threading.Thread(target=p2_pause_monitor,           daemon=True, name="PlanPause").start()
     threading.Thread(target=p2_lb_monitor,              daemon=True, name="Leaderboard").start()
+    threading.Thread(target=p2_abuse_monitor,           daemon=True, name="AbuseFlags").start()
+    threading.Thread(target=p2_summary_monitor,         daemon=True, name="DailySummary").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
