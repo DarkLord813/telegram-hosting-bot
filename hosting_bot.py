@@ -4756,6 +4756,7 @@ def show_referral_menu(chat_id, user_id, message_id=None):
         f"📊 *Your stats:*\n"
         f"  👥 Total referrals: `{total_refs}`\n"
         f"  🪙 Total earned:    `{total_earned}🪙`\n\n"
+        + ref_milestone_block(user_id)
         + (f"🕐 *Recent referrals:*\n{recent_text}\n" if recent_text else "")
         + f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Share your link — every new user who starts the bot through it earns you coins!"
@@ -8783,7 +8784,8 @@ def view_runtime_logs(chat_id, message_id, user_id, dep_id):
     
     keyboard = {
         "inline_keyboard": [
-            [{"text": "🔄 Refresh", "callback_data": f"view_runtime_logs_{dep_id}"}],
+            [{"text": "🔄 Refresh", "callback_data": f"view_runtime_logs_{dep_id}"},
+             {"text": "🔴 Live", "callback_data": f"p2_live_{dep_id}"}],
             [{"text": "📥 Download Logs", "callback_data": f"full_logs_{dep_id}"},
              {"text": "📋 Copy Logs", "callback_data": f"copy_logs_{dep_id}"}],
             [{"text": "📋 Install Logs", "callback_data": f"view_install_logs_{dep_id}"}],
@@ -15251,7 +15253,8 @@ def hang_check_tick():
         _pending_hist[("s", dep_id)] = strikes
         if strikes >= 2:
             db_execute("UPDATE dep_settings SET hang_off = 1 WHERE deployment_id = ?", (dep_id,))
-            send_message(d["owner"], f"ℹ️ *Bot #{dep_id}*: a restart didn't make it read its Telegram updates, so it may "
+            if notif_allows(d["owner"], "crash", "failed"):
+              send_message(d["owner"], f"ℹ️ *Bot #{dep_id}*: a restart didn't make it read its Telegram updates, so it may "
                                      f"simply not use polling. I turned hang detection off for this bot.",
                          _fp_kb([_fp_btn("🩺 Health check", f"fp_health_{dep_id}")]))
             continue
@@ -15262,7 +15265,8 @@ def hang_check_tick():
             pass
         res2 = _fp_restart(dep_id, "hang")
         audit(d["owner"], "hang_restart", dep_id, f"pending={hist and res[0]}")
-        send_message(d["owner"], f"🩺 *Bot #{dep_id} looks hung* — Telegram's queue for it kept growing (`{res[0]}` updates "
+        if notif_allows(d["owner"], "crash", "recovered"):      # a self-healed restart: only users who chose "all crashes"
+          send_message(d["owner"], f"🩺 *Bot #{dep_id} looks hung* — Telegram's queue for it kept growing (`{res[0]}` updates "
                                  f"waiting) so I restarted it (`{res2}`)." +
                      (f"\n\nLast log lines:\n```\n{tail}\n```" if tail else ""),
                      _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
@@ -15316,7 +15320,8 @@ def health_check_monitor():
                 except Exception:
                     pass
                 res = _fp_restart(dep_id, "health")
-                send_message(d["owner"], f"🩺 *Bot #{dep_id} stopped answering* its health check 3 times in a row, so I "
+                if notif_allows(d["owner"], "crash", "recovered"):
+                  send_message(d["owner"], f"🩺 *Bot #{dep_id} stopped answering* its health check 3 times in a row, so I "
                                          f"restarted it (`{res}`)." + (f"\n\nLast log lines:\n```\n{tail}\n```" if tail else ""),
                              _fp_kb([_fp_btn("📄 Deployment", f"view_deploy_{dep_id}")]))
         except Exception as e:
@@ -15983,6 +15988,7 @@ def fp_tools_menu(chat_id, message_id, uid, dep_id):
                          _fp_btn(f"🛡 Safe deploy: {'OFF' if _p2_safe_off(dep_id) else 'ON'}", f"p2_safe_{dep_id}")],
                         [_fp_btn("🌍 Public URL", f"p2_pub_{dep_id}"),
                          _fp_btn(f"🔁 Auto-renew: {'ON' if p2_autorenew_on(dep_id) else 'OFF'}", f"p2_ren_{dep_id}")],
+                        [_fp_btn("🎁 Transfer bot", f"p2_xfs_{dep_id}")],
                         [_fp_btn("🔙 Deployment", f"view_deploy_{dep_id}")]))
 
 
@@ -17499,7 +17505,8 @@ def p2_autorenew_tick():
                     send_message(uid, f"🔁 *Auto-renew #{dep_id}* — in about {int(left.total_seconds() // 3600 // 24) + 1} day(s) "
                                       f"I'll renew this {plan} bot for `{price}🪙`.\nYour balance: `{bal}🪙`"
                                       + ("" if bal >= price else "\n⚠️ That's not enough — top up so it doesn't expire."),
-                                 _fp_kb([_fp_btn("🔁 Settings", f"p2_ren_{dep_id}")]))
+                                 _fp_kb([_fp_btn("🔁 Settings", f"p2_ren_{dep_id}")]
+                                        + ([] if bal >= price else [_fp_btn("💳 Top up", "p2_buy")])))
                     warned += 1
                 continue
             if bal < price:
@@ -17508,7 +17515,7 @@ def p2_autorenew_tick():
                     kv_set(key, "1")
                     send_message(uid, f"⚠️ *Auto-renew #{dep_id} failed* — it needs `{price}🪙` but you have `{bal}🪙`. "
                                       f"Top up before it expires on `{exp_s[:16]}`.",
-                                 _fp_kb([_fp_btn("🔁 Settings", f"p2_ren_{dep_id}"), _fp_btn("🏠 Menu", "main_menu")]))
+                                 _fp_kb([_fp_btn("💳 Top up", "p2_buy")], [_fp_btn("🔁 Settings", f"p2_ren_{dep_id}"), _fp_btn("🏠 Menu", "main_menu")]))
                     warned += 1
                 continue
             conn = sqlite3.connect(DATABASE_FILE, timeout=10)
@@ -17543,12 +17550,61 @@ def p2_autorenew_tick():
     return renewed, warned
 
 
+def autorenew_shortfalls(now=None):
+    """Users whose coins won't cover ALL auto-renewals due in the next 3 days. -> {uid: (needed, balance, [dep ids])}"""
+    now = now or datetime.now()
+    need = {}
+    rows = _q("SELECT d.deployment_id, d.user_id, d.plan, d.expire_time FROM deployments d "
+              "JOIN dep_settings s ON s.deployment_id = d.deployment_id "
+              "WHERE s.autorenew = 1 AND d.status = 'active' AND COALESCE(d.is_free, 0) = 0 "
+              "AND d.plan IN ('monthly', 'yearly') AND d.expire_time IS NOT NULL", fetch='all') or []
+    for dep_id, uid, plan, exp_s in rows:
+        try:
+            left = datetime.fromisoformat(exp_s) - now
+            if left.total_seconds() <= 0 or left > timedelta(days=3) or get_ban_info(uid) or _premium_covers_plan_core(uid, plan):
+                continue
+            need.setdefault(uid, [0, []])
+            need[uid][0] += _p2_plan_price(plan)[1]
+            need[uid][1].append(dep_id)
+        except Exception:
+            continue
+    out = {}
+    for uid, (total, deps) in need.items():
+        bal = get_user_balances(uid)['coins']
+        if bal < total:
+            out[uid] = (total, bal, deps)
+    return out
+
+
+def autorenew_shortfall_tick(now=None):
+    """One combined 'top up' warning per user per day (only when 2+ renewals are due - a single bot already has its own notice)."""
+    now = now or datetime.now()
+    sent = 0
+    for uid, (total, bal, deps) in autorenew_shortfalls(now).items():
+        if len(deps) < 2:
+            continue
+        key = f"renewshort_{uid}_{now.strftime('%Y-%m-%d')}"
+        if kv_get(key) or not notif_allows(uid, "expiry", 72):
+            continue
+        kv_set(key, "1")
+        try:
+            send_message(uid, f"⚠️ *Not enough coins for your auto-renewals*\n\n`{len(deps)}` bots renew within 3 days and need "
+                              f"`{total}🪙` in total. Your balance: `{bal}🪙` — short by `{total - bal}🪙`.\n"
+                              f"Top up so none of them expire.",
+                         _fp_kb([_fp_btn("💳 Top up", "p2_buy")], [_fp_btn("🏠 Menu", "main_menu")]))
+            sent += 1
+        except Exception as e:
+            print(f"⚠️ shortfall msg {uid}: {e}")
+    return sent
+
+
 def p2_autorenew_monitor():
     sleep(120)
     print("✅ Auto-renew monitor started")
     while True:
         try:
             p2_autorenew_tick()
+            autorenew_shortfall_tick()
         except Exception as e:
             print(f"⚠️ autorenew monitor: {e}")
         sleep(1800)
@@ -21353,6 +21409,662 @@ _P2_ROUTES.append(("p2_bk", _p2_r_bk))
 _P2_ADMIN_ROWS.append([_fp_btn("🧰 Bulk actions", "p2_bk")])
 
 
+# ---------------------------------------------------------------- REFERRAL MILESTONES
+REF_MILESTONES_DEFAULT = os.environ.get("REF_MILESTONES", "5:25,10:75,25:250")      # "<verified referrals>:<bonus coins>,..."
+REF_MS_BACKFILL = os.environ.get("REF_MS_BACKFILL", "0") == "1"                       # count referrals made before this feature?
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS ref_ms_paid (user_id INTEGER, threshold INTEGER, coins INTEGER, ts TEXT, "
+               "PRIMARY KEY (user_id, threshold))")
+
+
+def ref_milestones_parse(text):
+    """'5:25, 10:75' -> [(5, 25), (10, 75)] sorted; raises ValueError on junk."""
+    out = {}
+    for part in re.split(r"[,\n;]+", (text or "").strip()):
+        part = part.strip()
+        if not part:
+            continue
+        a, b = re.match(r"^(\d{1,4})\s*[:=]\s*(\d{1,6})$", part).groups() if re.match(r"^(\d{1,4})\s*[:=]\s*(\d{1,6})$", part) else (None, None)
+        if a is None or int(a) < 1 or int(b) < 1:
+            raise ValueError(part)
+        out[int(a)] = int(b)
+    if not out or len(out) > 10:
+        raise ValueError("1-10 milestones")
+    return sorted(out.items())
+
+
+def ref_milestones():
+    if kv_get("ref_ms_on", "1") == "0":
+        return []
+    try:
+        return ref_milestones_parse(kv_get("ref_milestones", REF_MILESTONES_DEFAULT))
+    except Exception:
+        return ref_milestones_parse("5:25,10:75,25:250")
+
+
+def _ref_ms_start():
+    s = kv_get("ref_ms_start", "")
+    if not s:
+        s = "" if REF_MS_BACKFILL else _now()
+        kv_set("ref_ms_start", s or "0")
+    return "" if s == "0" else s
+
+
+def ref_count_for_ms(uid):
+    start = _ref_ms_start()
+    q = "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND reward_given = 1"
+    p = [uid]
+    if start:
+        q += " AND created_at >= ?"
+        p.append(start)
+    return (_q(q, tuple(p), "one") or [0])[0] or 0
+
+
+def ref_milestone_check(uid):
+    """Pay every reached milestone exactly once. -> [(threshold, coins)] paid now."""
+    paid = []
+    ms = ref_milestones()
+    if not ms or is_banned(uid):
+        return paid
+    n = ref_count_for_ms(uid)
+    for thr, coins in ms:
+        if n < thr:
+            break
+        con = sqlite3.connect(DATABASE_FILE)
+        try:
+            _q("SELECT 1")                                   # make sure the table exists
+            cur = con.execute("INSERT OR IGNORE INTO ref_ms_paid (user_id, threshold, coins, ts) VALUES (?,?,?,?)",
+                              (uid, thr, coins, _now()))
+            con.commit()
+            won = cur.rowcount == 1
+        finally:
+            con.close()
+        if not won:
+            continue
+        update_user_coins(uid, coins, "referral_milestone", f"milestone_{thr}")
+        paid.append((thr, coins))
+        try:
+            send_message(uid, f"🏅 *Milestone reached!*\n\n`{thr}` verified referrals — bonus *+{coins}🪙* added to your balance.",
+                         _fp_kb([_fp_btn("👥 My referrals", "my_referral")]))
+        except Exception:
+            pass
+    return paid
+
+
+def ref_milestone_block(uid):
+    ms = ref_milestones()
+    if not ms:
+        return ""
+    n = ref_count_for_ms(uid)
+    done = {r[0] for r in (_q("SELECT threshold FROM ref_ms_paid WHERE user_id = ?", (uid,), "all") or [])}
+    lines = []
+    for thr, coins in ms:
+        lines.append(f"  {'✅' if thr in done else '🔒'} `{thr}` referrals → `+{coins}🪙`")
+    nxt = next(((t, c) for t, c in ms if t not in done and n < t), None)
+    head = "🏅 *Milestone bonuses:*\n" + "\n".join(lines) + "\n"
+    if nxt:
+        head += f"  ➡️ Progress: `{min(n, nxt[0])}/{nxt[0]}`\n"
+    return head + "\n"
+
+
+_ms_orig_grant = grant_referral_reward
+
+
+def grant_referral_reward(new_user_id):                  # noqa: F811
+    referrer = None
+    try:
+        r = db_execute("SELECT referrer_id FROM referrals WHERE referred_id = ? AND reward_given = 0", (new_user_id,), fetch='one')
+        referrer = int(r[0]) if r else None
+    except Exception:
+        pass
+    ok_ = _ms_orig_grant(new_user_id)
+    if ok_ and referrer:
+        try:
+            ref_milestone_check(referrer)
+        except Exception as e:
+            print(f"⚠️ milestone check: {e}")
+    return ok_
+
+
+def _arm_screen():
+    on = kv_get("ref_ms_on", "1") != "0"
+    ms = ref_milestones_parse(kv_get("ref_milestones", REF_MILESTONES_DEFAULT))
+    paid = (_q("SELECT COUNT(*), COALESCE(SUM(coins),0) FROM ref_ms_paid", (), "one") or (0, 0))
+    start = _ref_ms_start()
+    t = ("*🏅 REFERRAL MILESTONES*\n\nBonus coins when someone reaches a number of verified referrals — each paid once.\n\n"
+         f"Status: *{'ON' if on else 'OFF'}*\n" + "\n".join(f"• `{a}` referrals → `{b}🪙`" for a, b in ms) +
+         f"\n\nPaid so far: `{paid[0]}` bonuses · `{paid[1]}🪙`\n"
+         f"Counting: {'all referrals' if not start else 'referrals since ' + start[:10]}")
+    return t, _fp_kb([_fp_btn(f"🔔 {'Turn OFF' if on else 'Turn ON'}", "p2_armtog")], [_fp_btn("✏️ Edit milestones", "p2_armedit")],
+                     [_fp_btn("🔙 Admin Panel", "admin_panel")])
+
+
+def _p2_r_arm(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    if data == "p2_armtog":
+        kv_set("ref_ms_on", "0" if kv_get("ref_ms_on", "1") != "0" else "1")
+        audit(uid, "ref_milestones_toggle")
+    elif data == "p2_armedit":
+        set_user_step(uid, 'fp_p2arm')
+        edit_message(chat_id, mid, "✏️ Send the milestones as `referrals:coins`, separated by commas.\n\nExample: `5:25, 10:75, 25:250`\n"
+                                   "_Changing amounts only affects milestones not yet paid._", _fp_kb([_fp_btn("❌ Cancel", "p2_arm")]))
+        return True
+    t, kb = _arm_screen()
+    edit_message(chat_id, mid, t, kb)
+    return True
+
+
+def _p2_text_arm(message, user_step, uid, chat_id, text):
+    if not is_admin(uid):
+        return True
+    try:
+        ms = ref_milestones_parse(text)
+    except Exception:
+        send_message(chat_id, "❌ Use `referrals:coins` pairs like `5:25, 10:75` (1–10 milestones).", _fp_kb([_fp_btn("🏅 Milestones", "p2_arm")]))
+        return True
+    kv_set("ref_milestones", ",".join(f"{a}:{b}" for a, b in ms))
+    audit(uid, "ref_milestones_edit", "", kv_get("ref_milestones", ""))
+    t, kb = _arm_screen()
+    send_message(chat_id, "✅ Saved.\n\n" + t, kb)
+    return True
+
+
+_P2_ROUTES.append(("p2_arm", _p2_r_arm))
+_P2_TEXT['fp_p2arm'] = _p2_text_arm
+_P2_ADMIN_ROWS.append([_fp_btn("🏅 Referral milestones", "p2_arm")])
+
+
+# ---------------------------------------------------------------- LIVE LOG VIEW
+LIVE_SECONDS      = int(os.environ.get("LIVE_LOG_SECONDS", 150))      # a live view ends by itself after this long
+LIVE_INTERVAL     = float(os.environ.get("LIVE_LOG_INTERVAL", 4))     # seconds between refreshes
+LIVE_MAX_SESSIONS = int(os.environ.get("LIVE_LOG_MAX", 15))           # across all users
+_LIVE = {}                                                            # (chat_id, message_id) -> token
+_LIVE_USER = {}                                                       # user id -> (chat_id, message_id)
+_LIVE_LOCK = threading.Lock()
+
+
+def live_text(dep_id):
+    d = _fp_dep(dep_id)
+    if not d:
+        return None, None
+    tail = _log_tail_text(d["folder"], lines=28, max_chars=2600)
+    body = tail or "(waiting for output…)"
+    icon = {"active": "🟢 RUNNING", "stopped": "🛑 STOPPED", "failed": "❌ FAILED", "paused": "⏸️ PAUSED"}.get(d["status"], str(d["status"]).upper())
+    return (f"```\n🔴 LIVE · {display_filename(d['file'])} · {icon}\n\n{body}\n\n"
+            f"refreshing every {int(LIVE_INTERVAL)}s\n```"), d
+
+
+def _live_kb(dep_id):
+    return {"inline_keyboard": [[{"text": "⏹ Stop live view", "callback_data": f"p2_livex_{dep_id}"}]]}
+
+
+def live_stop(key):
+    with _LIVE_LOCK:
+        _LIVE.pop(key, None)
+
+
+def live_loop(chat_id, mid, uid, dep_id, token, sleep_fn=None, now_fn=None):
+    """Refresh one message with the bot's newest output until it ends, is stopped, or times out."""
+    sleep_fn = sleep_fn or sleep
+    key = (chat_id, mid)
+    end = time.time() + LIVE_SECONDS if now_fn is None else now_fn() + LIVE_SECONDS
+    last = None
+    edits = 0
+    try:
+        while _LIVE.get(key) == token and (time.time() if now_fn is None else now_fn()) < end:
+            text, d = live_text(dep_id)
+            if text is None:
+                break
+            if text != last:
+                try:
+                    edit_message(chat_id, mid, text, _live_kb(dep_id))
+                    edits += 1
+                except Exception as e:
+                    print(f"⚠️ live view edit: {e}")
+                last = text
+            sleep_fn(LIVE_INTERVAL)
+    finally:
+        with _LIVE_LOCK:
+            mine = _LIVE.get(key) == token
+            if mine:
+                _LIVE.pop(key, None)
+            if _LIVE_USER.get(uid) == key:
+                _LIVE_USER.pop(uid, None)
+        if mine:                                     # ended on its own -> put the normal log screen back
+            try:
+                d = _fp_dep(dep_id)
+                if d:
+                    view_runtime_logs(chat_id, mid, d["owner"], dep_id)
+            except Exception as e:
+                print(f"⚠️ live view finish: {e}")
+    return edits
+
+
+def live_start(chat_id, mid, uid, dep_id):
+    """-> (ok, message)"""
+    key = (chat_id, mid)
+    with _LIVE_LOCK:
+        if len(_LIVE) >= LIVE_MAX_SESSIONS and key not in _LIVE:
+            return False, "Live view is busy right now — try again in a minute."
+        old = _LIVE_USER.get(uid)
+        if old:
+            _LIVE.pop(old, None)                     # one live view per user: the previous one stops
+        token = os.urandom(4).hex()
+        _LIVE[key] = token
+        _LIVE_USER[uid] = key
+    threading.Thread(target=live_loop, args=(chat_id, mid, uid, dep_id, token), daemon=True, name="LiveLog").start()
+    return True, ""
+
+
+def _p2_r_live(callback, data, uid, chat_id, mid):
+    m = re.match(r"p2_live(x?)_(\d+)$", data)
+    if not m:
+        return True
+    stop, dep_id = bool(m.group(1)), int(m.group(2))
+    d = _fp_dep(dep_id)
+    if not d or not (d["owner"] == uid or is_admin(uid) or share_level(dep_id, uid)):
+        answer_callback(callback["id"], "Not found", True)
+        return True
+    if stop:
+        live_stop((chat_id, mid))
+        view_runtime_logs(chat_id, mid, d["owner"], dep_id)
+        return True
+    ok_, msg = live_start(chat_id, mid, uid, dep_id)
+    if not ok_:
+        answer_callback(callback["id"], msg, True)
+    else:
+        answer_callback(callback["id"], f"Live for {LIVE_SECONDS // 60 if LIVE_SECONDS >= 120 else LIVE_SECONDS}{'m' if LIVE_SECONDS >= 120 else 's'}")
+    return True
+
+
+_P2_ROUTES.append(("p2_live", _p2_r_live))
+
+_live_orig_cb = handle_callback
+
+
+def handle_callback(callback):                            # noqa: F811
+    """Any tap on a message that is streaming live ends the stream, so it can't paint over the next screen."""
+    try:
+        m = callback.get("message") or {}
+        key = ((m.get("chat") or {}).get("id"), m.get("message_id"))
+        if key in _LIVE and not str(callback.get("data", "")).startswith("p2_live"):
+            live_stop(key)
+    except Exception:
+        pass
+    return _live_orig_cb(callback)
+
+
+# ---------------------------------------------------------------- BOT TRANSFER (owner -> another user)
+XFER_TTL_H = int(os.environ.get("XFER_OFFER_HOURS", 24))
+_P2_DDL.append("CREATE TABLE IF NOT EXISTS dep_transfers (id INTEGER PRIMARY KEY AUTOINCREMENT, dep_id INTEGER, from_uid INTEGER, "
+               "to_uid INTEGER, created TEXT, status TEXT DEFAULT 'pending', done TEXT)")
+_XF_CTX = {}
+
+
+def xfer_blocker(dep_id, from_uid):
+    """Why this bot can't be handed over right now (None = fine)."""
+    r = _q("SELECT user_id, status, is_free, payment_method, expire_time, COALESCE(is_paused, 0) FROM deployments WHERE deployment_id = ?",
+           (dep_id,), "one")
+    if not r or r[0] != from_uid:
+        return "Only the owner can transfer a bot."
+    _uid, status, is_free, pm, exp, paused = r
+    if is_free:
+        return "Free-slot bots can't be transferred — they belong to your free slot."
+    if pm == "premium_free":
+        return "This bot runs on your Premium plan, so it can't leave your account."
+    if paused:
+        return "Resume the paused plan first."
+    if status not in ("active", "stopped"):
+        return f"A bot that is *{status}* can't be transferred — get it running or stopped first."
+    try:
+        if exp and datetime.fromisoformat(exp) <= datetime.now():
+            return "This bot's plan has expired — renew it first."
+    except Exception:
+        pass
+    if _q("SELECT 1 FROM dep_transfers WHERE dep_id = ? AND status = 'pending' AND created >= ?",
+          (dep_id, (datetime.now() - timedelta(hours=XFER_TTL_H)).isoformat(timespec='seconds')), "one"):
+        return "There's already a pending transfer offer for this bot."
+    return None
+
+
+def xfer_offer(dep_id, from_uid, to_uid):
+    """-> (offer_id or None, error text)"""
+    why = xfer_blocker(dep_id, from_uid)
+    if why:
+        return None, why
+    if to_uid == from_uid:
+        return None, "That's you."
+    if not _q("SELECT 1 FROM users WHERE user_id = ?", (to_uid,), "one"):
+        return None, "No such user — they must have started the bot first."
+    if is_banned(to_uid):
+        return None, "That user can't receive bots."
+    _q("INSERT INTO dep_transfers (dep_id, from_uid, to_uid, created) VALUES (?,?,?,?)",
+       (dep_id, from_uid, to_uid, datetime.now().isoformat(timespec='seconds')))
+    r = _q("SELECT MAX(id) FROM dep_transfers WHERE dep_id = ?", (dep_id,), "one")
+    audit(from_uid, "transfer_offer", dep_id, f"to {to_uid}")
+    return r[0], ""
+
+
+def _xf_claim(offer_id, to_uid, status):
+    """Atomically move a pending, unexpired offer to `status`. -> row (dep_id, from_uid, to_uid) or None."""
+    cutoff = (datetime.now() - timedelta(hours=XFER_TTL_H)).isoformat(timespec='seconds')
+    con = sqlite3.connect(DATABASE_FILE)
+    try:
+        cur = con.execute("UPDATE dep_transfers SET status = ?, done = ? WHERE id = ? AND status = 'pending' "
+                          "AND to_uid = ? AND created >= ?", (status, _now(), offer_id, to_uid, cutoff))
+        con.commit()
+        if cur.rowcount != 1:
+            return None
+    finally:
+        con.close()
+    return _q("SELECT dep_id, from_uid, to_uid FROM dep_transfers WHERE id = ?", (offer_id,), "one")
+
+
+def xfer_execute(dep_id, from_uid, to_uid):
+    """Move the bot: stop it, move its folder, change the owner, drop old collaborators + webhook secret, relaunch if it was running.
+    -> (ok, text)"""
+    r = _q("SELECT user_id, status, folder_name FROM deployments WHERE deployment_id = ?", (dep_id,), "one")
+    if not r or r[0] != from_uid:
+        return False, "The bot is no longer owned by the sender."
+    was_active = r[1] == "active"
+    src = get_deploy_folder(from_uid, dep_id)
+    fname = r[2] or str(dep_id)
+    if was_active:
+        try:
+            stop_deployment(dep_id)
+        except Exception as e:
+            print(f"⚠️ transfer stop #{dep_id}: {e}")
+    dst_root = DEPLOYMENTS_DIR / str(to_uid)
+    dst = dst_root / fname
+    try:
+        dst_root.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            fname = f"{fname}_{dep_id}"
+            dst = dst_root / fname
+        if src.exists():
+            shutil.move(str(src), str(dst))
+    except Exception as e:
+        print(f"❌ transfer move #{dep_id}: {e}")
+        return False, "Couldn't move the bot's files — nothing was changed."
+    _q("UPDATE deployments SET user_id = ?, folder_name = ? WHERE deployment_id = ?", (to_uid, fname, dep_id))
+    _q("DELETE FROM dep_shares WHERE deployment_id = ?", (dep_id,))
+    try:
+        _q("UPDATE dep_settings SET hook_secret = NULL, auto_deploy = 0 WHERE deployment_id = ?", (dep_id,))
+    except Exception:
+        pass
+    audit(from_uid, "transfer_done", dep_id, f"to {to_uid}")
+    try:
+        files_repo_async_delete(from_uid, dep_id)
+        files_repo_async_save(dep_id, "transfer")
+    except Exception as e:
+        print(f"⚠️ transfer files-repo sync #{dep_id}: {e}")
+    if was_active:
+        try:
+            restart_deployment(dep_id, to_uid, to_uid)
+        except Exception as e:
+            print(f"⚠️ transfer relaunch #{dep_id}: {e}")
+    return True, ""
+
+
+def _p2_r_xf(callback, data, uid, chat_id, mid):
+    m = re.match(r"p2_xf([sacdx])_(\d+)$", data)
+    if not m:
+        return True
+    act, n = m.group(1), int(m.group(2))
+    if act == "s":                                           # start (n = deployment id)
+        d = _fp_dep(n)
+        why = xfer_blocker(n, uid) if d else "Not found."
+        if why:
+            edit_message(chat_id, mid, f"🎁 *TRANSFER*\n\n❌ {why}", _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{n}")]))
+            return True
+        _XF_CTX[uid] = n
+        set_user_step(uid, 'fp_p2xf')
+        edit_message(chat_id, mid, f"🎁 *TRANSFER BOT #{n}*\n\nSend the Telegram ID or @username of the new owner. They must have started this bot.\n\n"
+                                   "⚠️ The bot keeps its remaining plan time and its *environment variables (including any secrets)* — "
+                                   "the new owner will be able to see them. Collaborators are removed.",
+                     _fp_kb([_fp_btn("❌ Cancel", f"fp_tools_{n}")]))
+        return True
+    if act == "a":                                           # accept (n = offer id)
+        row = _xf_claim(n, uid, "accepted")
+        if not row:
+            answer_callback(callback["id"], "This offer has expired or was already answered", True)
+            edit_message(chat_id, mid, "⌛ This transfer offer is no longer available.", _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+            return True
+        dep_id, frm, to = row
+        why = xfer_blocker_for_accept(dep_id, frm)
+        ok_, msg = (False, why) if why else xfer_execute(dep_id, frm, to)
+        if not ok_:
+            _q("UPDATE dep_transfers SET status = 'failed' WHERE id = ?", (n,))
+            edit_message(chat_id, mid, f"❌ Transfer failed: {msg}", _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+            send_message(frm, f"❌ Transfer of bot #{dep_id} didn't go through: {msg}")
+            return True
+        edit_message(chat_id, mid, f"✅ *Bot #{dep_id} is yours now.*\n\nIt keeps its plan time. Check its environment variables and settings.",
+                     _fp_kb([_fp_btn("📄 Open bot", f"view_deploy_{dep_id}")], [_fp_btn("🏠 Menu", "main_menu")]))
+        send_message(frm, f"✅ Bot #{dep_id} was transferred to `{to}`.")
+        return True
+    if act in ("d", "c"):                                    # decline (by target) / cancel (by sender)
+        r = _q("SELECT dep_id, from_uid, to_uid FROM dep_transfers WHERE id = ? AND status = 'pending'", (n,), "one")
+        if not r or (uid != r[2] if act == "d" else uid != r[1]):
+            answer_callback(callback["id"], "Not available", True)
+            return True
+        _q("UPDATE dep_transfers SET status = ?, done = ? WHERE id = ? AND status = 'pending'",
+           ("declined" if act == "d" else "cancelled", _now(), n))
+        edit_message(chat_id, mid, "Transfer " + ("declined." if act == "d" else "cancelled."), _fp_kb([_fp_btn("🏠 Menu", "main_menu")]))
+        send_message(r[1] if act == "d" else r[2], f"ℹ️ The transfer of bot #{r[0]} was {'declined' if act == 'd' else 'cancelled'}.")
+        return True
+    return True
+
+
+def xfer_blocker_for_accept(dep_id, frm):
+    """The offer itself is the pending row, so skip the 'pending offer' check but keep the rest."""
+    r = _q("SELECT user_id, status, is_free, payment_method FROM deployments WHERE deployment_id = ?", (dep_id,), "one")
+    if not r or r[0] != frm:
+        return "the bot changed owner in the meantime"
+    if r[2] or r[3] == "premium_free":
+        return "the bot is no longer transferable"
+    if r[1] not in ("active", "stopped"):
+        return f"the bot is {r[1]}"
+    return None
+
+
+def _p2_text_xf(message, user_step, uid, chat_id, text):
+    dep_id = _XF_CTX.get(uid)
+    t = (text or "").strip().lstrip("@")
+    if t.isdigit():
+        to = int(t)
+    else:
+        r = _q("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (t,), "one") if t else None
+        to = r[0] if r else None
+    if not dep_id or not to:
+        send_message(chat_id, "❌ I couldn't find that user. Send their numeric ID or @username.",
+                     _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{dep_id or 0}")]))
+        return True
+    oid, err = xfer_offer(dep_id, uid, to)
+    if not oid:
+        send_message(chat_id, f"❌ {err}", _fp_kb([_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+        return True
+    d = _fp_dep(dep_id)
+    try:
+        left = ""
+        if d and d["expire"]:
+            days = max(0, (datetime.fromisoformat(d["expire"]) - datetime.now()).days)
+            left = f"\nPlan time left: `{days}` days"
+        send_message(to, f"🎁 *Bot transfer offer*\n\nUser `{uid}` wants to give you bot *{_tk_esc(display_filename(d['file']))}* (#{dep_id}).{left}\n"
+                         f"It keeps its plan time and settings. Offer valid for {XFER_TTL_H}h.",
+                     _fp_kb([_fp_btn("✅ Accept", f"p2_xfa_{oid}"), _fp_btn("🚫 Decline", f"p2_xfd_{oid}")]))
+    except Exception as e:
+        _q("UPDATE dep_transfers SET status = 'failed' WHERE id = ?", (oid,))
+        send_message(chat_id, "❌ Couldn't reach that user — they may have blocked the bot.")
+        return True
+    send_message(chat_id, f"📨 Offer sent to `{to}`. It stays open for {XFER_TTL_H}h.",
+                 _fp_kb([_fp_btn("↩️ Cancel offer", f"p2_xfc_{oid}")], [_fp_btn("🔙 Tools", f"fp_tools_{dep_id}")]))
+    return True
+
+
+_P2_ROUTES.append(("p2_xf", _p2_r_xf))
+_P2_TEXT['fp_p2xf'] = _p2_text_xf
+
+
+# ---------------------------------------------------------------- BACKUP RESTORE CHECK
+BV_HOURS = float(os.environ.get("BACKUP_VERIFY_HOURS", 24))            # how often the automatic check runs
+BV_LAG_PCT = float(os.environ.get("BACKUP_VERIFY_LAG_PCT", 10))        # backup missing more than this % of users = problem
+_BV_LOCK = threading.Lock()
+
+
+def _bv_count(path, table):
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def backup_verify():
+    """Dry-run restore: download the latest GitHub backup into a temp file, prove it is a healthy SQLite database with
+    real data, and compare it with the live one. Never touches the live database. -> result dict (also stored)."""
+    res = {"ts": int(time.time()), "ok": False, "problems": [], "size": 0}
+    if not GITHUB_ENABLED:
+        res["problems"].append("GitHub backup isn't configured")
+        return _bv_store(res)
+    import tempfile
+    tmp = None
+    try:
+        status, resp = _gh_api("GET", GITHUB_BACKUP_PATH)
+        if status == 404:
+            res["problems"].append("No backup file exists on GitHub")
+            return _bv_store(res)
+        if status != 200:
+            res["problems"].append(f"GitHub answered HTTP {status}: {str((resp or {}).get('message', ''))[:80]}")
+            return _bv_store(res)
+        data = _gh_contents_bytes(resp)
+        res["size"] = len(data)
+        if len(data) < 1024 or not data.startswith(b"SQLite format 3\x00"):
+            res["problems"].append("The backup file isn't a valid SQLite database")
+            return _bv_store(res)
+        fd, tmp = tempfile.mkstemp(suffix=".verify.db")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        con = sqlite3.connect(tmp)
+        try:
+            integ = con.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            con.close()
+        if not integ or integ[0] != "ok":
+            res["problems"].append(f"Integrity check failed: {str(integ)[:80]}")
+            return _bv_store(res)
+        for t in ("users", "deployments"):
+            b = _bv_count(tmp, t)
+            live = _q(f"SELECT COUNT(*) FROM {t}", (), "one")[0]
+            res[t] = {"backup": b, "live": live}
+            if b is None:
+                res["problems"].append(f"The backup has no `{t}` table")
+        u = res.get("users", {})
+        if u.get("backup") is not None and u.get("live", 0) > 0:
+            lag = (u["live"] - u["backup"]) / u["live"] * 100
+            res["lag_pct"] = round(max(lag, 0), 1)
+            if lag > BV_LAG_PCT:
+                res["problems"].append(f"The backup is missing {u['live'] - u['backup']} of {u['live']} users ({lag:.0f}%) — it's behind")
+        try:                                                              # when was it written?
+            st, cm = _gh_repo_api("GET", f"commits?path={urllib.parse.quote(GITHUB_BACKUP_PATH)}&sha={urllib.parse.quote(GITHUB_BACKUP_BRANCH)}&per_page=1", 30)
+            if st == 200 and cm:
+                res["commit"] = cm[0]["commit"]["committer"]["date"]
+        except Exception:
+            pass
+        res["ok"] = not res["problems"]
+    except Exception as e:
+        res["problems"].append(f"Couldn't run the check: {str(e)[:100]}")
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    return _bv_store(res)
+
+
+def _bv_store(res):
+    kv_set("backup_verify", json.dumps(res))
+    return res
+
+
+def bv_last():
+    try:
+        return json.loads(kv_get("backup_verify", "") or "")
+    except Exception:
+        return None
+
+
+def bv_text(r=None):
+    r = r or bv_last()
+    if not r:
+        return "*💾 BACKUP RESTORE CHECK*\n\nNo check has run yet.\n\nIt downloads the latest backup into a temporary file, runs an integrity check and compares it with live data — your live database is never touched."
+    when = datetime.fromtimestamp(r["ts"]).strftime("%d %b %H:%M")
+    t = f"*💾 BACKUP RESTORE CHECK*\n\nLast run: `{when}` — {'✅ *backup restores fine*' if r['ok'] else '🚨 *PROBLEM*'}\n"
+    if r.get("size"):
+        t += f"Backup size: `{r['size'] / 1024:.0f} KB`" + (f" · written `{r['commit'][:16].replace('T', ' ')}`" if r.get("commit") else "") + "\n"
+    for k in ("users", "deployments"):
+        if k in r and r[k].get("backup") is not None:
+            t += f"• {k}: backup `{r[k]['backup']}` / live `{r[k]['live']}`\n"
+    for p in r.get("problems", []):
+        t += f"⚠️ {_tk_esc(p)}\n"
+    return t
+
+
+_bv_orig_problems = health_problems
+
+
+def health_problems(h=None, bstate=None):                  # noqa: F811 - a failing restore check is a health problem
+    out = _bv_orig_problems(h, bstate)
+    r = bv_last()
+    if r and not r.get("ok") and time.time() - r.get("ts", 0) < max(BV_HOURS * 3600 * 2, 48 * 3600):
+        out.append(("restore", "Backup restore check FAILED: " + "; ".join(r.get("problems", []))[:200]))
+    return out
+
+
+def p2_bv_monitor():
+    sleep(600)
+    print("✅ Backup restore-check monitor started")
+    while True:
+        try:
+            r = bv_last()
+            if GITHUB_ENABLED and (not r or time.time() - r["ts"] >= BV_HOURS * 3600):
+                with _BV_LOCK:
+                    backup_verify()
+        except Exception as e:
+            print(f"⚠️ backup verify monitor: {e}")
+        sleep(1800)
+
+
+def _p2_r_bv(callback, data, uid, chat_id, mid):
+    if not is_admin(uid):
+        return True
+    kb = lambda: _fp_kb([_fp_btn("▶️ Run check now", "p2_bvgo")], [_fp_btn("🩺 Health", "p2_ah"), _fp_btn("🔙 Admin Panel", "admin_panel")])
+    if data == "p2_bvgo":
+        if not _BV_LOCK.acquire(blocking=False):
+            answer_callback(callback["id"], "A check is already running", True)
+            return True
+        edit_message(chat_id, mid, "⏳ *Checking the backup…*\n\nDownloading it into a temporary file — your live data isn't touched.", None)
+        def work():
+            try:
+                r = backup_verify()
+                audit(uid, "backup_verify", "", "ok" if r["ok"] else "; ".join(r["problems"])[:150])
+            except Exception as e:
+                r = {"ts": int(time.time()), "ok": False, "problems": [str(e)[:100]]}
+            finally:
+                _BV_LOCK.release()
+            edit_message(chat_id, mid, bv_text(r), kb())
+        threading.Thread(target=work, daemon=True, name="BackupVerify").start()
+        return True
+    edit_message(chat_id, mid, bv_text(), kb())
+    return True
+
+
+_P2_ROUTES.append(("p2_bv", _p2_r_bv))
+_P2_ADMIN_ROWS.append([_fp_btn("💾 Backup restore check", "p2_bv")])
+
+
 def _p2_route(callback, data, uid, chat_id, mid):
     for prefix, fn in _P2_ROUTES:
         if data.startswith(prefix):
@@ -21792,6 +22504,7 @@ def main():
     threading.Thread(target=p2_lb_monitor,              daemon=True, name="Leaderboard").start()
     threading.Thread(target=p2_abuse_monitor,           daemon=True, name="AbuseFlags").start()
     threading.Thread(target=p2_summary_monitor,         daemon=True, name="DailySummary").start()
+    threading.Thread(target=p2_bv_monitor,              daemon=True, name="BackupVerify").start()
     if FILES_REPO_ENABLED:
         threading.Thread(target=_files_sync_thread,     daemon=True, name="FilesRepoSync").start()
 
